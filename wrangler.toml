@@ -1,0 +1,18 @@
+name = "munshot-notetaker-frontend"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+# The munshot /public/join endpoint. Override here if it changes.
+[vars]
+JOIN_ENDPOINT = "https://save-robert-monitors-plugin.trycloudflare.com/public/join"
+
+# KV namespace for users + sessions.
+# Create it with:  npx wrangler kv namespace create KV
+# then paste the returned id below.
+[[kv_namespaces]]
+binding = "KV"
+id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+
+# Secrets (do NOT put these here — set them with `wrangler secret put`):
+#   npx wrangler secret put API_KEY      # the X-API-Key value
+#   npx wrangler secret put SIGNUP_CODE  # optional: require a code to register

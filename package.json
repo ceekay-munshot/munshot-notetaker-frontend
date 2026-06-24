@@ -1,0 +1,13 @@
+{
+  "name": "munshot-notetaker-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Worker: KV-backed logins + a form to send meetings to the munshot notetaker.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
