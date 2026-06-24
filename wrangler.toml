@@ -6,13 +6,13 @@ compatibility_date = "2024-11-01"
 [vars]
 JOIN_ENDPOINT = "https://save-robert-monitors-plugin.trycloudflare.com/public/join"
 
-# KV namespace for users + sessions.
-# Create it with:  npx wrangler kv namespace create KV
-# then paste the returned id below.
+# KV namespace for users + sessions (namespace: meetbot-users).
 [[kv_namespaces]]
 binding = "KV"
-id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
+id = "759a21557c7d4e118296479f9b4c50a6"
 
-# Secrets (do NOT put these here — set them with `wrangler secret put`):
-#   npx wrangler secret put API_KEY      # the X-API-Key value
-#   npx wrangler secret put SIGNUP_CODE  # optional: require a code to register
+# Secrets are NOT stored in this file. With git-connected Workers Builds,
+# add them once in the dashboard — they persist across deploys:
+#   Worker → Settings → Variables and Secrets → Add → type "Secret"
+#     API_KEY      (required)  the X-API-Key value
+#     SIGNUP_CODE  (optional)  require a code to register
