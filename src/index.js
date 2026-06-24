@@ -1,8 +1,10 @@
 // Munshot Notetaker — Cloudflare Worker
 // - KV-backed logins (one user = one `user:<email>` key)
 // - KV-backed sessions via HttpOnly cookie
+// - Admin login (username from env, password from the ADMIN_PASSWORD secret):
+//   sees ALL users' transcripts
 // - Join/leave the notetaker bot (email is taken from the session, never the body)
-// - D1-backed transcripts view, scoped to the signed-in user
+// - D1-backed transcripts view, scoped to the signed-in user (all rows for admin)
 
 const COOKIE_NAME = "session";
 const SESSION_TTL = 60 * 60 * 24 * 7; // 7 days
@@ -36,16 +38,16 @@ export default {
 /* ------------------------------ routes ------------------------------ */
 
 async function handleHome(request, env) {
-  if (await getSessionEmail(request, env)) {
+  if (await getSession(request, env)) {
     return Response.redirect(new URL("/dashboard", request.url).toString(), 302);
   }
   return html(loginPage({ codeRequired: !!env.SIGNUP_CODE }));
 }
 
 async function handleDashboard(request, env) {
-  const email = await getSessionEmail(request, env);
-  if (!email) return Response.redirect(new URL("/", request.url).toString(), 302);
-  return html(dashboardPage(email));
+  const session = await getSession(request, env);
+  if (!session) return Response.redirect(new URL("/", request.url).toString(), 302);
+  return html(dashboardPage(session.identity, session.isAdmin));
 }
 
 async function handleRegister(request, env) {
@@ -56,6 +58,9 @@ async function handleRegister(request, env) {
   if (!email || !password) return json({ error: "Email and password are required" }, 400);
   if (!isValidEmail(email)) return json({ error: "Enter a valid email address" }, 400);
   if (password.length < 6) return json({ error: "Password must be at least 6 characters" }, 400);
+  if (email === adminUsername(env).toLowerCase()) {
+    return json({ error: "That username is reserved" }, 409);
+  }
   if (env.SIGNUP_CODE && body.code !== env.SIGNUP_CODE) {
     return json({ error: "Invalid signup code" }, 403);
   }
@@ -79,10 +84,23 @@ async function handleRegister(request, env) {
 
 async function handleLogin(request, env) {
   const body = await request.json().catch(() => ({}));
-  const email = normalizeEmail(body.email);
+  const identifier = String(body.email || "").trim();
   const password = String(body.password || "");
-  if (!email || !password) return json({ error: "Email and password are required" }, 400);
+  if (!identifier || !password) return json({ error: "Email and password are required" }, 400);
 
+  // Admin login — username from env (default ADMIN), password from secret.
+  if (identifier.toLowerCase() === adminUsername(env).toLowerCase()) {
+    if (!env.ADMIN_PASSWORD) {
+      return json({ error: "Admin login isn't configured (set the ADMIN_PASSWORD secret)" }, 403);
+    }
+    if (!timingSafeEqual(password, env.ADMIN_PASSWORD)) {
+      return json({ error: "Invalid email or password" }, 401);
+    }
+    const cookie = await createAdminSession(env, adminUsername(env));
+    return json({ ok: true, admin: true }, 200, { "Set-Cookie": cookie });
+  }
+
+  const email = normalizeEmail(identifier);
   const raw = await env.KV.get(`user:${email}`);
   if (!raw) return json({ error: "Invalid email or password" }, 401);
 
@@ -115,8 +133,10 @@ function leaveEndpoint(env) {
 // Asks the notetaker bot to join or leave a meeting. The email is always taken
 // from the authenticated session — never from the request body.
 async function handleBot(request, env, action) {
-  const email = await getSessionEmail(request, env);
-  if (!email) return json({ error: "Not authenticated" }, 401);
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts can't send or stop meetings" }, 403);
+  const email = session.identity;
 
   const body = await request.json().catch(() => ({}));
   const meetingUrl = String(body.meeting_url || "").trim();
@@ -155,19 +175,27 @@ async function handleBot(request, env, action) {
   return json({ ok: upstream.ok, status: upstream.status, response: data }, upstream.ok ? 200 : 502);
 }
 
-// Returns the signed-in user's transcripts from D1. owner_email is derived from
-// the session server-side, so a user can never read another user's transcripts.
+// Returns transcripts from D1. A normal user sees only rows whose owner_email
+// matches their session email (derived server-side). Admin sees every row.
 async function handleTranscripts(request, env) {
-  const email = await getSessionEmail(request, env);
-  if (!email) return json({ error: "Not authenticated" }, 401);
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
   if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
 
-  const sql =
-    "SELECT meeting_id, segment_id, start_time, end_time, text, speaker, created_at " +
-    "FROM transcriptions WHERE owner_email = ?1 ORDER BY meeting_id, start_time";
   try {
-    const res = await env.DB.prepare(sql).bind(email).all();
-    return json({ ok: true, segments: res.results || [] });
+    let res;
+    if (session.isAdmin) {
+      res = await env.DB.prepare(
+        "SELECT meeting_id, segment_id, start_time, end_time, text, speaker, created_at, owner_email " +
+        "FROM transcriptions ORDER BY meeting_id, start_time"
+      ).all();
+    } else {
+      res = await env.DB.prepare(
+        "SELECT meeting_id, segment_id, start_time, end_time, text, speaker, created_at " +
+        "FROM transcriptions WHERE owner_email = ?1 ORDER BY meeting_id, start_time"
+      ).bind(session.identity).all();
+    }
+    return json({ ok: true, admin: session.isAdmin, segments: res.results || [] });
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
   }
@@ -175,16 +203,40 @@ async function handleTranscripts(request, env) {
 
 /* ------------------------------ auth helpers ------------------------------ */
 
+function adminUsername(env) {
+  return env.ADMIN_USERNAME || "ADMIN";
+}
+
 async function createSession(env, email) {
   const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
   await env.KV.put(`session:${token}`, email, { expirationTtl: SESSION_TTL });
   return sessionCookie(token);
 }
 
-async function getSessionEmail(request, env) {
+async function createAdminSession(env, name) {
+  const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
+  await env.KV.put(`session:${token}`, JSON.stringify({ admin: true, name }), { expirationTtl: SESSION_TTL });
+  return sessionCookie(token);
+}
+
+// Resolves the current session to { isAdmin, identity }. Admin sessions are
+// stored as JSON ({admin:true,...}); user sessions are the plain email string.
+// A user's session value is always their own email, so it can never be parsed
+// into an admin marker.
+async function getSession(request, env) {
   const token = parseCookies(request)[COOKIE_NAME];
   if (!token) return null;
-  return env.KV.get(`session:${token}`);
+  const value = await env.KV.get(`session:${token}`);
+  if (!value) return null;
+  if (value.charCodeAt(0) === 123 /* '{' */) {
+    try {
+      const o = JSON.parse(value);
+      if (o && o.admin) return { isAdmin: true, identity: o.name || "ADMIN" };
+    } catch {
+      /* fall through to user */
+    }
+  }
+  return { isAdmin: false, identity: value };
 }
 
 function sessionCookie(token) {
@@ -285,6 +337,7 @@ const STYLE = `
   .card.wide { max-width: 720px; }
   h1 { margin: 0 0 4px; font-size: 22px; }
   .sub { margin: 0 0 22px; color: #94a3b8; font-size: 14px; }
+  .badge { display: inline-block; margin-left: 8px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #38bdf8; color: #04263a; vertical-align: middle; }
   label { display: block; font-size: 13px; margin: 14px 0 6px; color: #cbd5e1; }
   input {
     width: 100%; padding: 11px 12px; border-radius: 9px; border: 1px solid #475569;
@@ -345,8 +398,8 @@ function loginPage({ codeRequired }) {
     <p class="sub" id="subtitle">Sign in to send a meeting to the notetaker.</p>
 
     <form id="login-form">
-      <label for="l-email">Email</label>
-      <input id="l-email" type="email" autocomplete="username" required />
+      <label for="l-email">Email or username</label>
+      <input id="l-email" type="text" autocomplete="username" required />
       <label for="l-pass">Password</label>
       <input id="l-pass" type="password" autocomplete="current-password" required />
       <button type="submit">Sign in</button>
@@ -437,8 +490,27 @@ function loginPage({ codeRequired }) {
 </html>`;
 }
 
-function dashboardPage(email) {
-  const safeEmail = escapeHtml(email);
+function dashboardPage(identity, isAdmin) {
+  const safe = escapeHtml(identity);
+  const formSection = isAdmin
+    ? ""
+    : `
+    <form id="join-form">
+      <label for="meeting">Meeting link</label>
+      <input id="meeting" type="url" placeholder="https://meet.google.com/your-live-meet" required />
+      <div class="btnrow">
+        <button type="submit" id="send-btn">Send to notetaker</button>
+        <button type="button" id="stop-btn" class="btn-stop">Stop bot</button>
+      </div>
+    </form>
+    <div class="msg" id="msg"></div>
+
+    <hr />
+`;
+  const subline = isAdmin
+    ? `Signed in as ${safe} <span class="badge">ADMIN</span>`
+    : `Signed in as ${safe}`;
+  const transcriptsTitle = isAdmin ? "All transcripts" : "Your transcripts";
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -453,22 +525,10 @@ function dashboardPage(email) {
       <h1>Notetaker</h1>
       <button class="linkbtn" id="logout">Log out</button>
     </div>
-    <p class="sub">Signed in as ${safeEmail}</p>
-
-    <form id="join-form">
-      <label for="meeting">Meeting link</label>
-      <input id="meeting" type="url" placeholder="https://meet.google.com/your-live-meet" required />
-      <div class="btnrow">
-        <button type="submit" id="send-btn">Send to notetaker</button>
-        <button type="button" id="stop-btn" class="btn-stop">Stop bot</button>
-      </div>
-    </form>
-    <div class="msg" id="msg"></div>
-
-    <hr />
-
+    <p class="sub">${subline}</p>
+${formSection}
     <div class="sect">
-      <h2>Your transcripts</h2>
+      <h2>${transcriptsTitle}</h2>
       <button class="refresh" id="refresh">Refresh</button>
     </div>
     <input class="search" id="tq" type="search" placeholder="Search transcript text…" />
@@ -477,54 +537,57 @@ function dashboardPage(email) {
   </div>
 
 <script>
-  var msg = document.getElementById('msg');
-  var meetingInput = document.getElementById('meeting');
-
-  function showMsg(text, kind) {
-    msg.textContent = text;
-    msg.className = 'msg' + (kind ? ' ' + kind : '');
-  }
-
   document.getElementById('logout').onclick = async function () {
     await fetch('/api/logout', { method: 'POST' });
     window.location.href = '/';
   };
 
-  async function callBot(path, okText) {
-    var url = meetingInput.value.trim();
-    if (!url) { showMsg('Enter the meeting link first.', 'err'); return; }
+  var joinForm = document.getElementById('join-form');
+  if (joinForm) {
+    var msg = document.getElementById('msg');
+    var meetingInput = document.getElementById('meeting');
     var sendBtn = document.getElementById('send-btn');
     var stopBtn = document.getElementById('stop-btn');
-    sendBtn.disabled = true; stopBtn.disabled = true;
-    showMsg('Working…', '');
-    try {
-      var res = await fetch(path, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ meeting_url: url }),
-      });
-      var data = await res.json().catch(function () { return {}; });
-      if (res.status === 401) { window.location.href = '/'; return; }
-      if (res.ok && data.ok) {
-        showMsg(okText, 'ok');
-      } else {
-        var detail = data.error || (data.response ? JSON.stringify(data.response) : 'Request failed.');
-        showMsg('Failed: ' + detail, 'err');
-      }
-    } catch (e) {
-      showMsg('Network error. Please try again.', 'err');
-    } finally {
-      sendBtn.disabled = false; stopBtn.disabled = false;
-    }
-  }
 
-  document.getElementById('join-form').onsubmit = function (e) {
-    e.preventDefault();
-    callBot('/api/join', 'Sent! The notetaker has been asked to join.');
-  };
-  document.getElementById('stop-btn').onclick = function () {
-    callBot('/api/leave', 'Stop requested. The notetaker is leaving the meeting.');
-  };
+    var showMsg = function (text, kind) {
+      msg.textContent = text;
+      msg.className = 'msg' + (kind ? ' ' + kind : '');
+    };
+
+    var callBot = async function (path, okText) {
+      var url = meetingInput.value.trim();
+      if (!url) { showMsg('Enter the meeting link first.', 'err'); return; }
+      sendBtn.disabled = true; stopBtn.disabled = true;
+      showMsg('Working…', '');
+      try {
+        var res = await fetch(path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ meeting_url: url }),
+        });
+        var data = await res.json().catch(function () { return {}; });
+        if (res.status === 401) { window.location.href = '/'; return; }
+        if (res.ok && data.ok) {
+          showMsg(okText, 'ok');
+        } else {
+          var detail = data.error || (data.response ? JSON.stringify(data.response) : 'Request failed.');
+          showMsg('Failed: ' + detail, 'err');
+        }
+      } catch (e) {
+        showMsg('Network error. Please try again.', 'err');
+      } finally {
+        sendBtn.disabled = false; stopBtn.disabled = false;
+      }
+    };
+
+    joinForm.onsubmit = function (e) {
+      e.preventDefault();
+      callBot('/api/join', 'Sent! The notetaker has been asked to join.');
+    };
+    stopBtn.onclick = function () {
+      callBot('/api/leave', 'Stop requested. The notetaker is leaving the meeting.');
+    };
+  }
 
   /* ---- transcripts ---- */
   var tq = document.getElementById('tq');
@@ -542,10 +605,11 @@ function dashboardPage(email) {
   function group(segs) {
     var map = {};
     segs.forEach(function (seg) {
-      var id = seg.meeting_id;
-      if (!map[id]) map[id] = { meeting_id: id, segments: [], latest: '' };
-      map[id].segments.push(seg);
-      if ((seg.created_at || '') > map[id].latest) map[id].latest = seg.created_at || '';
+      var owner = seg.owner_email || '';
+      var key = owner + '#' + seg.meeting_id;
+      if (!map[key]) map[key] = { meeting_id: seg.meeting_id, owner: owner, segments: [], latest: '' };
+      map[key].segments.push(seg);
+      if ((seg.created_at || '') > map[key].latest) map[key].latest = seg.created_at || '';
     });
     var arr = Object.keys(map).map(function (k) { return map[k]; });
     arr.sort(function (a, b) {
@@ -571,7 +635,11 @@ function dashboardPage(email) {
       var card = document.createElement('div'); card.className = 'mcard';
       var head = document.createElement('button'); head.type = 'button'; head.className = 'mhead';
       var when = m.latest ? new Date(m.latest).toLocaleString() : '';
-      head.textContent = 'Meeting ' + m.meeting_id + '  ·  ' + segs.length + ' segment' + (segs.length === 1 ? '' : 's') + (when ? '  ·  ' + when : '');
+      var parts = ['Meeting ' + m.meeting_id];
+      if (m.owner) parts.push(m.owner);
+      parts.push(segs.length + ' segment' + (segs.length === 1 ? '' : 's'));
+      if (when) parts.push(when);
+      head.textContent = parts.join('  ·  ');
       var body = document.createElement('div'); body.className = 'mbody';
       body.style.display = filter ? 'block' : 'none';
       head.onclick = function () { body.style.display = body.style.display === 'none' ? 'block' : 'none'; };
