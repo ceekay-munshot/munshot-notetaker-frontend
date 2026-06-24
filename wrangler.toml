@@ -18,9 +18,8 @@ id = "759a21557c7d4e118296479f9b4c50a6"
 #     API_KEY      (required)  the X-API-Key value
 #     SIGNUP_CODE  (optional)  require a code to register
 
-# Transcripts database (D1). Uncomment and fill in once you have the database id
-# (Cloudflare dashboard → Storage & Databases → D1 → your DB → copy Database ID):
-# [[d1_databases]]
-# binding = "DB"
-# database_name = "YOUR_D1_DATABASE_NAME"
-# database_id = "YOUR_D1_DATABASE_ID"
+# Transcripts database (D1).
+[[d1_databases]]
+binding = "DB"
+database_name = "vexa-transcript"
+database_id = "d43cc292-3389-42ba-bd20-184ac4335360"
