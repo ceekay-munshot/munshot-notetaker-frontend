@@ -2,9 +2,10 @@ name = "munshot-notetaker-frontend"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
-# The munshot /public/join endpoint. Override here if it changes.
+# The munshot bot endpoints. Override here if the tunnel changes.
 [vars]
 JOIN_ENDPOINT = "https://save-robert-monitors-plugin.trycloudflare.com/public/join"
+LEAVE_ENDPOINT = "https://save-robert-monitors-plugin.trycloudflare.com/public/leave"
 
 # KV namespace for users + sessions (namespace: meetbot-users).
 [[kv_namespaces]]
@@ -16,3 +17,10 @@ id = "759a21557c7d4e118296479f9b4c50a6"
 #   Worker → Settings → Variables and Secrets → Add → type "Secret"
 #     API_KEY      (required)  the X-API-Key value
 #     SIGNUP_CODE  (optional)  require a code to register
+
+# Transcripts database (D1). Uncomment and fill in once you have the database id
+# (Cloudflare dashboard → Storage & Databases → D1 → your DB → copy Database ID):
+# [[d1_databases]]
+# binding = "DB"
+# database_name = "YOUR_D1_DATABASE_NAME"
+# database_id = "YOUR_D1_DATABASE_ID"

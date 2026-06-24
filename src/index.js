@@ -1,13 +1,15 @@
 // Munshot Notetaker — Cloudflare Worker
 // - KV-backed logins (one user = one `user:<email>` key)
 // - KV-backed sessions via HttpOnly cookie
-// - A meeting form that proxies to the munshot /public/join endpoint,
-//   injecting the API key server-side so it never reaches the browser.
+// - Join/leave the notetaker bot (email is taken from the session, never the body)
+// - D1-backed transcripts view, scoped to the signed-in user
 
 const COOKIE_NAME = "session";
 const SESSION_TTL = 60 * 60 * 24 * 7; // 7 days
 const DEFAULT_JOIN_ENDPOINT =
   "https://save-robert-monitors-plugin.trycloudflare.com/public/join";
+const DEFAULT_LEAVE_ENDPOINT =
+  "https://save-robert-monitors-plugin.trycloudflare.com/public/leave";
 
 export default {
   async fetch(request, env) {
@@ -21,10 +23,12 @@ export default {
       if (method === "POST" && pathname === "/api/register") return handleRegister(request, env);
       if (method === "POST" && pathname === "/api/login") return handleLogin(request, env);
       if (method === "POST" && pathname === "/api/logout") return handleLogout(request, env);
-      if (method === "POST" && pathname === "/api/join") return handleJoin(request, env);
+      if (method === "POST" && pathname === "/api/join") return handleBot(request, env, "join");
+      if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
+      if (method === "GET" && pathname === "/api/transcripts") return handleTranscripts(request, env);
       return new Response("Not found", { status: 404 });
     } catch (err) {
-      return json({ error: "Server error", detail: String(err && err.message || err) }, 500);
+      return json({ error: "Server error", detail: String((err && err.message) || err) }, 500);
     }
   },
 };
@@ -98,14 +102,24 @@ async function handleLogout(request, env) {
   return json({ ok: true }, 200, { "Set-Cookie": clearCookie() });
 }
 
-async function handleJoin(request, env) {
+function joinEndpoint(env) {
+  return env.JOIN_ENDPOINT || DEFAULT_JOIN_ENDPOINT;
+}
+
+function leaveEndpoint(env) {
+  if (env.LEAVE_ENDPOINT) return env.LEAVE_ENDPOINT;
+  if (env.JOIN_ENDPOINT) return env.JOIN_ENDPOINT.replace(/\/join\/?$/, "/leave");
+  return DEFAULT_LEAVE_ENDPOINT;
+}
+
+// Asks the notetaker bot to join or leave a meeting. The email is always taken
+// from the authenticated session — never from the request body.
+async function handleBot(request, env, action) {
   const email = await getSessionEmail(request, env);
   if (!email) return json({ error: "Not authenticated" }, 401);
 
   const body = await request.json().catch(() => ({}));
   const meetingUrl = String(body.meeting_url || "").trim();
-  const sendEmail = normalizeEmail(body.email) || email;
-
   if (!meetingUrl) return json({ error: "Meeting URL is required" }, 400);
   try {
     new URL(meetingUrl);
@@ -116,7 +130,7 @@ async function handleJoin(request, env) {
     return json({ error: "Server is missing the API_KEY secret" }, 500);
   }
 
-  const endpoint = env.JOIN_ENDPOINT || DEFAULT_JOIN_ENDPOINT;
+  const endpoint = action === "leave" ? leaveEndpoint(env) : joinEndpoint(env);
   let upstream;
   try {
     upstream = await fetch(endpoint, {
@@ -125,10 +139,10 @@ async function handleJoin(request, env) {
         "X-API-Key": env.API_KEY,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ email: sendEmail, meeting_url: meetingUrl }),
+      body: JSON.stringify({ email, meeting_url: meetingUrl }),
     });
   } catch (err) {
-    return json({ error: "Failed to reach the notetaker service", detail: String(err && err.message || err) }, 502);
+    return json({ error: "Failed to reach the notetaker service", detail: String((err && err.message) || err) }, 502);
   }
 
   const text = await upstream.text();
@@ -139,6 +153,24 @@ async function handleJoin(request, env) {
     data = { raw: text };
   }
   return json({ ok: upstream.ok, status: upstream.status, response: data }, upstream.ok ? 200 : 502);
+}
+
+// Returns the signed-in user's transcripts from D1. owner_email is derived from
+// the session server-side, so a user can never read another user's transcripts.
+async function handleTranscripts(request, env) {
+  const email = await getSessionEmail(request, env);
+  if (!email) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+
+  const sql =
+    "SELECT meeting_id, segment_id, start_time, end_time, text, speaker, created_at " +
+    "FROM transcriptions WHERE owner_email = ?1 ORDER BY meeting_id, start_time";
+  try {
+    const res = await env.DB.prepare(sql).bind(email).all();
+    return json({ ok: true, segments: res.results || [] });
+  } catch (err) {
+    return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
+  }
 }
 
 /* ------------------------------ auth helpers ------------------------------ */
@@ -250,6 +282,7 @@ const STYLE = `
     width: 100%; max-width: 420px; background: #1e293b; border: 1px solid #334155;
     border-radius: 14px; padding: 28px; box-shadow: 0 12px 40px rgba(0,0,0,.35);
   }
+  .card.wide { max-width: 720px; }
   h1 { margin: 0 0 4px; font-size: 22px; }
   .sub { margin: 0 0 22px; color: #94a3b8; font-size: 14px; }
   label { display: block; font-size: 13px; margin: 14px 0 6px; color: #cbd5e1; }
@@ -273,6 +306,25 @@ const STYLE = `
   .linkbtn { background: transparent; color: #94a3b8; width: auto; margin: 0; padding: 6px 8px; font-weight: 500; }
   .linkbtn:hover { background: #334155; color: #e2e8f0; }
   .hint { font-size: 12px; color: #64748b; margin-top: 6px; }
+  .btnrow { display: flex; gap: 10px; margin-top: 20px; }
+  .btnrow button { margin-top: 0; }
+  .btn-stop { background: #475569; color: #e2e8f0; }
+  .btn-stop:hover { background: #64748b; }
+  hr { border: 0; border-top: 1px solid #334155; margin: 26px 0 18px; }
+  .sect { display: flex; justify-content: space-between; align-items: center; }
+  .sect h2 { font-size: 16px; margin: 0; }
+  .search { margin: 14px 0 10px; }
+  .tstatus { color: #94a3b8; font-size: 13px; padding: 8px 0; }
+  .mcard { border: 1px solid #334155; border-radius: 10px; margin-bottom: 10px; overflow: hidden; }
+  .mhead { width: 100%; text-align: left; margin: 0; border-radius: 0; background: #0f172a; color: #e2e8f0; font-weight: 600; font-size: 13px; padding: 12px 14px; }
+  .mhead:hover { background: #162033; }
+  .mbody { padding: 6px 14px 12px; border-top: 1px solid #334155; }
+  .seg { font-size: 13px; line-height: 1.5; padding: 5px 0; border-bottom: 1px solid #1e293b; color: #cbd5e1; }
+  .seg:last-child { border-bottom: 0; }
+  .ts { color: #64748b; font-variant-numeric: tabular-nums; }
+  .sp { color: #38bdf8; font-weight: 600; }
+  .refresh { width: auto; margin: 0; padding: 6px 10px; background: transparent; color: #94a3b8; font-weight: 500; }
+  .refresh:hover { background: #334155; color: #e2e8f0; }
 `;
 
 function loginPage({ codeRequired }) {
@@ -392,13 +444,13 @@ function dashboardPage(email) {
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Munshot Notetaker — Send a meeting</title>
+<title>Munshot Notetaker — Dashboard</title>
 <style>${STYLE}</style>
 </head>
 <body>
-  <div class="card">
+  <div class="card wide">
     <div class="row">
-      <h1>Send a meeting</h1>
+      <h1>Notetaker</h1>
       <button class="linkbtn" id="logout">Log out</button>
     </div>
     <p class="sub">Signed in as ${safeEmail}</p>
@@ -406,18 +458,27 @@ function dashboardPage(email) {
     <form id="join-form">
       <label for="meeting">Meeting link</label>
       <input id="meeting" type="url" placeholder="https://meet.google.com/your-live-meet" required />
-      <label for="email">Notetaker email</label>
-      <input id="email" type="email" value="${safeEmail}" required />
-      <p class="hint">The notetaker bot will join this meeting under this email.</p>
-      <button type="submit">Send to notetaker</button>
+      <div class="btnrow">
+        <button type="submit" id="send-btn">Send to notetaker</button>
+        <button type="button" id="stop-btn" class="btn-stop">Stop bot</button>
+      </div>
     </form>
-
     <div class="msg" id="msg"></div>
+
+    <hr />
+
+    <div class="sect">
+      <h2>Your transcripts</h2>
+      <button class="refresh" id="refresh">Refresh</button>
+    </div>
+    <input class="search" id="tq" type="search" placeholder="Search transcript text…" />
+    <div class="tstatus" id="tstatus"></div>
+    <div id="tlist"></div>
   </div>
 
 <script>
-  var form = document.getElementById('join-form');
   var msg = document.getElementById('msg');
+  var meetingInput = document.getElementById('meeting');
 
   function showMsg(text, kind) {
     msg.textContent = text;
@@ -429,28 +490,23 @@ function dashboardPage(email) {
     window.location.href = '/';
   };
 
-  form.onsubmit = async function (e) {
-    e.preventDefault();
-    var btn = form.querySelector('button[type=submit]');
-    btn.disabled = true;
-    showMsg('Sending…', '');
+  async function callBot(path, okText) {
+    var url = meetingInput.value.trim();
+    if (!url) { showMsg('Enter the meeting link first.', 'err'); return; }
+    var sendBtn = document.getElementById('send-btn');
+    var stopBtn = document.getElementById('stop-btn');
+    sendBtn.disabled = true; stopBtn.disabled = true;
+    showMsg('Working…', '');
     try {
-      var res = await fetch('/api/join', {
+      var res = await fetch(path, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          meeting_url: document.getElementById('meeting').value,
-          email: document.getElementById('email').value,
-        }),
+        body: JSON.stringify({ meeting_url: url }),
       });
       var data = await res.json().catch(function () { return {}; });
-      if (res.status === 401) {
-        window.location.href = '/';
-        return;
-      }
+      if (res.status === 401) { window.location.href = '/'; return; }
       if (res.ok && data.ok) {
-        showMsg('Sent! The notetaker has been asked to join.', 'ok');
-        document.getElementById('meeting').value = '';
+        showMsg(okText, 'ok');
       } else {
         var detail = data.error || (data.response ? JSON.stringify(data.response) : 'Request failed.');
         showMsg('Failed: ' + detail, 'err');
@@ -458,9 +514,99 @@ function dashboardPage(email) {
     } catch (e) {
       showMsg('Network error. Please try again.', 'err');
     } finally {
-      btn.disabled = false;
+      sendBtn.disabled = false; stopBtn.disabled = false;
     }
+  }
+
+  document.getElementById('join-form').onsubmit = function (e) {
+    e.preventDefault();
+    callBot('/api/join', 'Sent! The notetaker has been asked to join.');
   };
+  document.getElementById('stop-btn').onclick = function () {
+    callBot('/api/leave', 'Stop requested. The notetaker is leaving the meeting.');
+  };
+
+  /* ---- transcripts ---- */
+  var tq = document.getElementById('tq');
+  var tlist = document.getElementById('tlist');
+  var tstatus = document.getElementById('tstatus');
+  var meetings = [];
+  var hasSegments = false;
+
+  function fmtTime(s) {
+    s = Math.max(0, Math.floor(Number(s) || 0));
+    var m = Math.floor(s / 60), x = s % 60;
+    return (m < 10 ? '0' : '') + m + ':' + (x < 10 ? '0' : '') + x;
+  }
+
+  function group(segs) {
+    var map = {};
+    segs.forEach(function (seg) {
+      var id = seg.meeting_id;
+      if (!map[id]) map[id] = { meeting_id: id, segments: [], latest: '' };
+      map[id].segments.push(seg);
+      if ((seg.created_at || '') > map[id].latest) map[id].latest = seg.created_at || '';
+    });
+    var arr = Object.keys(map).map(function (k) { return map[k]; });
+    arr.sort(function (a, b) {
+      if (a.latest !== b.latest) return a.latest < b.latest ? 1 : -1;
+      return Number(b.meeting_id) - Number(a.meeting_id);
+    });
+    arr.forEach(function (m) {
+      m.segments.sort(function (a, b) { return (Number(a.start_time) || 0) - (Number(b.start_time) || 0); });
+    });
+    return arr;
+  }
+
+  function render() {
+    var filter = (tq.value || '').trim().toLowerCase();
+    tlist.innerHTML = '';
+    if (!hasSegments) { tstatus.textContent = 'No transcripts yet.'; return; }
+    var shown = 0;
+    meetings.forEach(function (m) {
+      var segs = m.segments;
+      if (filter) segs = segs.filter(function (s) { return (s.text || '').toLowerCase().indexOf(filter) > -1; });
+      if (!segs.length) return;
+      shown++;
+      var card = document.createElement('div'); card.className = 'mcard';
+      var head = document.createElement('button'); head.type = 'button'; head.className = 'mhead';
+      var when = m.latest ? new Date(m.latest).toLocaleString() : '';
+      head.textContent = 'Meeting ' + m.meeting_id + '  ·  ' + segs.length + ' segment' + (segs.length === 1 ? '' : 's') + (when ? '  ·  ' + when : '');
+      var body = document.createElement('div'); body.className = 'mbody';
+      body.style.display = filter ? 'block' : 'none';
+      head.onclick = function () { body.style.display = body.style.display === 'none' ? 'block' : 'none'; };
+      segs.forEach(function (s) {
+        var rowEl = document.createElement('div'); rowEl.className = 'seg';
+        var ts = document.createElement('span'); ts.className = 'ts'; ts.textContent = '[' + fmtTime(s.start_time) + '] ';
+        var sp = document.createElement('span'); sp.className = 'sp'; sp.textContent = (s.speaker || 'Unknown') + ': ';
+        var tx = document.createElement('span'); tx.textContent = s.text || '';
+        rowEl.appendChild(ts); rowEl.appendChild(sp); rowEl.appendChild(tx);
+        body.appendChild(rowEl);
+      });
+      card.appendChild(head); card.appendChild(body); tlist.appendChild(card);
+    });
+    tstatus.textContent = shown ? '' : (filter ? 'No segments match your search.' : 'No transcripts yet.');
+  }
+
+  async function loadTranscripts() {
+    tstatus.textContent = 'Loading transcripts…';
+    try {
+      var res = await fetch('/api/transcripts');
+      if (res.status === 401) { window.location.href = '/'; return; }
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) { hasSegments = false; meetings = []; tlist.innerHTML = ''; tstatus.textContent = data.error || 'Could not load transcripts.'; return; }
+      var segs = data.segments || [];
+      hasSegments = segs.length > 0;
+      meetings = group(segs);
+      render();
+    } catch (e) {
+      tstatus.textContent = 'Network error loading transcripts.';
+    }
+  }
+
+  tq.oninput = render;
+  document.getElementById('refresh').onclick = loadTranscripts;
+  loadTranscripts();
 </script>
 </body>
 </html>`;
