@@ -9,9 +9,9 @@
 const COOKIE_NAME = "session";
 const SESSION_TTL = 60 * 60 * 24 * 7; // 7 days
 const DEFAULT_JOIN_ENDPOINT =
-  "https://amy-recruitment-blair-vinyl.trycloudflare.com/public/join";
+  "https://ranging-fur-southampton-troubleshooting.trycloudflare.com/public/join";
 const DEFAULT_LEAVE_ENDPOINT =
-  "https://amy-recruitment-blair-vinyl.trycloudflare.com/public/leave";
+  "https://ranging-fur-southampton-troubleshooting.trycloudflare.com/public/leave";
 
 export default {
   async fetch(request, env) {
