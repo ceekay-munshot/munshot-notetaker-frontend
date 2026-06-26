@@ -35,16 +35,29 @@ A single Cloudflare Worker that provides:
 ```json
 {
   "meeting_url": "<your meeting link>",
-  "run_at": 1750000000000,          // epoch ms of the first run
-  "recurrence": "once",             // "once" | "daily" | "weekdays" | "weekly"
-  "tz_offset": -120                 // browser getTimezoneOffset(), for "weekdays"
+  "local_datetime": "2026-06-27T09:00",   // wall-clock time, as picked
+  "recurrence": "daily",                  // "once" | "daily" | "weekdays" | "weekly"
+  "time_zone": "America/New_York"         // IANA zone the wall-clock is in
 }
 ```
 
+The chosen wall-clock time is resolved to a real UTC instant in the chosen
+**IANA time zone**, so a schedule fires at the right local time even for users in
+other zones. Recurring schedules recompute their next run as wall-clock → UTC each
+time, so routines stay anchored to local time across **DST** changes (e.g. a daily
+09:00 New York routine fires at 14:00 UTC in winter and 13:00 UTC in summer).
+
 Schedules are stored in KV under `schedule:<owner>:<id>`. A Cron Trigger (`* * * * *`)
 runs `runDueSchedules` every minute: it sends each due meeting to `/api/join`'s
-upstream, then advances recurring schedules to their next occurrence or removes
-one-time ones. A one-time send that fails is retried for a few minutes, then dropped.
+upstream, then recomputes recurring schedules' next occurrence or removes one-time
+ones. A one-time send that fails is retried for a few minutes, then dropped.
+
+> **Why a Cron Trigger?** Workers are serverless — nothing stays running between
+> requests. The schedule itself lives in **KV** (durable storage), and Cloudflare's
+> Cron Trigger wakes a *fresh* Worker instance once a minute to check KV for due
+> schedules and fire them. No process is held open waiting for the time to arrive.
+> (Cron Triggers are a **Workers** feature; Cloudflare **Pages** Functions don't
+> have them — this project is a Worker, so it works.)
 
 ## Setup & deploy
 

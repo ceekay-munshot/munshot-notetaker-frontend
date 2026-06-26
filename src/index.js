@@ -265,6 +265,7 @@ function publicSchedule(s) {
     meetingUrl: s.meetingUrl,
     nextRun: s.nextRun,
     recurrence: s.recurrence,
+    timeZone: s.timeZone || "UTC",
     lastRun: s.lastRun || null,
     lastStatus: s.lastStatus || null,
   };
@@ -286,9 +287,9 @@ async function handleCreateSchedule(request, env) {
 
   const body = await request.json().catch(() => ({}));
   const meetingUrl = String(body.meeting_url || "").trim();
-  const runAt = Number(body.run_at);
   const recurrence = RECURRENCES.includes(body.recurrence) ? body.recurrence : "once";
-  const tzOffset = Number.isFinite(Number(body.tz_offset)) ? Number(body.tz_offset) : 0;
+  const timeZone = body.time_zone;
+  const local = parseLocalDateTime(body.local_datetime);
 
   if (!meetingUrl) return json({ error: "Meeting URL is required" }, 400);
   try {
@@ -296,17 +297,25 @@ async function handleCreateSchedule(request, env) {
   } catch {
     return json({ error: "Enter a valid meeting URL" }, 400);
   }
-  if (!Number.isFinite(runAt)) return json({ error: "Pick a date and time" }, 400);
+  if (!isValidTimeZone(timeZone)) return json({ error: "Pick a valid time zone" }, 400);
+  if (!local) return json({ error: "Pick a date and time" }, 400);
 
   const now = Date.now();
-  let nextRun = runAt;
+  // The wall-clock time the user picked, resolved to a real UTC instant in their
+  // chosen zone (DST-aware). `weekday` anchors weekly routines.
+  const firstUtc = wallTimeToUtc(local, timeZone);
+  const weekday = addDays(local.year, local.month, local.day, 0).dow;
+
+  let nextRun;
   if (recurrence === "once") {
-    if (nextRun < now - 60000) return json({ error: "Pick a time in the future" }, 400);
+    if (firstUtc < now - 60000) return json({ error: "Pick a time in the future" }, 400);
+    nextRun = firstUtc;
   } else {
-    // Roll a routine's first run forward until it lands in the future, so a
-    // start time earlier today doesn't fire a backlog the moment it's saved.
-    let guard = 0;
-    while (nextRun <= now && guard++ < 4000) nextRun = advanceRun(nextRun, recurrence, tzOffset);
+    // First occurrence at or after the picked time that obeys the repeat rule —
+    // e.g. a Saturday pick for a weekdays routine rolls forward to Monday.
+    const anchor = Math.max(now, firstUtc - 1);
+    nextRun = nextRecurringRun(anchor, { recurrence, hour: local.hour, minute: local.minute, weekday, timeZone });
+    if (!nextRun) return json({ error: "Could not compute the next run time" }, 400);
   }
 
   const existing = await listSchedulesFor(env, owner);
@@ -320,7 +329,10 @@ async function handleCreateSchedule(request, env) {
     owner,
     meetingUrl,
     recurrence,
-    tzOffset,
+    timeZone,
+    hour: local.hour,
+    minute: local.minute,
+    weekday,
     nextRun,
     createdAt: now,
     lastRun: null,
@@ -343,23 +355,84 @@ async function handleDeleteSchedule(request, env) {
   return json({ ok: true });
 }
 
-// Advances a run time to the next occurrence for a recurring schedule. tzOffset
-// is the browser's getTimezoneOffset() (minutes), so "weekdays" is judged in the
-// user's local time rather than UTC. (DST shifts are not tracked.)
-function advanceRun(ms, recurrence, tzOffset) {
-  const DAY = 86400000;
-  if (recurrence === "daily") return ms + DAY;
-  if (recurrence === "weekly") return ms + 7 * DAY;
-  if (recurrence === "weekdays") {
-    let next = ms + DAY;
-    for (let i = 0; i < 7; i++) {
-      const localDow = new Date(next - tzOffset * 60000).getUTCDay();
-      if (localDow !== 0 && localDow !== 6) break; // 0 = Sun, 6 = Sat
-      next += DAY;
-    }
-    return next;
+// Parses a browser <input type="datetime-local"> value ("YYYY-MM-DDTHH:MM")
+// into bare wall-clock fields. No zone is implied — that comes from time_zone.
+function parseLocalDateTime(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::\d{2})?$/.exec(String(s || ""));
+  if (!m) return null;
+  return { year: +m[1], month: +m[2], day: +m[3], hour: +m[4], minute: +m[5] };
+}
+
+// True if `tz` is a real IANA zone this runtime understands.
+function isValidTimeZone(tz) {
+  if (!tz || typeof tz !== "string") return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
   }
-  return ms; // "once" never recurs
+}
+
+// The offset (ms, local − UTC) that `timeZone` had at a given UTC instant.
+// Derived by formatting the instant in the zone and reading the wall clock back.
+function zoneOffsetMs(utcMs, timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  const p = {};
+  for (const part of dtf.formatToParts(new Date(utcMs))) p[part.type] = part.value;
+  const asIfUtc = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+  return asIfUtc - utcMs;
+}
+
+// Converts a wall-clock time in `timeZone` to its UTC epoch ms. Two passes
+// resolve DST: the second uses the offset that actually applies at the result.
+function wallTimeToUtc({ year, month, day, hour, minute }, timeZone) {
+  const naive = Date.UTC(year, month - 1, day, hour, minute, 0);
+  let utc = naive - zoneOffsetMs(naive, timeZone);
+  utc = naive - zoneOffsetMs(utc, timeZone);
+  return utc;
+}
+
+// The local calendar/clock fields of a UTC instant in `timeZone`.
+function zoneParts(utcMs, timeZone) {
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone, hour12: false,
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit",
+  });
+  const p = {};
+  for (const part of dtf.formatToParts(new Date(utcMs))) p[part.type] = part.value;
+  return { year: +p.year, month: +p.month, day: +p.day, hour: +p.hour, minute: +p.minute };
+}
+
+// A calendar date `n` days after y/m/d, with its day-of-week (0 = Sun … 6 = Sat).
+function addDays(y, m, d, n) {
+  const t = new Date(Date.UTC(y, m - 1, d));
+  t.setUTCDate(t.getUTCDate() + n);
+  return { y: t.getUTCFullYear(), m: t.getUTCMonth() + 1, d: t.getUTCDate(), dow: t.getUTCDay() };
+}
+
+// The next UTC instant strictly after `afterMs` whose local wall clock in
+// `timeZone` is hour:minute on a day the recurrence allows (weekly matches
+// `weekday`). Recomputing wall-clock → UTC each time keeps routines correct
+// across DST: the local time stays put while the UTC instant shifts.
+function nextRecurringRun(afterMs, { recurrence, hour, minute, weekday, timeZone }) {
+  const start = zoneParts(afterMs, timeZone);
+  for (let i = 0; i <= 372; i++) {
+    const cal = addDays(start.year, start.month, start.day, i);
+    const ok =
+      recurrence === "daily" ||
+      (recurrence === "weekdays" && cal.dow >= 1 && cal.dow <= 5) ||
+      (recurrence === "weekly" && cal.dow === weekday);
+    if (!ok) continue;
+    const utc = wallTimeToUtc({ year: cal.y, month: cal.m, day: cal.d, hour, minute }, timeZone);
+    if (utc > afterMs) return utc;
+  }
+  return null;
 }
 
 function stripMeta(s) {
@@ -386,14 +459,22 @@ async function runDueSchedules(env) {
     s.lastRun = now;
 
     if (s.recurrence !== "once") {
-      // Fire once now, then skip ahead to the next future occurrence so a
+      // Fire once now, then recompute the next occurrence strictly after now so a
       // long-overdue routine doesn't re-fire every minute until it catches up.
       s.attempts = 0;
-      let next = advanceRun(s.nextRun, s.recurrence, s.tzOffset || 0);
-      let guard = 0;
-      while (next <= now && guard++ < 4000) next = advanceRun(next, s.recurrence, s.tzOffset || 0);
-      s.nextRun = next;
-      await env.KV.put(s._key, JSON.stringify(stripMeta(s)));
+      const next = nextRecurringRun(now, {
+        recurrence: s.recurrence,
+        hour: s.hour,
+        minute: s.minute,
+        weekday: s.weekday,
+        timeZone: s.timeZone,
+      });
+      if (next) {
+        s.nextRun = next;
+        await env.KV.put(s._key, JSON.stringify(stripMeta(s)));
+      } else {
+        await env.KV.delete(s._key); // unreachable in practice; never loop forever
+      }
     } else if (ok) {
       await env.KV.delete(s._key);
     } else {
@@ -596,6 +677,7 @@ const STYLE = `
   .schedule .info { font-size: 13px; line-height: 1.5; min-width: 0; }
   .schedule .when { color: #e2e8f0; font-weight: 600; }
   .schedule .rec { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-size: 11px; background: #334155; color: #cbd5e1; font-weight: 600; }
+  .schedule .tzlabel { color: #64748b; font-size: 12px; margin-left: 6px; }
   .schedule .url { color: #94a3b8; word-break: break-all; }
   .schedule .last { color: #64748b; font-size: 12px; }
   .cancel { width: auto; margin: 0; padding: 6px 10px; background: #475569; color: #e2e8f0; font-weight: 500; font-size: 13px; flex-shrink: 0; }
@@ -749,6 +831,8 @@ function dashboardPage(identity, isAdmin) {
           </select>
         </div>
       </div>
+      <label for="sched-tz">Time zone</label>
+      <select id="sched-tz"></select>
       <button type="submit" id="sched-btn">Schedule it</button>
     </form>
     <div class="msg" id="sched-msg"></div>
@@ -844,7 +928,37 @@ ${formSection}
     var schedMsg = document.getElementById('sched-msg');
     var schedList = document.getElementById('sched-list');
     var schedBtn = document.getElementById('sched-btn');
+    var tzSelect = document.getElementById('sched-tz');
     var recNames = { once: 'One time', daily: 'Daily', weekdays: 'Weekdays', weekly: 'Weekly' };
+
+    // Detect the browser's zone, then offer the full IANA list (falling back to
+    // just the detected zone on older browsers without supportedValuesOf).
+    var detectedZone = 'UTC';
+    try { detectedZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch (e) {}
+    (function fillZones() {
+      var zones = [];
+      try { if (Intl.supportedValuesOf) zones = Intl.supportedValuesOf('timeZone'); } catch (e) {}
+      if (!zones.length) zones = ['UTC'];
+      if (zones.indexOf(detectedZone) === -1) zones.unshift(detectedZone);
+      zones.forEach(function (z) {
+        var o = document.createElement('option');
+        o.value = z; o.textContent = z;
+        if (z === detectedZone) o.selected = true;
+        tzSelect.appendChild(o);
+      });
+    })();
+
+    // Render an instant in a specific zone, so each schedule reads in its own.
+    function fmtIn(ms, tz) {
+      try {
+        return new Date(ms).toLocaleString([], {
+          timeZone: tz, year: 'numeric', month: 'short', day: 'numeric',
+          hour: '2-digit', minute: '2-digit',
+        });
+      } catch (e) {
+        return new Date(ms).toLocaleString();
+      }
+    }
 
     var showSched = function (text, kind) {
       schedMsg.textContent = text;
@@ -859,17 +973,19 @@ ${formSection}
 
         var when = document.createElement('div');
         var w = document.createElement('span'); w.className = 'when';
-        w.textContent = s.nextRun ? new Date(s.nextRun).toLocaleString() : '—';
+        w.textContent = s.nextRun ? fmtIn(s.nextRun, s.timeZone) : '—';
         var rec = document.createElement('span'); rec.className = 'rec';
         rec.textContent = recNames[s.recurrence] || s.recurrence;
-        when.appendChild(w); when.appendChild(rec);
+        var tz = document.createElement('span'); tz.className = 'tzlabel';
+        tz.textContent = s.timeZone || '';
+        when.appendChild(w); when.appendChild(rec); when.appendChild(tz);
 
         var url = document.createElement('div'); url.className = 'url'; url.textContent = s.meetingUrl;
         info.appendChild(when); info.appendChild(url);
 
         if (s.lastRun) {
           var last = document.createElement('div'); last.className = 'last';
-          last.textContent = 'Last run ' + new Date(s.lastRun).toLocaleString() + (s.lastStatus ? ' · ' + s.lastStatus : '');
+          last.textContent = 'Last run ' + fmtIn(s.lastRun, s.timeZone) + (s.lastStatus ? ' · ' + s.lastStatus : '');
           info.appendChild(last);
         }
 
@@ -907,9 +1023,8 @@ ${formSection}
       var url = document.getElementById('sched-url').value.trim();
       var whenVal = document.getElementById('sched-when').value;
       var rec = document.getElementById('sched-rec').value;
+      var tz = tzSelect.value || detectedZone;
       if (!url || !whenVal) { showSched('Enter a meeting link and a time.', 'err'); return; }
-      var runAt = new Date(whenVal).getTime();
-      if (!runAt) { showSched('That date and time looks invalid.', 'err'); return; }
       schedBtn.disabled = true;
       showSched('Scheduling…', '');
       try {
@@ -918,9 +1033,9 @@ ${formSection}
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             meeting_url: url,
-            run_at: runAt,
+            local_datetime: whenVal,
             recurrence: rec,
-            tz_offset: new Date().getTimezoneOffset(),
+            time_zone: tz,
           }),
         });
         if (res.status === 401) { window.location.href = '/'; return; }
