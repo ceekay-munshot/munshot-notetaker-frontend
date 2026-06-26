@@ -2,6 +2,12 @@ name = "munshot-notetaker-frontend"
 main = "src/index.js"
 compatibility_date = "2024-11-01"
 
+# Cron trigger: runs the scheduled-meeting runner every minute so the notetaker
+# joins on time whether or not anyone has the dashboard open. 1 minute is the
+# finest Cloudflare granularity, so scheduled times are honoured to the minute.
+[triggers]
+crons = ["* * * * *"]
+
 # The munshot bot endpoints. Override here if the tunnel changes.
 [vars]
 JOIN_ENDPOINT = "https://ranging-fur-southampton-troubleshooting.trycloudflare.com/public/join"

@@ -13,6 +13,11 @@ const DEFAULT_JOIN_ENDPOINT =
 const DEFAULT_LEAVE_ENDPOINT =
   "https://ranging-fur-southampton-troubleshooting.trycloudflare.com/public/leave";
 
+const SCHEDULE_PREFIX = "schedule:";
+const MAX_SCHEDULES_PER_USER = 50;
+const MAX_SCHEDULE_ATTEMPTS = 3; // give up on a failing one-time send after this many cron ticks
+const RECURRENCES = ["once", "daily", "weekdays", "weekly"];
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -28,10 +33,19 @@ export default {
       if (method === "POST" && pathname === "/api/join") return handleBot(request, env, "join");
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
       if (method === "GET" && pathname === "/api/transcripts") return handleTranscripts(request, env);
+      if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
+      if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
+      if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
       return new Response("Not found", { status: 404 });
     } catch (err) {
       return json({ error: "Server error", detail: String((err && err.message) || err) }, 500);
     }
+  },
+
+  // Cron-triggered (see [triggers] in wrangler.toml). Fires every schedule whose
+  // time has arrived, regardless of whether the user has the dashboard open.
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runDueSchedules(env));
   },
 };
 
@@ -150,21 +164,28 @@ async function handleBot(request, env, action) {
     return json({ error: "Server is missing the API_KEY secret" }, 500);
   }
 
-  const endpoint = action === "leave" ? leaveEndpoint(env) : joinEndpoint(env);
-  let upstream;
+  let result;
   try {
-    upstream = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "X-API-Key": env.API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ email, meeting_url: meetingUrl }),
-    });
+    result = await dispatchBot(env, action, email, meetingUrl);
   } catch (err) {
     return json({ error: "Failed to reach the notetaker service", detail: String((err && err.message) || err) }, 502);
   }
+  return json({ ok: result.ok, status: result.status, response: result.data }, result.ok ? 200 : 502);
+}
 
+// Calls the munshot bot's join/leave endpoint with the server-held API key.
+// Returns { ok, status, data }; throws only on a network failure. Shared by the
+// interactive /api/join|leave routes and the cron-driven schedule runner.
+async function dispatchBot(env, action, email, meetingUrl) {
+  const endpoint = action === "leave" ? leaveEndpoint(env) : joinEndpoint(env);
+  const upstream = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "X-API-Key": env.API_KEY,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ email, meeting_url: meetingUrl }),
+  });
   const text = await upstream.text();
   let data;
   try {
@@ -172,7 +193,7 @@ async function handleBot(request, env, action) {
   } catch {
     data = { raw: text };
   }
-  return json({ ok: upstream.ok, status: upstream.status, response: data }, upstream.ok ? 200 : 502);
+  return { ok: upstream.ok, status: upstream.status, data };
 }
 
 // Returns transcripts from D1. A normal user sees only rows whose owner_email
@@ -198,6 +219,192 @@ async function handleTranscripts(request, env) {
     return json({ ok: true, admin: session.isAdmin, segments: res.results || [] });
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
+  }
+}
+
+/* ------------------------------ schedules ------------------------------ */
+
+// Schedules live in KV under `schedule:<owner>:<id>`. Keying by owner lets a
+// user list/cancel only their own, and lets the cron scan every owner's at once.
+function scheduleKey(owner, id) {
+  return `${SCHEDULE_PREFIX}${encodeURIComponent(owner)}:${id}`;
+}
+
+// Reads every schedule under a KV prefix (one get per schedule), soonest first.
+// A bare SCHEDULE_PREFIX scans all owners; `${SCHEDULE_PREFIX}<owner>:` one user.
+async function readSchedules(env, prefix) {
+  const out = [];
+  let cursor;
+  do {
+    const page = await env.KV.list({ prefix, cursor });
+    for (const k of page.keys) {
+      const raw = await env.KV.get(k.name);
+      if (!raw) continue;
+      try {
+        const s = JSON.parse(raw);
+        s._key = k.name;
+        out.push(s);
+      } catch {
+        /* skip a corrupt entry */
+      }
+    }
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+  out.sort((a, b) => (a.nextRun || 0) - (b.nextRun || 0));
+  return out;
+}
+
+function listSchedulesFor(env, owner) {
+  return readSchedules(env, `${SCHEDULE_PREFIX}${encodeURIComponent(owner)}:`);
+}
+
+// Only the safe, client-facing fields — never the owner or internal counters.
+function publicSchedule(s) {
+  return {
+    id: s.id,
+    meetingUrl: s.meetingUrl,
+    nextRun: s.nextRun,
+    recurrence: s.recurrence,
+    lastRun: s.lastRun || null,
+    lastStatus: s.lastStatus || null,
+  };
+}
+
+async function handleListSchedules(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ ok: true, schedules: [] });
+  const schedules = await listSchedulesFor(env, session.identity);
+  return json({ ok: true, schedules: schedules.map(publicSchedule) });
+}
+
+async function handleCreateSchedule(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts can't schedule meetings" }, 403);
+  const owner = session.identity;
+
+  const body = await request.json().catch(() => ({}));
+  const meetingUrl = String(body.meeting_url || "").trim();
+  const runAt = Number(body.run_at);
+  const recurrence = RECURRENCES.includes(body.recurrence) ? body.recurrence : "once";
+  const tzOffset = Number.isFinite(Number(body.tz_offset)) ? Number(body.tz_offset) : 0;
+
+  if (!meetingUrl) return json({ error: "Meeting URL is required" }, 400);
+  try {
+    new URL(meetingUrl);
+  } catch {
+    return json({ error: "Enter a valid meeting URL" }, 400);
+  }
+  if (!Number.isFinite(runAt)) return json({ error: "Pick a date and time" }, 400);
+
+  const now = Date.now();
+  let nextRun = runAt;
+  if (recurrence === "once") {
+    if (nextRun < now - 60000) return json({ error: "Pick a time in the future" }, 400);
+  } else {
+    // Roll a routine's first run forward until it lands in the future, so a
+    // start time earlier today doesn't fire a backlog the moment it's saved.
+    let guard = 0;
+    while (nextRun <= now && guard++ < 4000) nextRun = advanceRun(nextRun, recurrence, tzOffset);
+  }
+
+  const existing = await listSchedulesFor(env, owner);
+  if (existing.length >= MAX_SCHEDULES_PER_USER) {
+    return json({ error: `You can have at most ${MAX_SCHEDULES_PER_USER} schedules` }, 409);
+  }
+
+  const id = crypto.randomUUID();
+  const schedule = {
+    id,
+    owner,
+    meetingUrl,
+    recurrence,
+    tzOffset,
+    nextRun,
+    createdAt: now,
+    lastRun: null,
+    lastStatus: null,
+    attempts: 0,
+  };
+  await env.KV.put(scheduleKey(owner, id), JSON.stringify(schedule));
+  return json({ ok: true, schedule: publicSchedule(schedule) }, 201);
+}
+
+async function handleDeleteSchedule(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts can't schedule meetings" }, 403);
+  const body = await request.json().catch(() => ({}));
+  const id = String(body.id || "").trim();
+  if (!id) return json({ error: "Schedule id is required" }, 400);
+  // The key embeds the session owner, so a user can only ever delete their own.
+  await env.KV.delete(scheduleKey(session.identity, id));
+  return json({ ok: true });
+}
+
+// Advances a run time to the next occurrence for a recurring schedule. tzOffset
+// is the browser's getTimezoneOffset() (minutes), so "weekdays" is judged in the
+// user's local time rather than UTC. (DST shifts are not tracked.)
+function advanceRun(ms, recurrence, tzOffset) {
+  const DAY = 86400000;
+  if (recurrence === "daily") return ms + DAY;
+  if (recurrence === "weekly") return ms + 7 * DAY;
+  if (recurrence === "weekdays") {
+    let next = ms + DAY;
+    for (let i = 0; i < 7; i++) {
+      const localDow = new Date(next - tzOffset * 60000).getUTCDay();
+      if (localDow !== 0 && localDow !== 6) break; // 0 = Sun, 6 = Sat
+      next += DAY;
+    }
+    return next;
+  }
+  return ms; // "once" never recurs
+}
+
+function stripMeta(s) {
+  const { _key, ...rest } = s;
+  return rest;
+}
+
+// Cron entry point: fires every schedule whose time has come, then advances it
+// (recurring) or removes it (one-time). Server-side, so it works whether or not
+// the user has the dashboard open.
+async function runDueSchedules(env) {
+  const now = Date.now();
+  const due = (await readSchedules(env, SCHEDULE_PREFIX)).filter((s) => (s.nextRun || 0) <= now);
+  for (const s of due) {
+    let ok = false;
+    try {
+      if (!env.API_KEY) throw new Error("missing API_KEY");
+      const r = await dispatchBot(env, "join", s.owner, s.meetingUrl);
+      ok = r.ok;
+      s.lastStatus = r.ok ? "sent" : `error ${r.status}`;
+    } catch (err) {
+      s.lastStatus = `error: ${String((err && err.message) || err)}`;
+    }
+    s.lastRun = now;
+
+    if (s.recurrence !== "once") {
+      // Fire once now, then skip ahead to the next future occurrence so a
+      // long-overdue routine doesn't re-fire every minute until it catches up.
+      s.attempts = 0;
+      let next = advanceRun(s.nextRun, s.recurrence, s.tzOffset || 0);
+      let guard = 0;
+      while (next <= now && guard++ < 4000) next = advanceRun(next, s.recurrence, s.tzOffset || 0);
+      s.nextRun = next;
+      await env.KV.put(s._key, JSON.stringify(stripMeta(s)));
+    } else if (ok) {
+      await env.KV.delete(s._key);
+    } else {
+      // One-time send failed — retry on the next tick, but give up eventually.
+      s.attempts = (s.attempts || 0) + 1;
+      if (s.attempts >= MAX_SCHEDULE_ATTEMPTS) {
+        await env.KV.delete(s._key);
+      } else {
+        await env.KV.put(s._key, JSON.stringify(stripMeta(s)));
+      }
+    }
   }
 }
 
@@ -344,6 +551,11 @@ const STYLE = `
     background: #0f172a; color: #e2e8f0; font-size: 14px;
   }
   input:focus { outline: none; border-color: #38bdf8; }
+  select {
+    width: 100%; padding: 11px 12px; border-radius: 9px; border: 1px solid #475569;
+    background: #0f172a; color: #e2e8f0; font-size: 14px;
+  }
+  select:focus { outline: none; border-color: #38bdf8; }
   button {
     width: 100%; margin-top: 20px; padding: 12px; border: 0; border-radius: 9px;
     background: #38bdf8; color: #04263a; font-weight: 600; font-size: 15px; cursor: pointer;
@@ -378,6 +590,16 @@ const STYLE = `
   .sp { color: #38bdf8; font-weight: 600; }
   .refresh { width: auto; margin: 0; padding: 6px 10px; background: transparent; color: #94a3b8; font-weight: 500; }
   .refresh:hover { background: #334155; color: #e2e8f0; }
+  .row2 { display: flex; gap: 12px; }
+  .row2 > div { flex: 1; min-width: 0; }
+  .schedule { border: 1px solid #334155; border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+  .schedule .info { font-size: 13px; line-height: 1.5; min-width: 0; }
+  .schedule .when { color: #e2e8f0; font-weight: 600; }
+  .schedule .rec { display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px; font-size: 11px; background: #334155; color: #cbd5e1; font-weight: 600; }
+  .schedule .url { color: #94a3b8; word-break: break-all; }
+  .schedule .last { color: #64748b; font-size: 12px; }
+  .cancel { width: auto; margin: 0; padding: 6px 10px; background: #475569; color: #e2e8f0; font-weight: 500; font-size: 13px; flex-shrink: 0; }
+  .cancel:hover { background: #64748b; }
 `;
 
 function loginPage({ codeRequired }) {
@@ -506,6 +728,33 @@ function dashboardPage(identity, isAdmin) {
     <div class="msg" id="msg"></div>
 
     <hr />
+
+    <div class="sect"><h2>Scheduled &amp; routines</h2></div>
+    <p class="hint">Pick a time and the notetaker joins on its own — you don't need to be online. Choose a repeat to turn it into a routine.</p>
+    <form id="sched-form">
+      <label for="sched-url">Meeting link</label>
+      <input id="sched-url" type="url" placeholder="https://meet.google.com/your-live-meet" required />
+      <div class="row2">
+        <div>
+          <label for="sched-when">When</label>
+          <input id="sched-when" type="datetime-local" required />
+        </div>
+        <div>
+          <label for="sched-rec">Repeat</label>
+          <select id="sched-rec">
+            <option value="once">One time</option>
+            <option value="daily">Every day</option>
+            <option value="weekdays">Weekdays (Mon–Fri)</option>
+            <option value="weekly">Every week</option>
+          </select>
+        </div>
+      </div>
+      <button type="submit" id="sched-btn">Schedule it</button>
+    </form>
+    <div class="msg" id="sched-msg"></div>
+    <div id="sched-list"></div>
+
+    <hr />
 `;
   const subline = isAdmin
     ? `Signed in as ${safe} <span class="badge">ADMIN</span>`
@@ -587,6 +836,111 @@ ${formSection}
     stopBtn.onclick = function () {
       callBot('/api/leave', 'Stop requested. The notetaker is leaving the meeting.');
     };
+  }
+
+  /* ---- schedules & routines ---- */
+  var schedForm = document.getElementById('sched-form');
+  if (schedForm) {
+    var schedMsg = document.getElementById('sched-msg');
+    var schedList = document.getElementById('sched-list');
+    var schedBtn = document.getElementById('sched-btn');
+    var recNames = { once: 'One time', daily: 'Daily', weekdays: 'Weekdays', weekly: 'Weekly' };
+
+    var showSched = function (text, kind) {
+      schedMsg.textContent = text;
+      schedMsg.className = 'msg' + (kind ? ' ' + kind : '');
+    };
+
+    function renderSchedules(items) {
+      schedList.innerHTML = '';
+      items.forEach(function (s) {
+        var row = document.createElement('div'); row.className = 'schedule';
+        var info = document.createElement('div'); info.className = 'info';
+
+        var when = document.createElement('div');
+        var w = document.createElement('span'); w.className = 'when';
+        w.textContent = s.nextRun ? new Date(s.nextRun).toLocaleString() : '—';
+        var rec = document.createElement('span'); rec.className = 'rec';
+        rec.textContent = recNames[s.recurrence] || s.recurrence;
+        when.appendChild(w); when.appendChild(rec);
+
+        var url = document.createElement('div'); url.className = 'url'; url.textContent = s.meetingUrl;
+        info.appendChild(when); info.appendChild(url);
+
+        if (s.lastRun) {
+          var last = document.createElement('div'); last.className = 'last';
+          last.textContent = 'Last run ' + new Date(s.lastRun).toLocaleString() + (s.lastStatus ? ' · ' + s.lastStatus : '');
+          info.appendChild(last);
+        }
+
+        var btn = document.createElement('button'); btn.className = 'cancel'; btn.textContent = 'Cancel';
+        btn.onclick = function () { cancelSchedule(s.id, btn); };
+        row.appendChild(info); row.appendChild(btn);
+        schedList.appendChild(row);
+      });
+    }
+
+    async function loadSchedules() {
+      try {
+        var res = await fetch('/api/schedules');
+        if (res.status === 401) { window.location.href = '/'; return; }
+        var data = await res.json().catch(function () { return {}; });
+        if (res.ok && data.ok) renderSchedules(data.schedules || []);
+      } catch (e) { /* leave the list as-is on a transient error */ }
+    }
+
+    async function cancelSchedule(id, btn) {
+      btn.disabled = true;
+      try {
+        var res = await fetch('/api/schedules/delete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id }),
+        });
+        if (res.status === 401) { window.location.href = '/'; return; }
+        await loadSchedules();
+      } catch (e) { btn.disabled = false; }
+    }
+
+    schedForm.onsubmit = async function (e) {
+      e.preventDefault();
+      var url = document.getElementById('sched-url').value.trim();
+      var whenVal = document.getElementById('sched-when').value;
+      var rec = document.getElementById('sched-rec').value;
+      if (!url || !whenVal) { showSched('Enter a meeting link and a time.', 'err'); return; }
+      var runAt = new Date(whenVal).getTime();
+      if (!runAt) { showSched('That date and time looks invalid.', 'err'); return; }
+      schedBtn.disabled = true;
+      showSched('Scheduling…', '');
+      try {
+        var res = await fetch('/api/schedules', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            meeting_url: url,
+            run_at: runAt,
+            recurrence: rec,
+            tz_offset: new Date().getTimezoneOffset(),
+          }),
+        });
+        if (res.status === 401) { window.location.href = '/'; return; }
+        var data = await res.json().catch(function () { return {}; });
+        if (res.ok && data.ok) {
+          showSched('Scheduled. The notetaker will join on time.', 'ok');
+          document.getElementById('sched-url').value = '';
+          document.getElementById('sched-when').value = '';
+          await loadSchedules();
+        } else {
+          showSched(data.error || 'Could not schedule.', 'err');
+        }
+      } catch (e) {
+        showSched('Network error. Please try again.', 'err');
+      } finally {
+        schedBtn.disabled = false;
+      }
+    };
+
+    loadSchedules();
   }
 
   /* ---- transcripts ---- */
