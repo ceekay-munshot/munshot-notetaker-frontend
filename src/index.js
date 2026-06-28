@@ -36,6 +36,8 @@ export default {
       if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
+      if (method === "POST" && pathname === "/api/calendar/sync") return handleCalendarSync(request, env);
+      if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
       return new Response("Not found", { status: 404 });
     } catch (err) {
       return json({ error: "Server error", detail: String((err && err.message) || err) }, 500);
@@ -144,6 +146,17 @@ function leaveEndpoint(env) {
   return DEFAULT_LEAVE_ENDPOINT;
 }
 
+// Origin of the bot API (derived from the join endpoint) — the /calendar/*
+// routes live on the same host alongside /public/join, so a tunnel swap of
+// JOIN_ENDPOINT moves them too.
+function apiBase(env) {
+  try {
+    return new URL(joinEndpoint(env)).origin;
+  } catch {
+    return new URL(DEFAULT_JOIN_ENDPOINT).origin;
+  }
+}
+
 // Asks the notetaker bot to join or leave a meeting. The email is always taken
 // from the authenticated session — never from the request body.
 async function handleBot(request, env, action) {
@@ -219,6 +232,56 @@ async function handleTranscripts(request, env) {
     return json({ ok: true, admin: session.isAdmin, segments: res.results || [] });
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
+  }
+}
+
+/* ------------------------------ calendar ------------------------------ */
+
+async function readUpstreamJson(upstream) {
+  const text = await upstream.text();
+  try {
+    return JSON.parse(text);
+  } catch {
+    return { raw: text };
+  }
+}
+
+// Calendar is per-email. The email is always the signed-in user's, taken from
+// the session — never the request body/query — and the API key is attached
+// server-side. Mirrors the curl: POST /calendar/sync {email}.
+async function handleCalendarSync(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
+  if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
+  try {
+    const upstream = await fetch(apiBase(env) + "/calendar/sync", {
+      method: "POST",
+      headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: session.identity }),
+    });
+    const result = await readUpstreamJson(upstream);
+    return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
+  } catch (err) {
+    return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
+  }
+}
+
+// GET /calendar/meetings?email=<session email>.
+async function handleCalendarMeetings(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
+  if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
+  try {
+    const upstream = await fetch(
+      apiBase(env) + "/calendar/meetings?email=" + encodeURIComponent(session.identity),
+      { headers: { "X-API-Key": env.API_KEY } }
+    );
+    const calendar = await readUpstreamJson(upstream);
+    return json({ ok: upstream.ok, status: upstream.status, calendar }, upstream.ok ? 200 : 502);
+  } catch (err) {
+    return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
   }
 }
 
@@ -839,6 +902,14 @@ function dashboardPage(identity, isAdmin) {
     <div id="sched-list"></div>
 
     <hr />
+
+    <div class="sect"><h2>Calendar</h2><button class="refresh" id="cal-refresh">Refresh</button></div>
+    <p class="hint">Sync your Google Calendar to see upcoming meetings, then send any of them to the notetaker.</p>
+    <button type="button" id="cal-sync">Sync calendar</button>
+    <div class="msg" id="cal-msg"></div>
+    <div id="cal-list"></div>
+
+    <hr />
 `;
   const subline = isAdmin
     ? `Signed in as ${safe} <span class="badge">ADMIN</span>`
@@ -1056,6 +1127,120 @@ ${formSection}
     };
 
     loadSchedules();
+  }
+
+  /* ---- calendar ---- */
+  var calSync = document.getElementById('cal-sync');
+  if (calSync) {
+    var calMsg = document.getElementById('cal-msg');
+    var calList = document.getElementById('cal-list');
+    var calRefresh = document.getElementById('cal-refresh');
+
+    var showCal = function (text, kind) {
+      calMsg.textContent = text;
+      calMsg.className = 'msg' + (kind ? ' ' + kind : '');
+    };
+
+    function fmtWhen(iso) {
+      if (!iso) return '';
+      var d = new Date(iso);
+      if (isNaN(d.getTime())) return iso;
+      return d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+
+    function renderEvents(events) {
+      calList.innerHTML = '';
+      if (!events.length) {
+        var empty = document.createElement('div'); empty.className = 'tstatus';
+        empty.textContent = 'No upcoming calendar meetings.';
+        calList.appendChild(empty);
+        return;
+      }
+      events.forEach(function (ev) {
+        var row = document.createElement('div'); row.className = 'schedule';
+        var info = document.createElement('div'); info.className = 'info';
+        var title = document.createElement('div'); title.className = 'when';
+        title.textContent = ev.title || 'Untitled meeting';
+        var meta = document.createElement('div'); meta.className = 'last';
+        meta.textContent = fmtWhen(ev.start_time) + (ev.platform ? ' · ' + ev.platform : '') + (ev.status ? ' · ' + ev.status : '');
+        info.appendChild(title); info.appendChild(meta);
+        if (ev.meeting_url) {
+          var url = document.createElement('div'); url.className = 'url'; url.textContent = ev.meeting_url;
+          info.appendChild(url);
+        }
+        var btn = document.createElement('button'); btn.className = 'cancel'; btn.textContent = 'Send bot';
+        if (!ev.meeting_url) btn.disabled = true;
+        btn.onclick = function () { sendEvent(ev.meeting_url, btn); };
+        row.appendChild(info); row.appendChild(btn);
+        calList.appendChild(row);
+      });
+    }
+
+    async function sendEvent(url, btn) {
+      if (!url) return;
+      btn.disabled = true;
+      var old = btn.textContent; btn.textContent = 'Sending…';
+      try {
+        var res = await fetch('/api/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ meeting_url: url }),
+        });
+        if (res.status === 401) { window.location.href = '/'; return; }
+        var data = await res.json().catch(function () { return {}; });
+        if (res.ok && data.ok) {
+          showCal('Sent to notetaker: ' + url, 'ok');
+          btn.textContent = 'Sent';
+        } else {
+          showCal('Failed: ' + (data.error || 'Request failed.'), 'err');
+          btn.textContent = old; btn.disabled = false;
+        }
+      } catch (e) {
+        showCal('Network error. Please try again.', 'err');
+        btn.textContent = old; btn.disabled = false;
+      }
+    }
+
+    async function loadMeetings() {
+      try {
+        var res = await fetch('/api/calendar/meetings');
+        if (res.status === 401) { window.location.href = '/'; return; }
+        var data = await res.json().catch(function () { return {}; });
+        if (res.ok && data.ok) {
+          renderEvents((data.calendar && data.calendar.calendar_events) || []);
+        } else {
+          showCal(data.error || 'Could not load calendar.', 'err');
+        }
+      } catch (e) { /* leave the list as-is on a transient error */ }
+    }
+
+    calSync.onclick = async function () {
+      calSync.disabled = true;
+      showCal('Syncing…', '');
+      try {
+        var res = await fetch('/api/calendar/sync', { method: 'POST' });
+        if (res.status === 401) { window.location.href = '/'; return; }
+        var data = await res.json().catch(function () { return {}; });
+        if (res.ok && data.ok) {
+          var r = data.result || {};
+          if (r.connected === false) {
+            showCal('Calendar not connected for your account yet.', 'err');
+          } else {
+            showCal('Synced' + (typeof r.events_synced === 'number' ? ' ' + r.events_synced + ' events' : '') + '.', 'ok');
+          }
+          await loadMeetings();
+        } else {
+          showCal(data.error || 'Sync failed.', 'err');
+        }
+      } catch (e) {
+        showCal('Network error. Please try again.', 'err');
+      } finally {
+        calSync.disabled = false;
+      }
+    };
+
+    calRefresh.onclick = loadMeetings;
+    loadMeetings();
   }
 
   /* ---- transcripts ---- */
