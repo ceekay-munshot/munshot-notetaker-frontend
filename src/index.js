@@ -877,22 +877,33 @@ const STYLE = `
   /* AI meeting assistant — floating window */
   .ai-fab { position: fixed; right: 22px; bottom: 22px; width: auto; margin: 0; padding: 12px 18px; border-radius: 999px; background: var(--accent); color: #fff; font-weight: 600; font-size: 14px; box-shadow: 0 10px 26px rgba(79,70,229,.35); z-index: 50; }
   .ai-fab:hover { background: var(--accent-hover); }
-  .ai-panel { position: fixed; right: 22px; bottom: 22px; width: 384px; max-width: calc(100vw - 32px); height: 564px; max-height: calc(100vh - 44px); background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 18px 50px rgba(16,24,40,.20); display: none; flex-direction: column; overflow: hidden; z-index: 60; }
+  .ai-panel { position: fixed; right: 24px; bottom: 24px; width: 460px; max-width: calc(100vw - 28px); height: 720px; max-height: calc(100vh - 36px); background: var(--card); border: 1px solid var(--border); border-radius: 18px; box-shadow: 0 24px 64px rgba(16,24,40,.22); display: none; flex-direction: column; overflow: hidden; z-index: 60; }
   .ai-panel.open { display: flex; }
-  .ai-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
-  .ai-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .ai-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 16px 18px; border-bottom: 1px solid var(--border); background: linear-gradient(180deg, var(--accent-soft), #fff); }
+  .ai-head h3 { margin: 0; font-size: 16px; font-weight: 650; letter-spacing: -.01em; }
   .ai-x { width: auto; margin: 0; padding: 2px 9px; background: transparent; color: var(--muted); font-size: 20px; line-height: 1; border-radius: 8px; }
-  .ai-x:hover { background: #f1f2f4; color: var(--text); }
-  .ai-meet { padding: 10px 16px; border-bottom: 1px solid var(--border); }
-  .ai-meet select { font-size: 13px; padding: 8px 10px; }
-  .ai-msgs { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; background: #fafbfc; }
-  .ai-msg { font-size: 13.5px; line-height: 1.55; padding: 10px 12px; border-radius: 12px; max-width: 88%; white-space: pre-wrap; word-break: break-word; }
-  .ai-msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
-  .ai-msg.bot { align-self: flex-start; background: #fff; border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 4px; }
+  .ai-x:hover { background: rgba(15,23,42,.06); color: var(--text); }
+  .ai-meet { padding: 12px 18px; border-bottom: 1px solid var(--border); }
+  .ai-meet select { font-size: 13px; padding: 9px 11px; }
+  .ai-msgs { flex: 1; overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; background: #f7f8fa; }
+  .ai-msg { font-size: 14px; line-height: 1.6; padding: 11px 14px; border-radius: 14px; max-width: 90%; white-space: pre-wrap; word-break: break-word; }
+  .ai-msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 5px; }
+  .ai-msg.bot { align-self: flex-start; max-width: 96%; white-space: normal; background: #fff; border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 5px; box-shadow: 0 1px 2px rgba(16,24,40,.05); }
   .ai-msg.note { align-self: center; background: transparent; color: var(--muted); font-size: 12px; padding: 4px 6px; }
-  .ai-form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
+  /* rendered markdown inside assistant replies */
+  .ai-msg p { margin: 0 0 8px; }
+  .ai-msg p:last-child { margin-bottom: 0; }
+  .ai-msg .ai-h { font-weight: 700; color: var(--text); font-size: 13.5px; margin: 12px 0 6px; }
+  .ai-msg .ai-h:first-child { margin-top: 0; }
+  .ai-msg ul { margin: 6px 0; padding-left: 18px; }
+  .ai-msg li { margin: 3px 0; }
+  .ai-msg li::marker { color: var(--accent); }
+  .ai-msg strong { font-weight: 700; color: var(--text); }
+  .ai-msg em { font-style: italic; }
+  .ai-msg code { background: #eef0f3; padding: 1px 5px; border-radius: 5px; font-size: 12.5px; }
+  .ai-form { display: flex; gap: 8px; padding: 14px; border-top: 1px solid var(--border); }
   .ai-form input { flex: 1; }
-  .ai-form button { width: auto; margin: 0; padding: 10px 16px; flex-shrink: 0; }
+  .ai-form button { width: auto; margin: 0; padding: 10px 18px; flex-shrink: 0; }
 `;
 
 function loginPage({ codeRequired }) {
@@ -1091,7 +1102,7 @@ ${formSection}
   <button class="ai-fab" id="ai-open" type="button" aria-label="Open meeting assistant">✨ Ask AI</button>
   <div class="ai-panel" id="ai-panel" role="dialog" aria-label="Meeting assistant">
     <div class="ai-head">
-      <h3>Meeting Assistant</h3>
+      <h3>✨ Meeting Assistant</h3>
       <button class="ai-x" id="ai-close" type="button" aria-label="Close">&times;</button>
     </div>
     <div class="ai-meet">
@@ -1521,9 +1532,50 @@ ${formSection}
       aiMsgs.appendChild(el); aiMsgs.scrollTop = aiMsgs.scrollHeight; return el;
     };
 
+    function aiEsc(s) {
+      return String(s).replace(/[&<>"']/g, function (c) {
+        return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+      });
+    }
+    // Inline markdown on already-escaped text (so we only ever add our own tags).
+    // NOTE: this whole script is emitted inside a backtick template literal, so
+    // every regex backslash must be doubled here to survive template evaluation.
+    function aiInline(s) {
+      return s
+        .replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>')
+        .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+        .replace(/(^|[^*])\\*([^*\\n]+)\\*/g, '$1<em>$2</em>')
+        .replace(/\`([^\`]+)\`/g, '<code>$1</code>');
+    }
+    // Minimal, safe Markdown -> HTML for assistant replies: escape first, then
+    // re-introduce only a fixed set of tags (headings, bullets, bold/italic/code).
+    function aiFormatMd(text) {
+      var lines = aiEsc(text).split(/\\r?\\n/), html = '', inList = false;
+      function closeList() { if (inList) { html += '</ul>'; inList = false; } }
+      lines.forEach(function (raw) {
+        var line = raw.trim();
+        if (!line) { closeList(); return; }
+        var h = /^#{1,6}\\s+(.*)$/.exec(line);
+        if (h) { closeList(); html += '<div class="ai-h">' + aiInline(h[1]) + '</div>'; return; }
+        var b = /^[-*•]\\s+(.*)$/.exec(line);
+        if (b) { if (!inList) { html += '<ul>'; inList = true; } html += '<li>' + aiInline(b[1]) + '</li>'; return; }
+        var n = /^\\d+\\.\\s+(.*)$/.exec(line);
+        if (n) { if (!inList) { html += '<ul>'; inList = true; } html += '<li>' + aiInline(n[1]) + '</li>'; return; }
+        closeList(); html += '<p>' + aiInline(line) + '</p>';
+      });
+      closeList();
+      return html;
+    }
+
     var aiRenderConv = function (state) {
       aiMsgs.innerHTML = '';
-      state.messages.forEach(function (m) { aiAdd(m.role === 'user' ? 'user' : 'bot', m.content); });
+      state.messages.forEach(function (m) {
+        if (m.role === 'user') { aiAdd('user', m.content); return; }
+        var el = document.createElement('div'); el.className = 'ai-msg bot';
+        el.innerHTML = aiFormatMd(m.content);   // assistant replies are markdown
+        aiMsgs.appendChild(el);
+      });
+      aiMsgs.scrollTop = aiMsgs.scrollHeight;
     };
 
     var aiBusy = function (on) { aiInput.disabled = on; aiSend.disabled = on; aiSelect.disabled = on; };
