@@ -681,8 +681,8 @@ const STYLE = `
     --border: #e8eaed;
     --border-strong: #d7dadf;
     --text: #1a1d21;
-    --muted: #6b7280;
-    --faint: #9aa0a8;
+    --muted: #5d636e;
+    --faint: #6b7280;
     --accent: #4f46e5;
     --accent-hover: #4338ca;
     --accent-soft: #eef2ff;
