@@ -33,6 +33,7 @@ export default {
       if (method === "POST" && pathname === "/api/join") return handleBot(request, env, "join");
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
       if (method === "GET" && pathname === "/api/transcripts") return handleTranscripts(request, env);
+      if (method === "POST" && pathname === "/api/ai") return handleAiChat(request, env);
       if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
@@ -233,6 +234,104 @@ async function handleTranscripts(request, env) {
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
   }
+}
+
+/* ------------------------------ AI assistant ------------------------------ */
+
+// Builds a readable, length-bounded transcript for the model. Keeps the start
+// and (when long) the tail, where decisions and action items usually land.
+function buildTranscriptText(rows) {
+  const MAX = 30000;
+  const lines = rows.map((r) => {
+    const t = Math.max(0, Math.floor(Number(r.start_time) || 0));
+    const mm = String(Math.floor(t / 60)).padStart(2, "0");
+    const ss = String(t % 60).padStart(2, "0");
+    return `[${mm}:${ss}] ${r.speaker || "Unknown"}: ${r.text || ""}`;
+  });
+  const full = lines.join("\n");
+  if (full.length <= MAX) return full;
+  const head = Math.floor(MAX * 0.7);
+  const tail = MAX - head;
+  return full.slice(0, head) + "\n…[transcript truncated]…\n" + full.slice(full.length - tail);
+}
+
+// Chat over a single meeting's transcript with OpenAI. The transcript is loaded
+// server-side and scoped to the session (all meetings for admin), and the OpenAI
+// key is a Worker secret that never reaches the browser. Same ACL as transcripts.
+async function handleAiChat(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+
+  const body = await request.json().catch(() => ({}));
+  const meetingId = String(body.meeting_id || "").trim();
+  if (!meetingId) return json({ error: "Pick a meeting first" }, 400);
+  const summarize = !!body.summarize;
+  const clientMessages = Array.isArray(body.messages) ? body.messages : [];
+
+  let res;
+  try {
+    if (session.isAdmin) {
+      res = await env.DB.prepare(
+        "SELECT start_time, text, speaker FROM transcriptions WHERE meeting_id = ?1 ORDER BY start_time"
+      ).bind(meetingId).all();
+    } else {
+      res = await env.DB.prepare(
+        "SELECT start_time, text, speaker FROM transcriptions WHERE owner_email = ?1 AND meeting_id = ?2 ORDER BY start_time"
+      ).bind(session.identity, meetingId).all();
+    }
+  } catch (err) {
+    return json({ error: "Failed to load the transcript", detail: String((err && err.message) || err) }, 500);
+  }
+  const rows = (res && res.results) || [];
+  if (!rows.length) return json({ error: "No transcript found for that meeting yet" }, 404);
+
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You are a concise meeting assistant. You are given the transcript of a single meeting. " +
+        "Answer only from what the transcript supports; if something isn't covered, say so briefly. " +
+        "Prefer short paragraphs and bullet points, and do not invent names, numbers, or decisions.\n\n" +
+        "MEETING TRANSCRIPT:\n" + buildTranscriptText(rows),
+    },
+  ];
+  for (const m of clientMessages.slice(-12)) {
+    const role = m && m.role === "assistant" ? "assistant" : "user";
+    const content = String((m && m.content) || "").slice(0, 4000);
+    if (content) messages.push({ role, content });
+  }
+  // First open (or an explicit summarize): ask for the summary.
+  if (summarize || messages.length === 1) {
+    messages.push({
+      role: "user",
+      content:
+        "Summarize this meeting: the main topics discussed, any decisions made, and clear action items " +
+        "(with owners if mentioned). Keep it tight — a few bullets.",
+    });
+  }
+
+  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  let upstream;
+  try {
+    upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 700 }),
+    });
+  } catch (err) {
+    return json({ error: "Failed to reach the AI service", detail: String((err && err.message) || err) }, 502);
+  }
+  const data = await upstream.json().catch(() => ({}));
+  if (!upstream.ok) {
+    const detail = (data && data.error && data.error.message) || `HTTP ${upstream.status}`;
+    return json({ error: "AI request failed", detail }, 502);
+  }
+  const reply =
+    data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+  return json({ ok: true, reply: String(reply || "").trim() });
 }
 
 /* ------------------------------ calendar ------------------------------ */
@@ -763,6 +862,25 @@ const STYLE = `
   .schedule .last { color: var(--faint); font-size: 12px; }
   .cancel { width: auto; margin: 0; padding: 7px 12px; background: #fff; color: #3a3f47; border: 1px solid var(--border-strong); font-weight: 500; font-size: 13px; flex-shrink: 0; }
   .cancel:hover { background: #f1f2f4; }
+  /* AI meeting assistant — floating window */
+  .ai-fab { position: fixed; right: 22px; bottom: 22px; width: auto; margin: 0; padding: 12px 18px; border-radius: 999px; background: var(--accent); color: #fff; font-weight: 600; font-size: 14px; box-shadow: 0 10px 26px rgba(79,70,229,.35); z-index: 50; }
+  .ai-fab:hover { background: var(--accent-hover); }
+  .ai-panel { position: fixed; right: 22px; bottom: 22px; width: 384px; max-width: calc(100vw - 32px); height: 564px; max-height: calc(100vh - 44px); background: var(--card); border: 1px solid var(--border); border-radius: 16px; box-shadow: 0 18px 50px rgba(16,24,40,.20); display: none; flex-direction: column; overflow: hidden; z-index: 60; }
+  .ai-panel.open { display: flex; }
+  .ai-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 14px 16px; border-bottom: 1px solid var(--border); }
+  .ai-head h3 { margin: 0; font-size: 15px; font-weight: 600; }
+  .ai-x { width: auto; margin: 0; padding: 2px 9px; background: transparent; color: var(--muted); font-size: 20px; line-height: 1; border-radius: 8px; }
+  .ai-x:hover { background: #f1f2f4; color: var(--text); }
+  .ai-meet { padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  .ai-meet select { font-size: 13px; padding: 8px 10px; }
+  .ai-msgs { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; background: #fafbfc; }
+  .ai-msg { font-size: 13.5px; line-height: 1.55; padding: 10px 12px; border-radius: 12px; max-width: 88%; white-space: pre-wrap; word-break: break-word; }
+  .ai-msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 4px; }
+  .ai-msg.bot { align-self: flex-start; background: #fff; border: 1px solid var(--border); color: var(--text); border-bottom-left-radius: 4px; }
+  .ai-msg.note { align-self: center; background: transparent; color: var(--muted); font-size: 12px; padding: 4px 6px; }
+  .ai-form { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--border); }
+  .ai-form input { flex: 1; }
+  .ai-form button { width: auto; margin: 0; padding: 10px 16px; flex-shrink: 0; }
 `;
 
 function loginPage({ codeRequired }) {
@@ -956,6 +1074,22 @@ ${formSection}
     <input class="search" id="tq" type="search" placeholder="Search transcript text…" />
     <div class="tstatus" id="tstatus"></div>
     <div id="tlist"></div>
+  </div>
+
+  <button class="ai-fab" id="ai-open" type="button" aria-label="Open meeting assistant">✨ Ask AI</button>
+  <div class="ai-panel" id="ai-panel" role="dialog" aria-label="Meeting assistant">
+    <div class="ai-head">
+      <h3>Meeting Assistant</h3>
+      <button class="ai-x" id="ai-close" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div class="ai-meet">
+      <select id="ai-meeting"></select>
+    </div>
+    <div class="ai-msgs" id="ai-msgs"></div>
+    <form class="ai-form" id="ai-form">
+      <input id="ai-input" type="text" placeholder="Ask about this meeting…" autocomplete="off" />
+      <button type="submit" id="ai-send">Send</button>
+    </form>
   </div>
 
 <script>
@@ -1339,6 +1473,7 @@ ${formSection}
       hasSegments = segs.length > 0;
       meetings = group(segs);
       render();
+      if (window.__aiRefresh) window.__aiRefresh();
     } catch (e) {
       tstatus.textContent = 'Network error loading transcripts.';
     }
@@ -1346,6 +1481,123 @@ ${formSection}
 
   tq.oninput = render;
   document.getElementById('refresh').onclick = loadTranscripts;
+
+  /* ---- AI meeting assistant ---- */
+  var aiOpenBtn = document.getElementById('ai-open');
+  if (aiOpenBtn) {
+    var aiPanel = document.getElementById('ai-panel');
+    var aiCloseBtn = document.getElementById('ai-close');
+    var aiSelect = document.getElementById('ai-meeting');
+    var aiMsgs = document.getElementById('ai-msgs');
+    var aiForm = document.getElementById('ai-form');
+    var aiInput = document.getElementById('ai-input');
+    var aiSend = document.getElementById('ai-send');
+    var aiState = {};   // meeting key -> { messages: [{role,content}], loaded: bool }
+    var aiCurrent = null;
+
+    var aiKeyOf = function (m) { return (m.owner || '') + '#' + m.meeting_id; };
+
+    var aiLabelOf = function (m) {
+      var parts = ['Meeting ' + m.meeting_id];
+      if (m.owner) parts.push(m.owner);
+      if (m.latest) parts.push(new Date(m.latest).toLocaleDateString([], { month: 'short', day: 'numeric' }));
+      return parts.join(' · ');
+    };
+
+    var aiAdd = function (kind, text) {
+      var el = document.createElement('div'); el.className = 'ai-msg ' + kind; el.textContent = text;
+      aiMsgs.appendChild(el); aiMsgs.scrollTop = aiMsgs.scrollHeight; return el;
+    };
+
+    var aiRenderConv = function (state) {
+      aiMsgs.innerHTML = '';
+      state.messages.forEach(function (m) { aiAdd(m.role === 'user' ? 'user' : 'bot', m.content); });
+    };
+
+    var aiBusy = function (on) { aiInput.disabled = on; aiSend.disabled = on; };
+
+    var aiCall = async function (meeting, extra) {
+      var payload = { meeting_id: String(meeting.meeting_id) };
+      for (var k in extra) payload[k] = extra[k];
+      var res = await fetch('/api/ai', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+      if (res.status === 401) { window.location.href = '/'; return null; }
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok || !data.ok) throw new Error(data.error || 'AI request failed.');
+      return data.reply || '';
+    };
+
+    var aiSelectMeeting = async function () {
+      var idx = aiSelect.value;
+      if (idx === '' || !meetings[Number(idx)]) {
+        aiMsgs.innerHTML = ''; aiAdd('note', 'No transcripts to chat about yet.'); aiCurrent = null; return;
+      }
+      var m = meetings[Number(idx)]; aiCurrent = m;
+      var key = aiKeyOf(m);
+      if (!aiState[key]) aiState[key] = { messages: [], loaded: false };
+      var state = aiState[key];
+      aiRenderConv(state);
+      if (!state.loaded) {
+        var note = aiAdd('note', 'Summarizing meeting…');
+        aiBusy(true);
+        try {
+          var reply = await aiCall(m, { summarize: true });
+          if (reply === null) return;
+          note.remove();
+          state.messages.push({ role: 'assistant', content: reply });
+          state.loaded = true;
+          aiRenderConv(state);
+        } catch (e) { note.textContent = 'Could not summarize: ' + e.message; }
+        finally { aiBusy(false); }
+      }
+    };
+
+    // Rebuilds the meeting picker from the loaded transcripts (called on open and
+    // whenever transcripts reload), preserving the current selection.
+    window.__aiRefresh = function () {
+      var prev = aiSelect.value;
+      aiSelect.innerHTML = '';
+      if (!meetings || !meetings.length) {
+        var o = document.createElement('option'); o.value = ''; o.textContent = 'No meetings yet';
+        aiSelect.appendChild(o); return;
+      }
+      meetings.forEach(function (m, i) {
+        var op = document.createElement('option'); op.value = String(i); op.textContent = aiLabelOf(m);
+        aiSelect.appendChild(op);
+      });
+      if (prev !== '' && Number(prev) < meetings.length) aiSelect.value = prev;
+    };
+
+    aiOpenBtn.onclick = function () {
+      aiPanel.classList.add('open'); aiOpenBtn.style.display = 'none';
+      window.__aiRefresh();
+      if (!aiCurrent) aiSelectMeeting();
+    };
+    aiCloseBtn.onclick = function () { aiPanel.classList.remove('open'); aiOpenBtn.style.display = ''; };
+    aiSelect.onchange = aiSelectMeeting;
+
+    aiForm.onsubmit = async function (e) {
+      e.preventDefault();
+      var q = aiInput.value.trim();
+      if (!q || !aiCurrent) return;
+      var state = aiState[aiKeyOf(aiCurrent)];
+      state.messages.push({ role: 'user', content: q });
+      aiRenderConv(state);
+      aiInput.value = '';
+      aiBusy(true);
+      var thinking = aiAdd('note', 'Thinking…');
+      try {
+        var reply = await aiCall(aiCurrent, { messages: state.messages });
+        if (reply === null) return;
+        thinking.remove();
+        state.messages.push({ role: 'assistant', content: reply });
+        aiRenderConv(state);
+      } catch (err) { thinking.textContent = 'Error: ' + err.message; }
+      finally { aiBusy(false); aiInput.focus(); }
+    };
+  }
+
   loadTranscripts();
 </script>
 </body>
