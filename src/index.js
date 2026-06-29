@@ -270,17 +270,21 @@ async function handleAiChat(request, env) {
   if (!meetingId) return json({ error: "Pick a meeting first" }, 400);
   const summarize = !!body.summarize;
   const clientMessages = Array.isArray(body.messages) ? body.messages : [];
+  // The dashboard groups meetings by owner + meeting_id, so scope by owner too:
+  // admin passes the selected meeting's owner (two owners can share a meeting_id),
+  // and a normal user is always scoped to their own session email.
+  const ownerScope = session.isAdmin ? String(body.owner || "").trim() : session.identity;
 
   let res;
   try {
-    if (session.isAdmin) {
+    if (session.isAdmin && !ownerScope) {
       res = await env.DB.prepare(
         "SELECT start_time, text, speaker FROM transcriptions WHERE meeting_id = ?1 ORDER BY start_time"
       ).bind(meetingId).all();
     } else {
       res = await env.DB.prepare(
         "SELECT start_time, text, speaker FROM transcriptions WHERE owner_email = ?1 AND meeting_id = ?2 ORDER BY start_time"
-      ).bind(session.identity, meetingId).all();
+      ).bind(ownerScope, meetingId).all();
     }
   } catch (err) {
     return json({ error: "Failed to load the transcript", detail: String((err && err.message) || err) }, 500);
@@ -834,8 +838,8 @@ const STYLE = `
   .btn-stop { background: #fff; color: #b42318; border: 1px solid #fbc9c4; }
   .btn-stop:hover { background: #fef3f2; }
   /* Calendar sync — soft teal accent, a different light colour */
-  #cal-sync { background: #0d9488; }
-  #cal-sync:hover { background: #0f766e; }
+  #cal-sync { background: #0f766e; }
+  #cal-sync:hover { background: #115e59; }
   hr { border: 0; border-top: 1px solid var(--border); margin: 28px 0 20px; }
   .sect { display: flex; justify-content: space-between; align-items: center; }
   .sect h2 { font-size: 16px; font-weight: 600; margin: 0; letter-spacing: -.01em; }
@@ -1514,10 +1518,11 @@ ${formSection}
       state.messages.forEach(function (m) { aiAdd(m.role === 'user' ? 'user' : 'bot', m.content); });
     };
 
-    var aiBusy = function (on) { aiInput.disabled = on; aiSend.disabled = on; };
+    var aiBusy = function (on) { aiInput.disabled = on; aiSend.disabled = on; aiSelect.disabled = on; };
 
     var aiCall = async function (meeting, extra) {
       var payload = { meeting_id: String(meeting.meeting_id) };
+      if (meeting.owner) payload.owner = meeting.owner;
       for (var k in extra) payload[k] = extra[k];
       var res = await fetch('/api/ai', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
@@ -1540,15 +1545,17 @@ ${formSection}
       aiRenderConv(state);
       if (!state.loaded) {
         var note = aiAdd('note', 'Summarizing meeting…');
+        var reqKey = key;
         aiBusy(true);
         try {
           var reply = await aiCall(m, { summarize: true });
           if (reply === null) return;
+          if (!aiCurrent || aiKeyOf(aiCurrent) !== reqKey) return; // selection changed mid-flight
           note.remove();
           state.messages.push({ role: 'assistant', content: reply });
           state.loaded = true;
           aiRenderConv(state);
-        } catch (e) { note.textContent = 'Could not summarize: ' + e.message; }
+        } catch (e) { if (aiCurrent && aiKeyOf(aiCurrent) === reqKey) note.textContent = 'Could not summarize: ' + e.message; }
         finally { aiBusy(false); }
       }
     };
@@ -1556,17 +1563,21 @@ ${formSection}
     // Rebuilds the meeting picker from the loaded transcripts (called on open and
     // whenever transcripts reload), preserving the current selection.
     window.__aiRefresh = function () {
-      var prev = aiSelect.value;
+      var prevKey = aiCurrent ? aiKeyOf(aiCurrent) : null;
       aiSelect.innerHTML = '';
       if (!meetings || !meetings.length) {
         var o = document.createElement('option'); o.value = ''; o.textContent = 'No meetings yet';
-        aiSelect.appendChild(o); return;
+        aiSelect.appendChild(o); aiCurrent = null; return;
       }
+      var matchIdx = -1;
       meetings.forEach(function (m, i) {
         var op = document.createElement('option'); op.value = String(i); op.textContent = aiLabelOf(m);
         aiSelect.appendChild(op);
+        if (prevKey && aiKeyOf(m) === prevKey) matchIdx = i;
       });
-      if (prev !== '' && Number(prev) < meetings.length) aiSelect.value = prev;
+      // Re-pin to the same meeting by key (not index) so a reordered/new list
+      // can't leave the dropdown and aiCurrent pointing at different meetings.
+      if (matchIdx >= 0) { aiSelect.value = String(matchIdx); aiCurrent = meetings[matchIdx]; }
     };
 
     aiOpenBtn.onclick = function () {
@@ -1581,19 +1592,22 @@ ${formSection}
       e.preventDefault();
       var q = aiInput.value.trim();
       if (!q || !aiCurrent) return;
-      var state = aiState[aiKeyOf(aiCurrent)];
+      var meeting = aiCurrent;
+      var reqKey = aiKeyOf(meeting);
+      var state = aiState[reqKey];
       state.messages.push({ role: 'user', content: q });
       aiRenderConv(state);
       aiInput.value = '';
       aiBusy(true);
       var thinking = aiAdd('note', 'Thinking…');
       try {
-        var reply = await aiCall(aiCurrent, { messages: state.messages });
+        var reply = await aiCall(meeting, { messages: state.messages });
         if (reply === null) return;
+        if (!aiCurrent || aiKeyOf(aiCurrent) !== reqKey) return; // selection changed mid-flight
         thinking.remove();
         state.messages.push({ role: 'assistant', content: reply });
         aiRenderConv(state);
-      } catch (err) { thinking.textContent = 'Error: ' + err.message; }
+      } catch (err) { if (aiCurrent && aiKeyOf(aiCurrent) === reqKey) thinking.textContent = 'Error: ' + err.message; }
       finally { aiBusy(false); aiInput.focus(); }
     };
   }
