@@ -307,13 +307,21 @@ async function handleAiChat(request, env) {
     const content = String((m && m.content) || "").slice(0, 4000);
     if (content) messages.push({ role, content });
   }
-  // First open (or an explicit summarize): ask for the summary.
+  // First open (or an explicit summarize): ask for a per-person breakdown.
   if (summarize || messages.length === 1) {
     messages.push({
       role: "user",
       content:
-        "Summarize this meeting: the main topics discussed, any decisions made, and clear action items " +
-        "(with owners if mentioned). Keep it tight — a few bullets.",
+        "Summarize this meeting as a per-person breakdown, not one block of text. " +
+        "Start with a one-line overall context. Then add a short section for each participant " +
+        "who spoke or was discussed, headed by their name, covering:\n" +
+        "- Working on: the project(s)/task(s) they are currently handling.\n" +
+        "- About: a one-line plain description of what that work is.\n" +
+        "- Update: what happened with them in this meeting — progress, blockers, decisions, and any " +
+        "action items or next steps (include deadlines and owners when mentioned).\n" +
+        "Close with a short \"Decisions & action items\" list across the team. " +
+        "Use the names from the transcript, keep each point tight, write in clear English, and only " +
+        "include what the transcript supports (say \"not discussed\" if a person's work is unclear).",
     });
   }
 
