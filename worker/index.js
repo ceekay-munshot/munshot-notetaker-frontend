@@ -33,6 +33,7 @@ export default {
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
       if (method === "GET" && pathname === "/api/transcripts") return handleTranscripts(request, env);
       if (method === "POST" && pathname === "/api/ai") return handleAiChat(request, env);
+      if (method === "POST" && pathname === "/api/weekly/people") return handleWeeklyPeople(request, env);
       if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
@@ -382,6 +383,133 @@ async function handleAiChat(request, env) {
   const reply =
     data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
   return json({ ok: true, reply: String(reply || "").trim() });
+}
+
+// Builds a combined, length-bounded transcript across MANY meetings, each under
+// a "Meeting <id>" header, newest meetings first. Used by the weekly per-person
+// rollup so the model can reason across the whole week.
+function buildMultiMeetingText(rows, maxChars = 42000) {
+  const byMeeting = new Map();
+  for (const r of rows) {
+    const id = String(r.meeting_id);
+    if (!byMeeting.has(id)) byMeeting.set(id, []);
+    byMeeting.get(id).push(r);
+  }
+  // created_at desc per meeting → newest meetings first.
+  const order = [...byMeeting.entries()].sort((a, b) => {
+    const la = a[1].reduce((m, r) => (r.created_at > m ? r.created_at : m), "");
+    const lb = b[1].reduce((m, r) => (r.created_at > m ? r.created_at : m), "");
+    return la < lb ? 1 : la > lb ? -1 : 0;
+  });
+  let out = "";
+  for (const [id, segs] of order) {
+    segs.sort((a, b) => (Number(a.start_time) || 0) - (Number(b.start_time) || 0));
+    let block = `\n=== Meeting ${id} ===\n`;
+    for (const s of segs) block += `${s.speaker || "Unknown"}: ${s.text || ""}\n`;
+    if (out.length + block.length > maxChars) {
+      out += block.slice(0, Math.max(0, maxChars - out.length));
+      out += "\n…[transcripts truncated]…\n";
+      break;
+    }
+    out += block;
+  }
+  return out.trim();
+}
+
+// Per-person weekly rollup. Loads every transcript the signed-in user can see
+// (own rows; all rows for admin), then asks OpenAI for a STRICT-JSON breakdown
+// per participant: an overall view, what they've accomplished, and their current
+// to-dos. The OpenAI key stays a server-side secret. Same ACL as /api/transcripts.
+async function handleWeeklyPeople(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+
+  let res;
+  try {
+    if (session.isAdmin) {
+      res = await env.DB.prepare(
+        "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions ORDER BY meeting_id, start_time"
+      ).all();
+    } else {
+      res = await env.DB.prepare(
+        "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions WHERE owner_email = ?1 ORDER BY meeting_id, start_time"
+      ).bind(session.identity).all();
+    }
+  } catch (err) {
+    return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
+  }
+  const rows = (res && res.results) || [];
+  if (!rows.length) return json({ ok: true, people: [] });
+
+  const transcripts = buildMultiMeetingText(rows);
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You analyze a team's meeting transcripts and produce a per-person status rollup. " +
+        "Use ONLY what the transcripts support — never invent names, tasks, or outcomes. " +
+        "Respond with STRICT JSON only.",
+    },
+    {
+      role: "user",
+      content:
+        "From the meeting transcripts below, produce a per-person rollup across all the meetings. " +
+        "For each person who actually spoke or was discussed, return an object with:\n" +
+        '- "name": their name exactly as it appears in the transcript.\n' +
+        '- "overall": one or two sentences describing their role / focus across the meetings.\n' +
+        '- "accomplished": an array of concrete things they have completed or made progress on (past tense).\n' +
+        '- "todo": an array of concrete current or next tasks / action items they still need to do.\n' +
+        "Keep each list item short (a phrase, not a paragraph). Omit a person entirely if there is nothing " +
+        "concrete to say. If a list has nothing, use an empty array. " +
+        'Return JSON of the exact shape: {"people":[{"name":"","overall":"","accomplished":[],"todo":[]}]}.\n\n' +
+        "TRANSCRIPTS:\n" + transcripts,
+    },
+  ];
+
+  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  let upstream;
+  try {
+    upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.2,
+        max_tokens: 1500,
+        response_format: { type: "json_object" },
+      }),
+    });
+  } catch (err) {
+    return json({ error: "Failed to reach the AI service", detail: String((err && err.message) || err) }, 502);
+  }
+  const data = await upstream.json().catch(() => ({}));
+  if (!upstream.ok) {
+    const detail = (data && data.error && data.error.message) || `HTTP ${upstream.status}`;
+    return json({ error: "AI request failed", detail }, 502);
+  }
+  const content =
+    (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "{}";
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    parsed = { people: [] };
+  }
+  const people = Array.isArray(parsed.people)
+    ? parsed.people
+        .map((p) => ({
+          name: String((p && p.name) || "").trim(),
+          overall: String((p && p.overall) || "").trim(),
+          accomplished: Array.isArray(p && p.accomplished) ? p.accomplished.map((x) => String(x).trim()).filter(Boolean) : [],
+          todo: Array.isArray(p && p.todo) ? p.todo.map((x) => String(x).trim()).filter(Boolean) : [],
+        }))
+        .filter((p) => p.name)
+    : [];
+  return json({ ok: true, people });
 }
 
 /* ------------------------------ calendar ------------------------------ */

@@ -18,6 +18,7 @@ import { groupQuantByEpisode } from '../lib/weeklyQuant'
 import { EditionSwitcher } from '../components/EditionSwitcher'
 import { RichText, entityTerms } from '../components/RichText'
 import { ToneMeter } from '../components/ToneMeter'
+import { WeeklyPeople } from '../components/WeeklyPeople'
 
 const THEME_STYLES = [
   { tile: 'bg-[#eff5ff] text-[#2563eb] border-[#dbeafe]', icon: 'cloud' },
@@ -365,6 +366,7 @@ function WeeklyDoc({
   // synthesised Key Points / Quant / Comparison lead; by-show is the fallback body.
   const nav = [
     { id: 'overview', label: 'Overview', icon: 'play_circle', show: weekly.overview.length > 0 },
+    { id: 'people', label: 'Per Person', icon: 'groups', show: true },
     { id: 'key-points', label: 'Key Points', icon: 'format_list_bulleted', show: synthesised },
     { id: 'quant', label: 'Quantitative', icon: 'monitoring', show: quantTable.length > 0 },
     { id: 'readout', label: 'Investment Readout', icon: 'fact_check', show: readouts.length > 0 },
@@ -429,6 +431,9 @@ function WeeklyDoc({
               </div>
             </section>
           )}
+
+          {/* Per-person rollup — overall / accomplished / to-do for each participant */}
+          <WeeklyPeople />
 
           {/* Key Points — synthesised, claim-first, cross-episode (the primary body) */}
           {synthesised && (

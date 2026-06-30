@@ -4,7 +4,6 @@ import { useNavigate } from 'react-router-dom'
 import { useAppData } from '../store/AppData'
 import { useDateRange } from '../store/DateRange'
 import { useChannelFilter } from '../store/ChannelFilter'
-import { useSentiment } from '../store/Sentiment'
 import { CoverTile } from './CoverTile'
 import { Icon } from './Icon'
 
@@ -14,7 +13,6 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
   const { podcasts, episodes } = useAppData()
   const { preset, presets, setPreset, rangeLabel } = useDateRange()
   const { channelId, setChannel } = useChannelFilter()
-  const { on: sentimentOn, toggle: toggleSentiment } = useSentiment()
   const [dateOpen, setDateOpen] = useState(false)
   const [chanOpen, setChanOpen] = useState(false)
 
@@ -59,28 +57,6 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
         </form>
 
         <div className="ml-auto flex items-center gap-2.5">
-          {/* Sentiment coloring toggle — the two dots are the legend (green = positive, red = negative) */}
-          <button
-            onClick={toggleSentiment}
-            aria-pressed={sentimentOn}
-            title={
-              sentimentOn
-                ? 'Sentiment coloring on — green = positive, red = negative. Click to turn off.'
-                : 'Sentiment coloring off. Click to color positive (green) and negative (red) language.'
-            }
-            className={`hidden items-center gap-2 rounded-xl border px-3 py-2 text-[13px] font-medium transition-[background-color,border-color,color,transform] duration-150 ease-[cubic-bezier(0.23,1,0.32,1)] active:scale-[0.97] sm:flex ${
-              sentimentOn
-                ? 'border-primary bg-surface-container-low text-on-surface'
-                : 'border-outline-variant bg-surface text-secondary hover:bg-surface-container-low'
-            }`}
-          >
-            <span className="flex items-center gap-1" aria-hidden>
-              <span className={`h-2.5 w-2.5 rounded-full bg-success transition-opacity ${sentimentOn ? '' : 'opacity-30'}`} />
-              <span className={`h-2.5 w-2.5 rounded-full bg-error transition-opacity ${sentimentOn ? '' : 'opacity-30'}`} />
-            </span>
-            Sentiment
-          </button>
-
           {/* Channel filter — wired to the global ChannelFilter store */}
           <div className="relative hidden md:block">
             <button

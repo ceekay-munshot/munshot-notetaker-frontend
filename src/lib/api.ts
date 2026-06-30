@@ -139,6 +139,25 @@ export async function chatMeeting(
   return String(data.reply || '')
 }
 
+// ── Weekly per-person rollup ────────────────────────────────────────────────────
+
+export interface PersonRollup {
+  name: string
+  overall: string
+  accomplished: string[]
+  todo: string[]
+}
+
+/** A per-person status rollup across all the signed-in user's meetings: overall
+ *  view, what each participant has accomplished, and their current to-dos. */
+export async function fetchWeeklyPeople(): Promise<PersonRollup[]> {
+  const data = await request<{ ok: boolean; people?: PersonRollup[] }>('/api/weekly/people', {
+    method: 'POST',
+    body: '{}',
+  })
+  return data.people || []
+}
+
 // ── The notetaker bot ───────────────────────────────────────────────────────────
 
 export function sendBot(
