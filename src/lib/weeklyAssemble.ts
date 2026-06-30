@@ -333,24 +333,69 @@ export function aggregateMentions(ready: Episode[]): { people: string[]; compani
 }
 
 export function pickInteresting(ready: Episode[], podcastById: ById): WeeklySummary['interesting'] {
-  const ep =
+  // Preferred: a curated highlight from a generated summary (headline + insight).
+  const withHighlight =
     ready.find((e) => e.signal === 'high' && e.summary?.highlights?.length) ??
-    ready.find((e) => e.summary?.highlights?.length) ??
-    ready[0]
-  const h = ep.summary?.highlights?.[0]
-  const pod = podcastById(ep.podcastId)
-  // Surface the curated highlight — its headline plus the why-it-matters insight.
-  // (Never the raw transcript segment: spoken lines are mid-sentence fragments
-  // that read as nonsense out of context.)
-  const title = (h?.title ?? ep.title).replace(/\*\*/g, '').trim()
-  const insight = (h?.detail ?? ep.blurb ?? '').replace(/\*\*/g, '').trim()
-  return {
-    title: trim(title, 120),
-    quote: trim(insight, 260),
-    speaker: pod?.title ?? 'The hosts',
-    role: ep.title,
-    episodeId: ep.id,
+    ready.find((e) => e.summary?.highlights?.length)
+  if (withHighlight) {
+    const h = withHighlight.summary!.highlights[0]
+    const pod = podcastById(withHighlight.podcastId)
+    return {
+      title: trim((h.title ?? withHighlight.title).replace(/\*\*/g, '').trim(), 120),
+      quote: trim((h.detail ?? withHighlight.blurb ?? '').replace(/\*\*/g, '').trim(), 260),
+      speaker: pod?.title ?? 'The hosts',
+      role: withHighlight.title,
+      episodeId: withHighlight.id,
+    }
   }
+
+  // Meeting fallback: surface the most substantive real line spoken across the
+  // week, attributed to the participant who said it — a memorable moment, not the
+  // raw opening chatter ("Hello? Hello?") the blurb would otherwise show.
+  const moment = bestMeetingMoment(ready)
+  if (moment) {
+    return {
+      title: moment.ep.title,
+      quote: trim(moment.text, 260),
+      speaker: moment.speaker,
+      role: shortDate(moment.ep.publishedAt),
+      episodeId: moment.ep.id,
+    }
+  }
+
+  // Nothing usable — leave the quote empty so the section hides itself.
+  const ep = ready[0]
+  return { title: ep?.title ?? '', quote: '', speaker: '', role: '', episodeId: ep?.id ?? '' }
+}
+
+// Filler/greeting words that mark a transcript line as non-substantive.
+const FILLER = /\b(hello+|hi|hey|yo|test(?:ing)?|can you hear|are you there|okay|ok|yeah|yep|hmm+|uh+|um+|right|cool|thanks?|thank you|bye)\b/gi
+
+// Pick the single most substantive transcript line across the week's meetings.
+function bestMeetingMoment(ready: Episode[]): { ep: Episode; speaker: string; text: string } | null {
+  let best: { score: number; ep: Episode; speaker: string; text: string } | null = null
+  for (const ep of ready) {
+    for (const seg of ep.transcript ?? []) {
+      const text = (seg.text || '').replace(/\s+/g, ' ').trim()
+      if (text.length < 50) continue
+      const words = text.split(' ').length
+      const fillerHits = (text.match(FILLER) || []).length
+      const questionHits = (text.match(/\?/g) || []).length
+      // Reward real sentences; punish greeting/filler-heavy, very short, or
+      // question-spammy lines.
+      const score = words - fillerHits * 5 - questionHits * 3
+      if (score > 6 && (!best || score > best.score)) {
+        const speaker = (seg.speaker || '').trim()
+        best = { score, ep, speaker: speaker && speaker.toLowerCase() !== 'unknown' ? speaker : 'A participant', text }
+      }
+    }
+  }
+  return best ? { ep: best.ep, speaker: best.speaker, text: best.text } : null
+}
+
+function shortDate(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
 // ── small utilities ──────────────────────────────────────────────────────────
