@@ -2,6 +2,12 @@ name = "munshot-notetaker-frontend"
 main = "worker/index.js"
 compatibility_date = "2024-11-01"
 
+# Build the React SPA into ./dist before any deploy/upload. Workers Builds (CI)
+# runs `wrangler versions upload` directly, so this hook is what produces the
+# assets the [assets] block below serves. Runs locally on `wrangler deploy` too.
+[build]
+command = "npm run build"
+
 # The React dashboard is built to ./dist (`npm run build`) and served as static
 # assets. A request that matches a built file (hashed JS/CSS, fonts, the logo)
 # is served directly; everything else invokes the Worker, which handles /api/*
