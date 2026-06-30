@@ -1,6 +1,17 @@
 name = "munshot-notetaker-frontend"
-main = "src/index.js"
+main = "worker/index.js"
 compatibility_date = "2024-11-01"
+
+# The React dashboard is built to ./dist (`npm run build`) and served as static
+# assets. The Worker runs first for every request: it handles /api/* itself and
+# serves the SPA (index.html + hashed assets) for everything else via the
+# ASSETS binding. Nothing is gated at the asset layer — all data is behind the
+# authenticated /api/* routes, and the SPA renders the login screen until
+# /api/me succeeds.
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+run_worker_first = true
 
 # Cron trigger: runs the scheduled-meeting runner every minute so the notetaker
 # joins on time whether or not anyone has the dashboard open. 1 minute is the
