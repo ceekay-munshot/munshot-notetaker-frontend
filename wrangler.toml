@@ -32,8 +32,8 @@ crons = ["* * * * *"]
 
 # The munshot bot endpoints. Override here if the tunnel changes.
 [vars]
-JOIN_ENDPOINT = "https://mortgage-competitive-angels-anonymous.trycloudflare.com/public/join"
-LEAVE_ENDPOINT = "https://mortgage-competitive-angels-anonymous.trycloudflare.com/public/leave"
+JOIN_ENDPOINT = "https://idea-cancer-translated-hat.trycloudflare.com/public/join"
+LEAVE_ENDPOINT = "https://idea-cancer-translated-hat.trycloudflare.com/public/leave"
 
 # KV namespace for users + sessions (namespace: meetbot-users).
 [[kv_namespaces]]
