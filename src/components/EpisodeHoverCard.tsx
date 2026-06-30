@@ -193,7 +193,7 @@ function EpisodeHoverCard({ episode, anchor, point }: Active) {
   const sources: { icon: string; label: string }[] = []
   if (episode.transcriptUrl) sources.push({ icon: 'description', label: 'Transcript' })
   if (episode.audioUrl) sources.push({ icon: 'graphic_eq', label: 'Audio' })
-  if (!episode.transcriptUrl && episode.notes) sources.push({ icon: 'notes', label: 'Show notes' })
+  if (!episode.transcriptUrl && episode.notes) sources.push({ icon: 'notes', label: 'Notes' })
 
   return createPortal(
     <div
@@ -213,7 +213,7 @@ function EpisodeHoverCard({ episode, anchor, point }: Active) {
       <div className="flex items-center gap-2.5">
         {podcast && <CoverTile podcast={podcast} className="h-9 w-9 shrink-0" showSource />}
         <div className="min-w-0 flex-1">
-          <p className="truncate text-metadata font-semibold text-on-surface">{podcast?.title ?? 'Podcast'}</p>
+          <p className="truncate text-metadata font-semibold text-on-surface">{podcast?.title ?? 'Meeting'}</p>
           {podcast?.author && <p className="truncate text-[12px] text-secondary">{podcast.author}</p>}
         </div>
         {episode.signal === 'high' && (

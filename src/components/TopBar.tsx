@@ -53,7 +53,7 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
           <input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="Search episodes, podcasts, people, companies…"
+            placeholder="Search meetings, people, topics…"
             className="w-full rounded-xl border border-outline-variant bg-surface-container-low py-2.5 pl-11 pr-sm text-[14px] text-on-surface outline-none transition-colors placeholder:text-outline focus:border-primary focus:bg-surface focus:ring-2 focus:ring-primary/15"
           />
         </form>
@@ -96,7 +96,7 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
               ) : (
                 <span className="grid h-4 w-4 place-items-center rounded bg-inverse-surface text-[8px] font-bold text-white">M</span>
               )}
-              <span className="max-w-[150px] truncate">{selected ? selected.title : 'All Channels'}</span>
+              <span className="max-w-[150px] truncate">{selected ? selected.title : 'All Meetings'}</span>
               <Icon name="expand_more" size={18} className={`text-outline transition-transform ${chanOpen ? 'rotate-180' : ''}`} />
             </button>
 
@@ -104,7 +104,7 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
               <>
                 <button className="fixed inset-0 z-40 cursor-default" aria-hidden onClick={() => setChanOpen(false)} />
                 <div className="pop absolute right-0 z-50 mt-2 max-h-[70vh] w-64 origin-top-right overflow-y-auto rounded-xl border border-outline-variant bg-surface p-1 shadow-card-hover">
-                  <p className="px-2.5 py-1.5 text-label-caps uppercase text-outline">Filter by channel</p>
+                  <p className="px-2.5 py-1.5 text-label-caps uppercase text-outline">Filter by meeting</p>
                   <button
                     onClick={() => {
                       setChannel(null)
@@ -115,7 +115,7 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
                     }`}
                   >
                     <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-inverse-surface text-[9px] font-bold text-white">M</span>
-                    <span className="flex-1 text-left">All Channels</span>
+                    <span className="flex-1 text-left">All Meetings</span>
                     {channelId === null && <Icon name="check" size={16} className="shrink-0" />}
                   </button>
                   {channels.map((p) => (

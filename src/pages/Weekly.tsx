@@ -199,8 +199,8 @@ export default function Weekly() {
             {loading || weekly === undefined
               ? 'Synthesising this edition…'
               : weekly
-                ? `${weekly.episodeCount} episode${weekly.episodeCount === 1 ? '' : 's'} · ${weekly.readMinutes} min read`
-                : 'No episodes analysed yet'}
+                ? `${weekly.episodeCount} meeting${weekly.episodeCount === 1 ? '' : 's'} · ${weekly.readMinutes} min read`
+                : 'No meetings analysed yet'}
           </p>
           {weekly && sentimentOn && (
             <div className="mt-2 flex items-center gap-2 text-metadata text-secondary">
@@ -215,7 +215,7 @@ export default function Weekly() {
             <button
               onClick={refresh}
               disabled={refreshing || weekly === undefined}
-              title={newEpisodes.length ? `Refresh to fold in ${newEpisodes.length} newly detected episode${newEpisodes.length === 1 ? '' : 's'}` : 'Regenerate this edition from the latest episodes (skips the cache)'}
+              title={newEpisodes.length ? `Refresh to fold in ${newEpisodes.length} newly detected meeting${newEpisodes.length === 1 ? '' : 's'}` : 'Regenerate this edition from the latest meetings (skips the cache)'}
               className="press relative inline-flex items-center gap-2 rounded-lg border border-outline-variant bg-surface px-3 py-2.5 text-metadata font-semibold text-on-surface hover:bg-surface-container-low disabled:cursor-not-allowed disabled:opacity-50"
             >
               <Icon name="refresh" size={18} className={refreshing ? 'motion-safe:animate-spin' : ''} />
@@ -260,7 +260,7 @@ export default function Weekly() {
             ) : (
               <>
                 <p className="text-[13.5px] font-semibold text-on-surface">
-                  {unprocessed.length} episode{unprocessed.length === 1 ? '' : 's'} from this week {unprocessed.length === 1 ? "isn't" : "aren't"} processed yet
+                  {unprocessed.length} meeting{unprocessed.length === 1 ? '' : 's'} from this week {unprocessed.length === 1 ? "isn't" : "aren't"} processed yet
                 </p>
                 <p className="text-[12px] text-secondary">{needsApiKey ? 'Connect an AI key to process them.' : 'Process them so the Monday brief includes everything.'}</p>
               </>
@@ -297,7 +297,7 @@ export default function Weekly() {
           </span>
           <span className="min-w-0 flex-1">
             <span className="block text-[13.5px] font-semibold text-on-surface">
-              {newEpisodes.length} new episode{newEpisodes.length === 1 ? '' : 's'} detected since this edition
+              {newEpisodes.length} new meeting{newEpisodes.length === 1 ? '' : 's'} detected since this edition
             </span>
             <span className="block text-[12px] text-secondary">Showing the saved version — refresh to fold in the latest.</span>
           </span>
@@ -355,10 +355,10 @@ function WeeklyDoc({
   const epForCite = (index: number) => episodeById(citations.find((c) => c.index === index)?.episodeId ?? '')
 
   const stats = [
-    { icon: 'play_circle', label: 'Episodes Processed', value: weekly.episodeCount, style: THEME_STYLES[0] },
+    { icon: 'play_circle', label: 'Meetings Processed', value: weekly.episodeCount, style: THEME_STYLES[0] },
     { icon: 'trending_up', label: 'Ideas Pitched', value: ideaCount, style: THEME_STYLES[1] },
     { icon: 'help', label: 'Questions Answered', value: ready.reduce((n, e) => n + (e.summary?.qa.length ?? 0), 0), style: THEME_STYLES[2] },
-    { icon: 'podcasts', label: 'Podcasts', value: trackedCount, style: THEME_STYLES[3] },
+    { icon: 'forum', label: 'Meetings', value: trackedCount, style: THEME_STYLES[3] },
   ]
 
   // Only nav to sections that actually have content (zero empty/fake sections). The
@@ -368,7 +368,7 @@ function WeeklyDoc({
     { id: 'key-points', label: 'Key Points', icon: 'format_list_bulleted', show: synthesised },
     { id: 'quant', label: 'Quantitative', icon: 'monitoring', show: quantTable.length > 0 },
     { id: 'readout', label: 'Investment Readout', icon: 'fact_check', show: readouts.length > 0 },
-    ...(synthesised ? [] : shows.map((s) => ({ id: `show-${s.podcastId}`, label: s.show, icon: 'podcasts', show: true }))),
+    ...(synthesised ? [] : shows.map((s) => ({ id: `show-${s.podcastId}`, label: s.show, icon: 'forum', show: true }))),
     { id: 'themes', label: 'Top Themes', icon: 'sell', show: !synthesised && weekly.topThemes.length > 0 },
     { id: 'mentions', label: 'Mentions', icon: 'alternate_email', show: hasMentions },
     { id: 'interesting', label: 'Interesting', icon: 'lightbulb', show: !!weekly.interesting.quote },
@@ -483,7 +483,7 @@ function WeeklyDoc({
                   const wrap = (s: string, w: string) => <div className={`${w} whitespace-normal`}>{stripCites(s)}</div>
                   return [
                     ep ? (
-                      <Link to={`/episodes/${ep.id}`} className="press inline-block max-w-[9rem] font-medium text-primary hover:underline">
+                      <Link to={`/meetings/${ep.id}`} className="press inline-block max-w-[9rem] font-medium text-primary hover:underline">
                         {r.episode}
                       </Link>
                     ) : (
@@ -564,7 +564,7 @@ function WeeklyDoc({
                   </div>
                   {interestingEpisode && (
                     <Link
-                      to={`/episodes/${interestingEpisode.id}`}
+                      to={`/meetings/${interestingEpisode.id}`}
                       className="press inline-flex items-center gap-1.5 rounded-lg bg-white/15 px-3 py-2 text-metadata font-semibold backdrop-blur hover:bg-white/25"
                     >
                       <Icon name="open_in_new" size={16} /> Double-click this
@@ -585,7 +585,7 @@ function WeeklyDoc({
                 return (
                   <Link
                     key={ep.id}
-                    to={`/episodes/${ep.id}`}
+                    to={`/meetings/${ep.id}`}
                     className="group flex items-center justify-between gap-md rounded-lg p-2 transition-colors hover:bg-surface-container-low"
                   >
                     <div className="flex min-w-0 items-center gap-3">
@@ -632,7 +632,7 @@ function Cited({ text, terms, epForCite }: { text: string; terms: string[]; epFo
           <sup className="text-[0.7em] font-semibold text-primary">{part}</sup>
         )
         return ep ? (
-          <Link key={i} to={`/episodes/${ep.id}`} className="hover:underline" aria-label={`Source ${n}: ${ep.title}`}>
+          <Link key={i} to={`/meetings/${ep.id}`} className="hover:underline" aria-label={`Source ${n}: ${ep.title}`}>
             {marker}
           </Link>
         ) : (
@@ -713,7 +713,7 @@ function ReadoutCard({ r, ep }: { r: WeeklyEpisodeReadout; ep?: Episode }) {
       <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
         <div className="min-w-0">
           {ep ? (
-            <Link to={`/episodes/${ep.id}`} className="press text-[15px] font-semibold text-on-surface hover:underline">
+            <Link to={`/meetings/${ep.id}`} className="press text-[15px] font-semibold text-on-surface hover:underline">
               {r.episode}
             </Link>
           ) : (
@@ -767,11 +767,11 @@ function ShowDigest({
     >
       <div className="mb-md flex items-center gap-2.5">
         <span className="grid h-8 w-8 place-items-center rounded-lg bg-primary-fixed/60 text-primary">
-          <Icon name="podcasts" size={18} />
+          <Icon name="forum" size={18} />
         </span>
         <h3 className="text-[18px] font-bold tracking-tight text-on-surface">{digest.show}</h3>
         <span className="text-metadata text-secondary">
-          {digest.episodeCount} episode{digest.episodeCount === 1 ? '' : 's'}
+          {digest.episodeCount} meeting{digest.episodeCount === 1 ? '' : 's'}
         </span>
       </div>
 
@@ -848,7 +848,7 @@ function IdeaCard({
         </p>
         {ep && (
           <Link
-            to={`/episodes/${ep.id}`}
+            to={`/meetings/${ep.id}`}
             title={ep.title}
             className="press shrink-0 text-secondary hover:text-primary"
           >
@@ -881,7 +881,7 @@ function GeneratingState({ count }: { count: number }) {
       <Icon name="auto_awesome" size={30} className="text-primary motion-safe:animate-pulse" fill />
       <p className="text-body-md font-semibold text-on-surface">Synthesising your weekly summary…</p>
       <p className="max-w-sm text-metadata text-secondary">
-        Reading across {count} analysed episode{count === 1 ? '' : 's'} to find the through-line, themes, and what actually mattered.
+        Reading across {count} analysed meeting{count === 1 ? '' : 's'} to find the through-line, themes, and what actually mattered.
       </p>
     </div>
   )
@@ -893,11 +893,11 @@ function EmptyState() {
       <Icon name="summarize" size={32} className="text-outline" />
       <h3 className="text-display-sm text-on-surface-variant">No weekly summary yet</h3>
       <p className="max-w-md text-body-md text-secondary">
-        Your weekly master summary is built from analysed episodes. Once a few episodes are summarised, the cross-episode
+        Your weekly master summary is built from analysed meetings. Once a few meetings are summarised, the cross-meeting
         synthesis appears here — drawn entirely from real content.
       </p>
-      <Link to="/episodes" className="press mt-1 inline-flex items-center gap-2 rounded-lg bg-primary px-lg py-2.5 text-metadata font-semibold text-on-primary hover:bg-primary-container">
-        <Icon name="play_circle" size={18} /> Go to Episodes
+      <Link to="/meetings" className="press mt-1 inline-flex items-center gap-2 rounded-lg bg-primary px-lg py-2.5 text-metadata font-semibold text-on-primary hover:bg-primary-container">
+        <Icon name="play_circle" size={18} /> Go to Meetings
       </Link>
     </div>
   )

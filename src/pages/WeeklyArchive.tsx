@@ -69,7 +69,7 @@ export default function WeeklyArchive() {
                 </div>
 
                 <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-metadata">
-                  <Stat icon="play_circle" label={`${e.episodeCount} episode${e.episodeCount === 1 ? '' : 's'}`} />
+                  <Stat icon="play_circle" label={`${e.episodeCount} meeting${e.episodeCount === 1 ? '' : 's'}`} />
                   {e.ideaCount > 0 && <Stat icon="trending_up" label={`${e.ideaCount} idea${e.ideaCount === 1 ? '' : 's'} pitched`} />}
                   <span className="flex flex-wrap gap-1.5">
                     {e.shows.slice(0, 4).map((s) => (
@@ -103,14 +103,14 @@ function EmptyState() {
       <Icon name="history" size={32} className="text-outline" />
       <h3 className="text-display-sm text-on-surface-variant">No weekly editions yet</h3>
       <p className="max-w-md text-body-md text-secondary">
-        Each week with analysed episodes becomes its own edition here. Once a few episodes are summarised, your history starts
+        Each week with analysed meetings becomes its own edition here. Once a few meetings are summarised, your history starts
         building automatically — drawn entirely from real content.
       </p>
       <Link
-        to="/episodes"
+        to="/meetings"
         className="press mt-1 inline-flex items-center gap-2 rounded-lg bg-primary px-lg py-2.5 text-metadata font-semibold text-on-primary hover:bg-primary-container"
       >
-        <Icon name="play_circle" size={18} /> Go to Episodes
+        <Icon name="play_circle" size={18} /> Go to Meetings
       </Link>
     </div>
   )

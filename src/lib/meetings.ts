@@ -42,6 +42,19 @@ const num = (v: unknown): number => {
   return Number.isFinite(n) ? n : 0
 }
 
+// Parse an ISO string, a SQLite datetime ("2026-06-30 08:10:00"), or epoch ms
+// into an ISO string. Never throws — an unparseable value falls back to epoch 0.
+function toIso(value: string): string {
+  if (!value) return new Date(0).toISOString()
+  let d = new Date(value)
+  if (Number.isNaN(d.getTime())) d = new Date(value.replace(' ', 'T') + 'Z')
+  if (Number.isNaN(d.getTime())) {
+    const n = Number(value)
+    d = Number.isFinite(n) ? new Date(n) : new Date(0)
+  }
+  return Number.isNaN(d.getTime()) ? new Date(0).toISOString() : d.toISOString()
+}
+
 /** "MM:SS" (or "H:MM:SS") for a second offset. */
 export function clockTime(totalSec: number): string {
   const s = Math.max(0, Math.floor(totalSec))
@@ -94,10 +107,12 @@ function buildMeeting(meetingId: string, owner: string, segs: RawSegment[]): Mee
   const id = encodeMeetingId(owner, meetingId)
   const people = participantsOf(ordered)
 
-  // Latest created_at across the meeting → when it happened.
+  // Latest created_at across the meeting → when it happened. created_at may be an
+  // ISO string, a SQLite datetime, or epoch ms; parse defensively so one odd row
+  // never throws and breaks the whole load.
   let latest = ''
   for (const s of ordered) if ((s.created_at || '') > latest) latest = s.created_at || ''
-  const publishedAt = latest ? new Date(latest).toISOString() : new Date(0).toISOString()
+  const publishedAt = toIso(latest)
 
   const durationSec = ordered.reduce((mx, s) => Math.max(mx, num(s.end_time) || num(s.start_time)), 0)
 

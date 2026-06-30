@@ -1,18 +1,32 @@
 # Munshot Notetaker — frontend
 
-A single Cloudflare Worker that provides:
+A **React dashboard** (Vite + TypeScript + Tailwind) served by a **Cloudflare Worker**. The Worker is the API + static host; the SPA is the whole UI, including login, and lives behind the session.
 
-- **Logins** — email + password stored in Workers KV (one `user:<email>` key per user). Passwords are PBKDF2-SHA256 hashed with a per-user salt. Sessions are KV-backed and carried in an HttpOnly cookie.
-- **A meeting form** — once signed in, paste a meeting link and it calls the munshot `/public/join` endpoint. The `X-API-Key` is held as a Worker **secret** and injected server-side, so it never reaches the browser.
-- **Scheduling & routines** — schedule the notetaker to join at a future time, or set a repeating routine (daily / weekdays / weekly). A Cloudflare **Cron Trigger** fires due schedules server-side every minute, so the bot joins on time whether or not you have the dashboard open.
-- **Meeting Assistant (AI)** — a floating chat window on the dashboard. Pick a meeting and it auto-summarizes the transcript, then you can ask follow-up questions about it. The transcript is loaded server-side (same per-user scoping as `/api/transcripts`) and sent to OpenAI with the `OPENAI_API_KEY` held as a Worker **secret**, so the key never reaches the browser.
+- **Architecture** — `worker/index.js` handles `/api/*` (auth, transcripts, AI, schedules, calendar, the join/leave bot) and serves the built SPA from `./dist` via the `[assets]` binding. The React app (in `src/`) calls those routes; it probes `/api/me` on boot and shows the login screen until there's a session.
+- **Logins** — email + password stored in Workers KV (one `user:<email>` key per user). Passwords are PBKDF2-SHA256 hashed with a per-user salt. Sessions are KV-backed and carried in an HttpOnly cookie. Sign-in / register are rebuilt in the SPA.
+- **Meetings** — the dashboard lists every meeting the notetaker has transcribed (`/api/transcripts`, grouped by `meeting_id`), with a per-meeting detail view (transcript + on-demand AI summary), search across transcripts, and a weekly digest.
+- **Send the notetaker** — paste a meeting link to send the bot now (`/public/join`), or schedule it for later (one-time / daily / weekdays / weekly). The `X-API-Key` is a Worker **secret** injected server-side, so it never reaches the browser. A Cloudflare **Cron Trigger** fires due schedules every minute.
+- **Calendar** — sync your calendar and send the notetaker to upcoming meetings in one click.
+- **Meeting Assistant (AI)** — each meeting auto-summarizes its transcript and answers follow-up questions. The transcript is loaded server-side (per-user scoping) and sent to OpenAI with the `OPENAI_API_KEY` held as a Worker **secret**.
+
+## Develop & build
+
+```bash
+npm install
+npm run build      # tsc + vite build -> ./dist
+npm run deploy     # build, then wrangler deploy
+
+# Local dev: run the Worker API and the Vite SPA together.
+npm run dev:worker # wrangler dev  (the API, on :8787)
+npm run dev        # vite          (the SPA; proxies /api -> :8787)
+```
 
 ## Routes
 
 | Method | Path                    | Purpose                                          |
 | ------ | ----------------------- | ------------------------------------------------ |
-| GET    | `/`                     | Login / register page                            |
-| GET    | `/dashboard`            | Meeting form + scheduler (requires session)      |
+| GET    | `/*`                    | The React SPA (index.html + assets); `/api/*` excepted |
+| GET    | `/api/me`               | Session probe for the SPA (user, isAdmin, or 401) |
 | POST   | `/api/register`         | Create a user, start a session                   |
 | POST   | `/api/login`            | Verify credentials, start a session              |
 | POST   | `/api/logout`           | Destroy the session                              |
@@ -23,6 +37,8 @@ A single Cloudflare Worker that provides:
 | GET    | `/api/schedules`        | List the signed-in user's schedules              |
 | POST   | `/api/schedules`        | Create a schedule / routine                      |
 | POST   | `/api/schedules/delete` | Cancel one of the user's schedules               |
+| POST   | `/api/calendar/sync`    | Sync the signed-in user's calendar               |
+| GET    | `/api/calendar/meetings`| Upcoming calendar meetings for the user          |
 
 `/api/join` sends the same payload as the original curl:
 

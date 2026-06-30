@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Link, NavLink } from 'react-router-dom'
 import { useAppData } from '../store/AppData'
+import { useAuth } from '../store/Auth'
 import { isEmbedded, type Identity } from '../lib/munshot'
 import { Icon } from './Icon'
 import { WeeklySubscribe } from './WeeklySubscribe'
@@ -9,10 +10,10 @@ type NavItem = { to: string; label: string; icon: string; end?: boolean; sub?: b
 
 const NAV: NavItem[] = [
   { to: '/', label: 'Home', icon: 'home', end: true },
-  { to: '/episodes', label: 'Episodes', icon: 'play_circle' },
+  { to: '/meetings', label: 'Meetings', icon: 'forum' },
   { to: '/weekly', label: 'Weekly Summary', icon: 'bar_chart', end: true },
   { to: '/weekly/archive', label: 'Past Editions', icon: 'history', sub: true },
-  { to: '/discover', label: 'Discover', icon: 'explore' },
+  { to: '/search', label: 'Search', icon: 'search' },
 ]
 
 /** The static sidebar — desktop/tablet only; below `md` the drawer takes over. */
@@ -132,6 +133,7 @@ function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onCl
  *  (standalone); or a quiet skeleton for the first moment identity resolves. */
 function IdentityBadge() {
   const { identity } = useAppData()
+  const { signOut } = useAuth()
 
   if (identity === undefined) {
     return (
@@ -185,23 +187,31 @@ function IdentityBadge() {
   }
 
   const display = identity.name || identity.email || identity.userId
-  const detail = identity.email && identity.email !== display ? identity.email : 'Personal space · synced'
+  const detail = identity.email && identity.email !== display ? identity.email : 'Your meetings · private'
   return (
     <div
-      className="mt-auto flex items-center gap-3 rounded-xl border border-outline-variant/60 bg-surface-container-low/40 px-3 py-2.5"
-      title={`Signed in via Munshot — your tracked shows and history are saved to this account (${identity.userId})`}
+      className="mt-auto flex items-center gap-2 rounded-xl border border-outline-variant/60 bg-surface-container-low/40 px-3 py-2.5"
+      title={`Signed in as ${identity.userId} — your meetings, transcripts and summaries are private to this account`}
     >
       <span className="relative shrink-0">
         <span className="grid h-8 w-8 place-items-center rounded-full bg-primary-fixed/70 text-[12px] font-bold text-primary">
           {initials(identity)}
         </span>
-        {/* Connected-to-host dot */}
         <span className="absolute -bottom-0.5 -right-0.5 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-surface" />
       </span>
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <p className="truncate text-[13px] font-semibold text-on-surface">{display}</p>
         <p className="truncate text-[11.5px] text-secondary">{detail}</p>
       </div>
+      <button
+        type="button"
+        onClick={() => void signOut()}
+        aria-label="Sign out"
+        title="Sign out"
+        className="press grid h-8 w-8 shrink-0 place-items-center rounded-lg text-secondary hover:bg-surface-container hover:text-error"
+      >
+        <Icon name="logout" size={18} />
+      </button>
     </div>
   )
 }

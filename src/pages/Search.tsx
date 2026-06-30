@@ -75,7 +75,7 @@ export default function Search() {
           autoFocus
           value={q}
           onChange={(e) => setParams(e.target.value ? { q: e.target.value } : {}, { replace: true })}
-          placeholder="A topic, company, person, or anything said on an episode…"
+          placeholder="A topic, company, person, or anything said in a meeting…"
           className="w-full rounded-xl border border-outline-variant bg-surface-container-lowest py-3.5 pl-12 pr-4 text-body-lg outline-none focus:border-primary focus:ring-1 focus:ring-primary"
         />
       </div>
@@ -83,7 +83,7 @@ export default function Search() {
       {/* Empty state → real topic suggestions */}
       {!needle && (
         <div>
-          <SectionLabel className="mb-sm">Topics from your episodes</SectionLabel>
+          <SectionLabel className="mb-sm">Topics from your meetings</SectionLabel>
           {suggestions.length ? (
             <div className="flex flex-wrap gap-sm">
               {suggestions.map((t) => (
@@ -97,7 +97,7 @@ export default function Search() {
               ))}
             </div>
           ) : (
-            <p className="text-body-md text-secondary">Once episodes are analysed, their topics show up here.</p>
+            <p className="text-body-md text-secondary">Once meetings are analysed, their topics show up here.</p>
           )}
         </div>
       )}
@@ -108,10 +108,10 @@ export default function Search() {
           {results.excerpts.length > 0 && (
             <section className="mb-xl">
               <div className="mb-sm flex items-baseline justify-between gap-sm">
-                <SectionLabel>Heard on the podcasts</SectionLabel>
+                <SectionLabel>From your meetings</SectionLabel>
                 <span className="text-metadata text-secondary">
                   {results.excerpts.length} passage{results.excerpts.length === 1 ? '' : 's'} · {results.excerptEpisodeIds.size}{' '}
-                  episode{results.excerptEpisodeIds.size === 1 ? '' : 's'}
+                  meeting{results.excerptEpisodeIds.size === 1 ? '' : 's'}
                 </span>
               </div>
               <div className="space-y-sm">
@@ -120,14 +120,14 @@ export default function Search() {
                   return (
                     <Link
                       key={`${ex.episode.id}-${ex.segment.id}`}
-                      to={`/episodes/${ex.episode.id}?tab=transcript`}
+                      to={`/meetings/${ex.episode.id}?tab=transcript`}
                       className="lift group block rounded-xl border border-outline-variant bg-surface-container-lowest p-md hover:shadow-card"
                     >
                       {/* Provenance */}
                       <div className="mb-2.5 flex items-center gap-2.5">
                         {podcast && <CoverTile podcast={podcast} className="h-8 w-8 shrink-0" />}
                         <div className="min-w-0 flex-1">
-                          <p className="truncate text-metadata font-semibold text-on-surface">{podcast?.title ?? 'Podcast'}</p>
+                          <p className="truncate text-metadata font-semibold text-on-surface">{podcast?.title ?? 'Meeting'}</p>
                           <p className="truncate text-[12px] text-secondary">
                             {ex.episode.title} · {longDate(ex.episode.publishedAt)}
                           </p>
@@ -176,17 +176,17 @@ export default function Search() {
             </section>
           )}
 
-          {/* Episodes */}
+          {/* Meetings */}
           {results.eps.length > 0 && (
             <section className="mb-xl">
-              <SectionLabel className="mb-sm">Episodes · {results.eps.length}</SectionLabel>
+              <SectionLabel className="mb-sm">Meetings · {results.eps.length}</SectionLabel>
               <div className="overflow-hidden rounded-2xl border border-outline-variant bg-surface-container-lowest">
                 {results.eps.map((ep) => {
                   const podcast = podcastById(ep.podcastId)
                   return (
                     <Link
                       key={ep.id}
-                      to={`/episodes/${ep.id}`}
+                      to={`/meetings/${ep.id}`}
                       className="flex items-center gap-md border-b border-outline-variant p-sm transition-colors last:border-b-0 hover:bg-surface-container-low"
                     >
                       {podcast && <CoverTile podcast={podcast} className="h-11 w-11 shrink-0" />}
@@ -204,10 +204,10 @@ export default function Search() {
             </section>
           )}
 
-          {/* Podcasts */}
+          {/* Sources */}
           {results.pods.length > 0 && (
             <section className="mb-xl">
-              <SectionLabel className="mb-sm">Podcasts · {results.pods.length}</SectionLabel>
+              <SectionLabel className="mb-sm">Sources · {results.pods.length}</SectionLabel>
               <div className="grid grid-cols-1 gap-sm sm:grid-cols-2">
                 {results.pods.map((p) => (
                   <Link
@@ -234,7 +234,7 @@ export default function Search() {
                 {results.highlights.map(({ episode, highlight }) => (
                   <Link
                     key={highlight.id}
-                    to={`/episodes/${episode.id}?tab=highlights`}
+                    to={`/meetings/${episode.id}?tab=highlights`}
                     className="lift block rounded-xl border border-outline-variant bg-surface-container-lowest p-md hover:shadow-card"
                   >
                     <div className="mb-1 flex items-center justify-between gap-sm">
@@ -256,10 +256,10 @@ export default function Search() {
             <div className="grid place-items-center gap-sm py-xl text-center">
               <Icon name="search_off" size={32} className="text-outline" />
               <p className="text-body-md text-secondary">
-                Nothing in your analysed episodes mentions “{q}” yet.
+                Nothing in your analysed meetings mentions “{q}” yet.
               </p>
               <p className="max-w-md text-metadata text-secondary">
-                Excerpts appear once an episode covering this has been transcribed and summarised.
+                Excerpts appear once a meeting covering this has been transcribed and summarised.
               </p>
             </div>
           )}

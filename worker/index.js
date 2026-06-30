@@ -92,13 +92,17 @@ async function serveSpa(request, env) {
       200,
     );
   }
-  const res = await env.ASSETS.fetch(request);
-  if (res.status === 404 && request.method === "GET") {
-    const indexUrl = new URL(request.url);
-    indexUrl.pathname = "/index.html";
-    return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
+  const url = new URL(request.url);
+  // A real built file (it has an extension: .js/.css/.png/.woff2 …) → serve as-is.
+  if (/\.[a-zA-Z0-9]+$/.test(url.pathname)) {
+    return env.ASSETS.fetch(request);
   }
-  return res;
+  // Otherwise it's a navigation ("/", "/meetings", "/meetings/42") → always
+  // return the SPA shell so the client router can take over (deep links and
+  // refreshes work). Don't rely on the asset layer's not-found behaviour.
+  const indexUrl = new URL(request.url);
+  indexUrl.pathname = "/index.html";
+  return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
 }
 
 async function handleRegister(request, env) {

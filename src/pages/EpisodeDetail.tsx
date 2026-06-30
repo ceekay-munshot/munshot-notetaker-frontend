@@ -107,10 +107,9 @@ export default function EpisodeDetail() {
   // the store hit costs no LLM/transcription). Idempotent — AppData dedupes per id.
   useEffect(() => {
     if (!episode || episode.status === 'failed') return
-    const needsWork =
-      (!episode.summary && !!episode.notes) ||
-      (!!episode.summary && !episode.transcript?.length && !!(episode.transcriptUrl || episode.audioUrl))
-    if (needsWork) summarizeEpisode(episode, podcast)
+    // A meeting already carries its transcript; generate the AI summary the first
+    // time it's opened (idempotent — AppData dedupes per id).
+    if (!episode.summary && !!episode.transcript?.length) summarizeEpisode(episode, podcast)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [episode?.id])
 
@@ -118,9 +117,9 @@ export default function EpisodeDetail() {
     return (
       <div className="grid place-items-center py-[20vh] text-center">
         <Icon name="error" size={36} className="mb-sm text-outline" />
-        <p className="text-body-md text-secondary">That episode could not be found.</p>
-        <Link to="/episodes" className="mt-sm text-metadata font-semibold text-primary hover:underline">
-          Back to episodes
+        <p className="text-body-md text-secondary">That meeting could not be found.</p>
+        <Link to="/meetings" className="mt-sm text-metadata font-semibold text-primary hover:underline">
+          Back to meetings
         </Link>
       </div>
     )
@@ -161,18 +160,19 @@ export default function EpisodeDetail() {
         onClick={() => navigate(-1)}
         className="mb-md inline-flex items-center gap-1 text-metadata font-semibold text-primary transition-colors hover:underline"
       >
-        <Icon name="arrow_back" size={16} /> Back to Episodes
+        <Icon name="arrow_back" size={16} /> Back to Meetings
       </button>
 
       {/* Header */}
       <div className="mb-lg flex flex-col gap-md sm:flex-row sm:items-start">
         <CoverTile podcast={podcast} className="h-28 w-28 shrink-0" rounded="rounded-xl" />
         <div className="flex-1">
-          <div className="mb-1 flex items-center gap-2">
-            <CoverTile podcast={podcast} className="h-5 w-5" rounded="rounded" />
-            <span className="text-metadata font-semibold text-on-surface">{podcast.title}</span>
-            <span className="text-metadata text-secondary">· {podcast.author}</span>
-          </div>
+          {episode.entities.people.length > 0 && (
+            <div className="mb-1 flex flex-wrap items-center gap-1.5">
+              <Icon name="group" size={16} className="text-secondary" />
+              <span className="text-metadata text-secondary">{episode.entities.people.join(', ')}</span>
+            </div>
+          )}
           <h1 className="mb-2 text-display-lg tracking-tight text-on-surface">{episode.title}</h1>
           <div className="flex flex-wrap items-center gap-3 text-metadata text-secondary">
             <span className="inline-flex items-center gap-1">
@@ -186,7 +186,6 @@ export default function EpisodeDetail() {
           {episode.summary && sentimentOn && <ToneMeter tone={episodeToneView(episode)} detailed className="mt-3" />}
         </div>
         <div className="flex items-center gap-2.5">
-          <SourceLink episode={episode} podcast={podcast} />
           {episode.summary && (
             <button
               onClick={refreshSummary}
@@ -717,10 +716,10 @@ function TranscriptTab({
     return (
       <div className="grid place-items-center gap-sm rounded-2xl border border-dashed border-outline-variant bg-surface-container-low py-xl text-center">
         <Icon name="graphic_eq" size={32} className="text-outline" />
-        <h3 className="text-[19px] font-semibold text-on-surface-variant">Transcript not ingested yet</h3>
+        <h3 className="text-[19px] font-semibold text-on-surface-variant">No transcript yet</h3>
         <p className="max-w-md text-body-md text-secondary">
-          Once the transcription API returns this episode's text, the full transcript appears here with the summary's
-          highlights linked inline.
+          Once the notetaker finishes this meeting, the full transcript appears here with the summary's highlights
+          linked inline.
         </p>
       </div>
     )
@@ -952,9 +951,9 @@ function CopyButton({ text, label }: { text: string; label?: string }) {
 
 // ── Processing pipeline (non-ready episodes) ─────────────────────────────────
 const PIPELINE: { status: ProcessingStatus; label: string; icon: string }[] = [
-  { status: 'detected', label: 'Episode detected', icon: 'fiber_new' },
-  { status: 'fetching', label: 'Fetching audio', icon: 'downloading' },
-  { status: 'transcribing', label: 'Transcribing', icon: 'graphic_eq' },
+  { status: 'detected', label: 'Meeting recorded', icon: 'fiber_new' },
+  { status: 'fetching', label: 'Collecting transcript', icon: 'downloading' },
+  { status: 'transcribing', label: 'Transcript ready', icon: 'graphic_eq' },
   { status: 'summarizing', label: 'Generating AI summary', icon: 'auto_awesome' },
   { status: 'ready', label: 'Summary ready', icon: 'check_circle' },
 ]
@@ -1048,14 +1047,14 @@ function ProcessingPanel({ episode, onRetry, needsApiKey }: { episode: Episode; 
         </span>
         <div>
           <h2 className="text-[19px] font-semibold text-on-surface">
-            {failed ? 'Processing failed' : needsApiKey ? 'Summary pending' : ready ? 'Summary ready' : 'Working on this episode…'}
+            {failed ? 'Summary failed' : needsApiKey ? 'Summary pending' : ready ? 'Summary ready' : 'Summarizing this meeting…'}
           </h2>
           <p className="text-metadata text-secondary">
             {failed
-              ? 'Something went wrong during processing. You can retry the pipeline.'
+              ? 'Something went wrong while summarizing. You can try again.'
               : needsApiKey
-                ? 'Add an OpenAI or Anthropic API key (in your local .env, or the Pages env vars) to generate the AI summary from this episode’s show-notes.'
-                : 'Munshot is reading the show-notes and writing the AI summary. It will appear here when ready.'}
+                ? 'The meeting assistant isn’t configured yet — set the OPENAI_API_KEY secret on the Worker to generate AI summaries.'
+                : 'Munshot is reading the transcript and writing the AI summary. It will appear here when ready.'}
           </p>
         </div>
       </div>
@@ -1097,7 +1096,7 @@ function ProcessingPanel({ episode, onRetry, needsApiKey }: { episode: Episode; 
           onClick={onRetry}
           className="press mt-md inline-flex items-center gap-2 rounded-lg bg-primary px-lg py-2.5 text-metadata font-semibold text-on-primary hover:bg-primary-container"
         >
-          <Icon name="refresh" size={18} /> Retry processing
+          <Icon name="refresh" size={18} /> Try again
         </button>
       )}
     </section>
@@ -1128,7 +1127,7 @@ function PipelineBar({ progress, mode, idx }: { progress: number; mode: PipeMode
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={pct}
-        aria-label="Episode processing progress"
+        aria-label="Meeting summary progress"
         className="relative h-2 overflow-hidden rounded-full bg-surface-container-high"
       >
         <div

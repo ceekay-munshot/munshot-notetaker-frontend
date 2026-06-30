@@ -47,9 +47,9 @@ export default function Episodes() {
     <div className="animate-fade-up">
       <div className="mb-md flex flex-wrap items-center justify-between gap-md">
         <div>
-          <h2 className="text-display-lg text-on-background">Episodes</h2>
+          <h2 className="text-display-lg text-on-background">Meetings</h2>
           <p className="mt-1 text-metadata text-secondary">
-            {rows.length} episode{rows.length === 1 ? '' : 's'} · {preset.days === null ? 'all time' : rangeLabel}
+            {rows.length} meeting{rows.length === 1 ? '' : 's'} · {preset.days === null ? 'all time' : rangeLabel}
           </p>
         </div>
         <Link
@@ -65,7 +65,7 @@ export default function Episodes() {
         <input
           value={q}
           onChange={(e) => setQ(e.target.value)}
-          placeholder="Search episodes…"
+          placeholder="Search meetings…"
           className="w-full rounded-lg border border-outline-variant bg-surface-container-lowest py-2.5 pl-11 pr-sm text-[14px] outline-none focus:border-primary"
         />
       </div>
@@ -89,8 +89,8 @@ export default function Episodes() {
 
       <div className="overflow-hidden rounded-2xl border border-outline-variant bg-surface-container-lowest shadow-card">
         <div className={`grid ${grid} items-center gap-md border-b border-outline-variant px-md py-3 text-label-caps uppercase text-outline`}>
-          <span>Episode</span>
-          <span>Podcast</span>
+          <span>Meeting</span>
+          <span>Source</span>
           <span className="flex items-center gap-1">Date <Icon name="arrow_downward" size={13} /></span>
           <span>Duration</span>
           {sentimentOn && <span>Tone</span>}
@@ -107,7 +107,7 @@ export default function Episodes() {
             active={activeId === ep.id}
             onOpen={() => {
               hardClose()
-              navigate(`/episodes/${ep.id}`)
+              navigate(`/meetings/${ep.id}`)
             }}
           />
         ))}
@@ -115,7 +115,7 @@ export default function Episodes() {
         {rows.length === 0 && (
           <div className="flex flex-col items-center gap-1 px-md py-xl text-center">
             <Icon name="event_busy" size={28} className="text-outline" />
-            <p className="text-body-md text-secondary">No episodes in {preset.days === null ? 'your library' : rangeLabel}.</p>
+            <p className="text-body-md text-secondary">No meetings in {preset.days === null ? 'your library' : rangeLabel}.</p>
             {preset.days !== null && (
               <button onClick={() => setPreset('all')} className="text-metadata font-semibold text-primary hover:underline">
                 Show all time

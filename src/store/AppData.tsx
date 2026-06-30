@@ -97,6 +97,11 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         })
       })
       setPodcasts(pods)
+    } catch {
+      // Transient/empty backend (e.g. no transcripts yet) — show an empty
+      // dashboard rather than crashing; the notetaker controls still work.
+      setEpisodes([])
+      setPodcasts([])
     } finally {
       setLoading(false)
     }

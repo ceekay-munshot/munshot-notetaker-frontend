@@ -48,7 +48,7 @@ function LoadingState() {
   return (
     <div className="grid place-items-center py-[20vh] text-secondary">
       <Icon name="graphic_eq" size={36} className="mb-sm motion-safe:animate-pulse text-primary" />
-      <p className="text-metadata">Loading your intelligence feed…</p>
+      <p className="text-metadata">Loading your meetings…</p>
     </div>
   )
 }

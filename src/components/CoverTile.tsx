@@ -64,7 +64,7 @@ export function CoverTile({
       )}
       {showSource && (
         <span className="absolute bottom-1.5 right-1.5 grid h-5 w-5 place-items-center rounded-full bg-black/30 backdrop-blur">
-          <Icon name={podcast.source === 'youtube' ? 'smart_display' : 'podcasts'} size={13} className="text-white" />
+          <Icon name={podcast.source === 'youtube' ? 'smart_display' : 'forum'} size={13} className="text-white" />
         </span>
       )}
     </div>

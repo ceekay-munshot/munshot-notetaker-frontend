@@ -66,12 +66,12 @@ export function EditionSwitcher({
             <EditionRow
               key={e.weekKey}
               label={e.rangeLabel}
-              meta={`${e.episodeCount} ep${e.episodeCount === 1 ? '' : 's'}${e.ideaCount ? ` · ${e.ideaCount} idea${e.ideaCount === 1 ? '' : 's'}` : ''}`}
+              meta={`${e.episodeCount} meeting${e.episodeCount === 1 ? '' : 's'}${e.ideaCount ? ` · ${e.ideaCount} idea${e.ideaCount === 1 ? '' : 's'}` : ''}`}
               active={e.weekKey === currentKey}
               onClick={() => pick(e.weekKey)}
             />
           ))}
-          <EditionRow label="All time" meta="every analysed episode" active={currentKey === 'all'} onClick={() => pick('all')} />
+          <EditionRow label="All time" meta="every analysed meeting" active={currentKey === 'all'} onClick={() => pick('all')} />
           <div className="my-1 border-t border-outline-variant" />
           <Link
             to={archiveTo}

@@ -194,7 +194,7 @@ function WatchModal({
           ) : failed ? (
             <div className="grid h-full w-full place-items-center p-md">
               <div className="pop flex flex-col items-center gap-1.5 text-center">
-                <p className="text-[14px] font-semibold text-white/90">Couldn't find this episode on YouTube</p>
+                <p className="text-[14px] font-semibold text-white/90">Couldn't find this meeting on YouTube</p>
                 <p className="text-metadata text-white/60">It may not be published there yet.</p>
                 <a
                   href={href}
@@ -210,7 +210,7 @@ function WatchModal({
             <div className="grid h-full w-full place-items-center">
               <div className="animate-pulse flex flex-col items-center gap-2.5">
                 <SourceMark youtube size={34} />
-                <p className="text-metadata font-medium text-white/70">Finding this episode on YouTube…</p>
+                <p className="text-metadata font-medium text-white/70">Finding this meeting on YouTube…</p>
               </div>
             </div>
           )}
