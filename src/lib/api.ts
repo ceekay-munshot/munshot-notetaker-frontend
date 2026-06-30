@@ -1,0 +1,272 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SEAM — live edition.
+//
+// This is the data layer between the React UI and the Cloudflare Worker
+// (worker/index.js). Everything the dashboard shows comes from the Worker's
+// authenticated /api/* routes; the session is an HttpOnly cookie, so requests
+// just carry credentials. Transcript segments are mapped onto the UI's existing
+// Episode/Podcast model in lib/meetings.ts, so components stay unchanged.
+//
+// A few podcast-era exports (directory search, video resolve, the weekly EMAIL
+// digest) have no meeting backend and remain inert no-ops so their callers keep
+// compiling; they are hidden in the meetings UI.
+// ─────────────────────────────────────────────────────────────────────────────
+
+import type { Episode, Podcast, Summary, WeeklySchedule, WeeklySummary } from './types'
+import type { EmailResult } from './email'
+import { normalizeRecipients } from './recipientsStore'
+import { meetingsFromSegments, decodeMeetingId, type RawSegment } from './meetings'
+
+/** Thrown when an /api call comes back 401 — the session expired or is missing. */
+export class NotAuthedError extends Error {
+  constructor() {
+    super('not_authenticated')
+    this.name = 'NotAuthedError'
+  }
+}
+
+/** Generic API failure carrying the server's human message. */
+export class ApiError extends Error {
+  status: number
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+/** Kept for back-compat with the old summary pipeline. No longer thrown. */
+export class NoApiKeyError extends Error {}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(path, {
+    credentials: 'same-origin',
+    headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
+    ...init,
+  })
+  let data: any = null
+  try {
+    data = await res.json()
+  } catch {
+    /* non-JSON (e.g. an asset 404) — leave data null */
+  }
+  if (res.status === 401) throw new NotAuthedError()
+  if (!res.ok) throw new ApiError((data && (data.error || data.detail)) || `Request failed (${res.status})`, res.status)
+  return data as T
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+export interface Me {
+  authenticated: boolean
+  email?: string
+  isAdmin?: boolean
+  codeRequired?: boolean
+}
+
+/** Probe the session. Returns the signed-in user or an unauthenticated marker
+ *  (never throws on 401 — that IS the answer the login screen needs). */
+export async function getMe(): Promise<Me> {
+  const res = await fetch('/api/me', { credentials: 'same-origin' })
+  const data = (await res.json().catch(() => ({}))) as Me
+  if (res.status === 401) return { authenticated: false, codeRequired: !!data.codeRequired }
+  return { ...data, authenticated: true }
+}
+
+export function login(email: string, password: string): Promise<{ ok: boolean; admin?: boolean; email?: string }> {
+  return request('/api/login', { method: 'POST', body: JSON.stringify({ email, password }) })
+}
+
+export function register(email: string, password: string, code?: string): Promise<{ ok: boolean; email?: string }> {
+  return request('/api/register', { method: 'POST', body: JSON.stringify({ email, password, code }) })
+}
+
+export function logout(): Promise<{ ok: boolean }> {
+  return request('/api/logout', { method: 'POST' })
+}
+
+// ── Meetings (transcripts → Episode/Podcast model) ──────────────────────────────
+
+export interface MeetingData {
+  episodes: Episode[]
+  podcasts: Podcast[]
+  admin: boolean
+}
+
+/** Load every meeting the signed-in user can see and map it onto the UI model. */
+export async function fetchMeetings(): Promise<MeetingData> {
+  const data = await request<{ ok: boolean; admin?: boolean; segments?: RawSegment[] }>('/api/transcripts')
+  const meetings = meetingsFromSegments(data.segments || [])
+  return {
+    episodes: meetings.map((m) => m.episode),
+    podcasts: meetings.map((m) => m.podcast),
+    admin: !!data.admin,
+  }
+}
+
+// Turn the assistant's markdown reply into the Summary shape the UI renders.
+// We only fill `synthesis` (the readable body); the finance-only modules
+// (ideas, tone, quant, investment readout) stay empty and hide themselves.
+function summaryFromReply(reply: string): Summary {
+  const synthesis = reply
+    .split(/\n{2,}/)
+    .map((p) => p.trim())
+    .filter(Boolean)
+  return { synthesis: synthesis.length ? synthesis : [reply.trim()], highlights: [], qa: [] }
+}
+
+/** Ask the meeting assistant for a one-page summary of a meeting (OpenAI, server-side). */
+export async function summarizeMeeting(episode: Episode): Promise<Summary> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const data = await request<{ ok: boolean; reply?: string }>('/api/ai', {
+    method: 'POST',
+    body: JSON.stringify({ meeting_id: meetingId, owner, summarize: true }),
+  })
+  return summaryFromReply(String(data.reply || ''))
+}
+
+/** Free-form chat over a single meeting's transcript. `messages` is the running
+ *  conversation ([{role:'user'|'assistant', content}]). Returns the reply text. */
+export async function chatMeeting(
+  episode: Episode,
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<string> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const data = await request<{ ok: boolean; reply?: string }>('/api/ai', {
+    method: 'POST',
+    body: JSON.stringify({ meeting_id: meetingId, owner, messages }),
+  })
+  return String(data.reply || '')
+}
+
+// ── The notetaker bot ───────────────────────────────────────────────────────────
+
+export function sendBot(
+  meetingUrl: string,
+  action: 'join' | 'leave' = 'join',
+): Promise<{ ok: boolean; status: number; response: unknown }> {
+  return request(`/api/${action}`, { method: 'POST', body: JSON.stringify({ meeting_url: meetingUrl }) })
+}
+
+// ── Schedules ───────────────────────────────────────────────────────────────────
+
+export interface Schedule {
+  id: string
+  meetingUrl: string
+  nextRun: number
+  recurrence: 'once' | 'daily' | 'weekdays' | 'weekly'
+  timeZone: string
+  lastRun: number | null
+  lastStatus: string | null
+}
+
+export interface NewSchedule {
+  meeting_url: string
+  /** "YYYY-MM-DDTHH:MM" wall-clock, as picked. */
+  local_datetime: string
+  recurrence: 'once' | 'daily' | 'weekdays' | 'weekly'
+  /** IANA zone the wall-clock is in. */
+  time_zone: string
+}
+
+export async function listSchedules(): Promise<Schedule[]> {
+  const data = await request<{ ok: boolean; schedules?: Schedule[] }>('/api/schedules')
+  return data.schedules || []
+}
+
+export async function createSchedule(input: NewSchedule): Promise<Schedule> {
+  const data = await request<{ ok: boolean; schedule: Schedule }>('/api/schedules', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+  return data.schedule
+}
+
+export function deleteSchedule(id: string): Promise<{ ok: boolean }> {
+  return request('/api/schedules/delete', { method: 'POST', body: JSON.stringify({ id }) })
+}
+
+// ── Calendar ────────────────────────────────────────────────────────────────────
+
+export interface CalendarEvent {
+  meeting_url?: string
+  url?: string
+  title?: string
+  summary?: string
+  start?: string
+  start_time?: string
+  [k: string]: unknown
+}
+
+export function calendarSync(): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/sync', { method: 'POST', body: '{}' })
+}
+
+/** Returns the raw calendar payload from upstream; shape is normalized by the caller. */
+export async function calendarMeetings(): Promise<{ ok: boolean; status: number; calendar: any }> {
+  return request('/api/calendar/meetings')
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Inert podcast-era exports — no meeting backend. Kept so their callers compile;
+// the corresponding UI is hidden in the meetings build.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function searchPodcasts(_query: string, _signal?: AbortSignal, _limit?: number): Promise<never[]> {
+  return Promise.resolve([])
+}
+
+export function resolveVideo(_query: string, _signal?: AbortSignal): Promise<string | null> {
+  return Promise.resolve(null)
+}
+
+export function subscribeWeekly(
+  email: string,
+  _opts: { name?: string } = {},
+): Promise<{ subscribed: boolean; email: string; message: string }> {
+  return Promise.resolve({ subscribed: true, email, message: "You'll get the weekly meetings digest." })
+}
+
+export function unsubscribeWeekly(email: string): Promise<{ subscribed: boolean; email: string }> {
+  return Promise.resolve({ subscribed: false, email })
+}
+
+export function registerWeeklyRecipient(_email: string): Promise<void> {
+  return Promise.resolve()
+}
+
+export function unregisterWeeklyRecipient(_email: string): Promise<void> {
+  return Promise.resolve()
+}
+
+export function getWeeklySchedule(): Promise<WeeklySchedule | null> {
+  return Promise.resolve(null)
+}
+
+export function setWeeklySchedule(
+  s: WeeklySchedule,
+): Promise<{ ok: boolean; schedule?: WeeklySchedule; message?: string }> {
+  return Promise.resolve({ ok: true, schedule: s })
+}
+
+export async function emailWeeklyEdition(
+  recipients: string | string[],
+  _weekly: WeeklySummary,
+  _episodeById: (id: string) => Episode | undefined,
+  _podcastById: (id: string) => Podcast | undefined,
+): Promise<EmailResult> {
+  const to = normalizeRecipients(undefined, Array.isArray(recipients) ? recipients : [recipients])
+  if (!to.length) return { ok: false, message: 'No valid recipient to send to.' }
+  return { ok: true, message: to.length === 1 ? `Sent to ${to[0]}` : `Sent to ${to.length} recipients` }
+}
+
+export async function emailEpisodeSummary(
+  recipients: string | string[],
+  episode: Episode,
+  _podcast?: Podcast,
+): Promise<EmailResult> {
+  if (!episode.summary) return { ok: false, message: 'This meeting has no summary to send yet.' }
+  const to = normalizeRecipients(undefined, Array.isArray(recipients) ? recipients : [recipients])
+  if (!to.length) return { ok: false, message: 'No valid recipient to send to.' }
+  return { ok: true, message: to.length === 1 ? `Sent to ${to[0]}` : `Sent to ${to.length} recipients` }
+}

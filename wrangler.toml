@@ -1,6 +1,28 @@
 name = "munshot-notetaker-frontend"
-main = "src/index.js"
+main = "worker/index.js"
 compatibility_date = "2024-11-01"
+
+# Build the React SPA into ./dist before any deploy/upload. Workers Builds (CI)
+# runs `wrangler versions upload` directly, so this hook is what produces the
+# assets the [assets] block below serves. Runs locally on `wrangler deploy` too.
+[build]
+command = "npm run build"
+
+# The React dashboard is built to ./dist (`npm run build`) and served as static
+# assets. A request that matches a built file (hashed JS/CSS, fonts, the logo)
+# is served directly; everything else invokes the Worker, which handles /api/*
+# and otherwise serves the SPA shell (index.html) via the ASSETS binding so
+# client-side routes load. Nothing is gated at the asset layer — all data is
+# behind the authenticated /api/* routes, and the SPA shows the login screen
+# until /api/me succeeds. (No not_found_handling = "single-page-application":
+# that would shadow /api/* with index.html; the Worker does the SPA fallback.)
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+run_worker_first = true
+# Serve files literally — don't let the asset layer redirect "/index.html" → "/"
+# (its default), which would loop against the Worker's SPA fallback.
+html_handling = "none"
 
 # Cron trigger: runs the scheduled-meeting runner every minute so the notetaker
 # joins on time whether or not anyone has the dashboard open. 1 minute is the
