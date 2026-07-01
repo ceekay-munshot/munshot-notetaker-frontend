@@ -32,8 +32,8 @@ crons = ["* * * * *"]
 
 # The munshot bot endpoints. Override here if the tunnel changes.
 [vars]
-JOIN_ENDPOINT = "http://65.1.101.15:8080/public/join"
-LEAVE_ENDPOINT = "http://65.1.101.15:8080/public/leave"
+JOIN_ENDPOINT = "http://65.1.101.15.nip.io:8080/public/join"
+LEAVE_ENDPOINT = "http://65.1.101.15.nip.io:8080/public/leave"
 
 # KV namespace for users + sessions (namespace: meetbot-users).
 [[kv_namespaces]]
