@@ -9,9 +9,9 @@
 const COOKIE_NAME = "session";
 const SESSION_TTL = 60 * 60 * 24 * 7; // 7 days
 const DEFAULT_JOIN_ENDPOINT =
-  "https://guitar-chester-contribute-incidence.trycloudflare.com/public/join";
+  "http://65.1.101.15:8056/public/join";
 const DEFAULT_LEAVE_ENDPOINT =
-  "https://guitar-chester-contribute-incidence.trycloudflare.com/public/leave";
+  "http://65.1.101.15:8056/public/leave";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
