@@ -161,25 +161,80 @@ const RECUR_LABEL: Record<string, string> = {
   weekly: 'Weekly',
 }
 
-/** Upcoming scheduled notetaker runs, with cancel. */
+/** Upcoming: calendar meetings + scheduled notetaker runs together. Send the bot,
+ *  remove a calendar meeting, cancel a schedule, and sync the calendar — all here. */
 export function SchedulesCard() {
-  const { schedules, deleteSchedule } = useAppData()
+  const { schedules, deleteSchedule, calendarEvents, calendarLoading, syncCalendar, sendBot, removeCalendarEvent } =
+    useAppData()
   const upcoming = useMemo(() => [...schedules].sort((a, b) => a.nextRun - b.nextRun), [schedules])
+  const events = useMemo(() => calendarEvents.filter((e) => e.id != null || eventUrl(e)), [calendarEvents])
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+  const empty = upcoming.length === 0 && events.length === 0
 
   return (
     <Card>
-      <h3 className="mb-3 flex items-center gap-2 text-[17px] font-semibold text-on-surface">
-        <Icon name="event" size={20} className="text-primary" /> Upcoming schedules
-      </h3>
-      {upcoming.length === 0 ? (
-        <p className="py-4 text-center text-metadata text-secondary">No schedules yet. Schedule the notetaker above.</p>
+      <div className="mb-3 flex items-center justify-between gap-2">
+        <h3 className="flex items-center gap-2 text-[17px] font-semibold text-on-surface">
+          <Icon name="event" size={20} className="text-primary" /> Upcoming schedules
+        </h3>
+        <button
+          type="button"
+          disabled={calendarLoading}
+          onClick={async () => {
+            setMsg(null)
+            try {
+              await syncCalendar()
+              setMsg({ kind: 'ok', text: 'Calendar synced.' })
+            } catch {
+              setMsg({ kind: 'err', text: 'Could not sync the calendar.' })
+            }
+          }}
+          className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-semibold text-primary hover:bg-surface-container-low disabled:opacity-50"
+        >
+          {calendarLoading ? (
+            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
+          ) : (
+            <Icon name="sync" size={16} />
+          )}
+          Sync calendar
+        </button>
+      </div>
+      {empty ? (
+        <p className="py-4 text-center text-metadata text-secondary">
+          No upcoming meetings or schedules. Schedule the notetaker above, or sync your calendar.
+        </p>
       ) : (
         <ul className="flex flex-col gap-2">
+          {events.map((ev, i) => (
+            <CalendarRow
+              key={`cal-${ev.id ?? i}`}
+              event={ev}
+              onSend={async () => {
+                setMsg(null)
+                try {
+                  await sendBot(eventUrl(ev), 'join')
+                  setMsg({ kind: 'ok', text: 'Notetaker is joining.' })
+                } catch {
+                  setMsg({ kind: 'err', text: 'Could not send the notetaker.' })
+                }
+              }}
+              onRemove={async () => {
+                setMsg(null)
+                try {
+                  await removeCalendarEvent(ev.id as number | string)
+                  setMsg({ kind: 'ok', text: "Removed — the bot won't join it." })
+                } catch {
+                  setMsg({ kind: 'err', text: 'Could not remove the meeting.' })
+                }
+              }}
+            />
+          ))}
           {upcoming.map((s) => (
             <ScheduleRow key={s.id} schedule={s} onCancel={() => deleteSchedule(s.id)} />
           ))}
         </ul>
       )}
+      {msg && <Note kind={msg.kind}>{msg.text}</Note>}
     </Card>
   )
 }
@@ -231,81 +286,65 @@ function eventWhen(ev: CalendarEvent): string {
     : String(raw)
 }
 
-/** Sync the calendar and list upcoming calendar meetings, each with a quick "send bot". */
-export function CalendarCard() {
-  const { calendarEvents, calendarLoading, syncCalendar, sendBot } = useAppData()
-  const [msg, setMsg] = useState<string | null>(null)
-  const [sendingId, setSendingId] = useState<string | null>(null)
+function platformLabel(p: unknown): string {
+  const s = String(p || '')
+  if (s === 'google_meet') return 'Google Meet'
+  if (s === 'browser_session') return 'Browser'
+  return s.replace(/_/g, ' ')
+}
 
-  const withUrl = calendarEvents.filter((e) => eventUrl(e))
-
+/** One calendar meeting: name + when + platform/status, with send-bot and remove. */
+function CalendarRow({
+  event,
+  onSend,
+  onRemove,
+}: {
+  event: CalendarEvent
+  onSend: () => Promise<void>
+  onRemove: () => Promise<void>
+}) {
+  const [busy, setBusy] = useState<'send' | 'remove' | null>(null)
+  const url = eventUrl(event)
+  async function run(kind: 'send' | 'remove', fn: () => Promise<void>) {
+    setBusy(kind)
+    try {
+      await fn()
+    } finally {
+      setBusy(null)
+    }
+  }
   return (
-    <Card>
-      <div className="mb-3 flex items-center justify-between">
-        <h3 className="flex items-center gap-2 text-[17px] font-semibold text-on-surface">
-          <Icon name="calendar_month" size={20} className="text-primary" /> Calendar
-        </h3>
+    <li className="flex items-center gap-3 rounded-lg border border-outline-variant bg-surface px-3 py-2.5">
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-metadata font-semibold text-on-surface">{eventTitle(event)}</p>
+        <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-secondary">
+          {eventWhen(event) && <span>{eventWhen(event)}</span>}
+          {event.platform ? <span>· {platformLabel(event.platform)}</span> : null}
+          {event.status ? (
+            <span className="rounded-full bg-surface-container-high px-1.5 py-0.5 text-[11px] font-medium capitalize text-on-surface-variant">
+              {String(event.status)}
+            </span>
+          ) : null}
+        </p>
+      </div>
+      {url ? (
         <button
           type="button"
-          disabled={calendarLoading}
-          onClick={async () => {
-            setMsg(null)
-            try {
-              await syncCalendar()
-              setMsg('Calendar synced.')
-            } catch {
-              setMsg('Could not sync the calendar.')
-            }
-          }}
-          className="press inline-flex items-center gap-1.5 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-semibold text-primary hover:bg-surface-container-low disabled:opacity-50"
+          disabled={busy !== null}
+          onClick={() => run('send', onSend)}
+          className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-primary hover:bg-surface-container-low disabled:opacity-50"
         >
-          {calendarLoading ? (
-            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
-          ) : (
-            <Icon name="sync" size={16} />
-          )}
-          Sync calendar
+          {busy === 'send' ? '…' : 'Send bot'}
         </button>
-      </div>
-      {withUrl.length === 0 ? (
-        <p className="py-4 text-center text-metadata text-secondary">
-          No upcoming meetings. Sync your calendar to pull them in.
-        </p>
-      ) : (
-        <ul className="flex flex-col gap-1.5">
-          {withUrl.slice(0, 6).map((ev, i) => {
-            const id = eventUrl(ev) + i
-            return (
-              <li key={id} className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-surface-container-low">
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-metadata font-medium text-on-surface">{eventTitle(ev)}</p>
-                  {eventWhen(ev) && <p className="text-[12px] text-secondary">{eventWhen(ev)}</p>}
-                </div>
-                <button
-                  type="button"
-                  disabled={sendingId === id}
-                  onClick={async () => {
-                    setSendingId(id)
-                    setMsg(null)
-                    try {
-                      await sendBot(eventUrl(ev), 'join')
-                      setMsg('Notetaker is joining.')
-                    } catch {
-                      setMsg('Could not send the notetaker.')
-                    } finally {
-                      setSendingId(null)
-                    }
-                  }}
-                  className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-primary hover:bg-surface disabled:opacity-50"
-                >
-                  Send bot
-                </button>
-              </li>
-            )
-          })}
-        </ul>
-      )}
-      {msg && <p className="mt-2 text-metadata text-secondary">{msg}</p>}
-    </Card>
+      ) : null}
+      <button
+        type="button"
+        disabled={busy !== null}
+        onClick={() => run('remove', onRemove)}
+        className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-secondary hover:bg-surface-container-low hover:text-error disabled:opacity-50"
+      >
+        {busy === 'remove' ? '…' : 'Remove'}
+      </button>
+    </li>
   )
 }

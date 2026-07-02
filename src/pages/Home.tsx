@@ -7,7 +7,7 @@ import { CoverTile } from '../components/CoverTile'
 import { Icon } from '../components/Icon'
 import { RichText, entityTerms } from '../components/RichText'
 import { StatusBadge } from '../components/StatusBadge'
-import { SendBotCard, SchedulesCard, CalendarCard } from '../components/NotetakerControls'
+import { SendBotCard, SchedulesCard } from '../components/NotetakerControls'
 import { topTopics } from '../lib/topics'
 
 export default function Home() {
@@ -47,10 +47,9 @@ export default function Home() {
 
       {/* Notetaker actions — send the bot, schedule it, sync the calendar. */}
       {!isAdmin && (
-        <div className="mb-gutter grid grid-cols-1 gap-gutter lg:grid-cols-3">
+        <div className="mb-gutter grid grid-cols-1 gap-gutter lg:grid-cols-2">
           <SendBotCard />
           <SchedulesCard />
-          <CalendarCard />
         </div>
       )}
 

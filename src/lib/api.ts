@@ -208,12 +208,17 @@ export function deleteSchedule(id: string): Promise<{ ok: boolean }> {
 // ── Calendar ────────────────────────────────────────────────────────────────────
 
 export interface CalendarEvent {
+  id?: number | string
   meeting_url?: string
   url?: string
   title?: string
   summary?: string
   start?: string
   start_time?: string
+  end_time?: string
+  platform?: string
+  status?: string
+  meeting_id?: number | string | null
   [k: string]: unknown
 }
 
@@ -224,6 +229,11 @@ export function calendarSync(): Promise<{ ok: boolean; status: number; result: u
 /** Returns the raw calendar payload from upstream; shape is normalized by the caller. */
 export async function calendarMeetings(): Promise<{ ok: boolean; status: number; calendar: any }> {
   return request('/api/calendar/meetings')
+}
+
+/** Remove a scheduled/upcoming calendar meeting so the bot won't join it. */
+export function calendarRemove(eventId: number | string): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/remove', { method: 'POST', body: JSON.stringify({ event_id: eventId }) })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -39,6 +39,7 @@ export default {
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
       if (method === "POST" && pathname === "/api/calendar/sync") return handleCalendarSync(request, env);
       if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
+      if (method === "POST" && pathname === "/api/calendar/meetings/remove") return handleCalendarRemove(request, env);
       if (method === "GET" && pathname === "/api/config") return handleGetConfig(request, env);
       if (method === "POST" && pathname === "/api/config") return handleSetConfig(request, env);
       // Unknown API path → JSON 404 (never the SPA shell, so fetch() callers
@@ -571,6 +572,33 @@ async function handleCalendarMeetings(request, env) {
     );
     const calendar = await readUpstreamJson(upstream);
     return json({ ok: upstream.ok, status: upstream.status, calendar }, upstream.ok ? 200 : 502);
+  } catch (err) {
+    return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
+  }
+}
+
+// POST /calendar/meetings/remove {email, event_id} — removes a scheduled/upcoming
+// calendar meeting so the bot won't (or no longer will) join it. The event_id
+// comes from the calendar_events array; email is the session's, added server-side.
+async function handleCalendarRemove(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
+  if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
+  const body = await request.json().catch(() => ({}));
+  const eventId = body.event_id;
+  if (eventId === undefined || eventId === null || eventId === "") {
+    return json({ error: "event_id is required" }, 400);
+  }
+  try {
+    const base = await resolveApiBase(env);
+    const upstream = await fetch(base + "/calendar/meetings/remove", {
+      method: "POST",
+      headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: session.identity, event_id: eventId }),
+    });
+    const result = await readUpstreamJson(upstream);
+    return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
   } catch (err) {
     return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
   }

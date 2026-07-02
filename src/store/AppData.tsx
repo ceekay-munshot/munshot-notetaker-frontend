@@ -41,6 +41,7 @@ interface AppData {
   calendarLoading: boolean
   syncCalendar: () => Promise<void>
   refreshCalendar: () => Promise<void>
+  removeCalendarEvent: (eventId: number | string) => Promise<void>
   // bulk weekly processing
   weekProcessing: boolean
   weekProgress: { done: number; total: number; title: string }
@@ -58,7 +59,7 @@ function normalizeCalendar(payload: any): api.CalendarEvent[] {
   if (!payload) return []
   const arr = Array.isArray(payload)
     ? payload
-    : payload.meetings || payload.events || payload.items || payload.calendar || []
+    : payload.calendar_events || payload.meetings || payload.events || payload.items || payload.calendar || []
   return Array.isArray(arr) ? arr : []
 }
 
@@ -196,6 +197,19 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshCalendar])
 
+  const removeCalendarEvent = useCallback(
+    async (eventId: number | string) => {
+      // optimistic: drop it from the list right away
+      setCalendarEvents((prev) => prev.filter((e) => String(e.id) !== String(eventId)))
+      try {
+        await api.calendarRemove(eventId)
+      } finally {
+        await refreshCalendar()
+      }
+    },
+    [refreshCalendar],
+  )
+
   const processWeek = useCallback(
     async (targets: Episode[]) => {
       if (weekRunning.current || !targets.length) return
@@ -250,6 +264,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       calendarLoading,
       syncCalendar,
       refreshCalendar,
+      removeCalendarEvent,
       weekProcessing,
       weekProgress,
       processWeek,
@@ -279,6 +294,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       calendarLoading,
       syncCalendar,
       refreshCalendar,
+      removeCalendarEvent,
       weekProcessing,
       weekProgress,
       processWeek,
