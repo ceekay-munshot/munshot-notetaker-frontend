@@ -354,13 +354,12 @@ async function generateDetailedSummary(rows, apiKey, model) {
       role: "user",
       content:
         "From the meeting transcript, write:\n\n" +
-        "First, a 3-5 sentence plain-prose overview of the meeting — its purpose, the main topics, and the outcome. " +
-        "Do NOT put a header before it.\n\n" +
+        "First, a 2-3 sentence overview — purpose, main topics, outcome. Concise; no header before it.\n\n" +
         "Then a blank line, then this section:\n\n" +
         "**Decisions & Action Items**\n" +
-        'A bullet list ("- " per line), one concrete decision or action item per bullet, with the owner and any deadline ' +
-        'in parentheses when the transcript states them, e.g. "- Add multiselect filter options (Owner: Tarandeep)." ' +
-        'If there were none, write "- None recorded."\n\n' +
+        'Short bullets ("- " per line), one decision or action item each, with the owner/deadline in parentheses when the ' +
+        'transcript states them (e.g. "- Multiselect filter options (Owner: Tarandeep)."). Keep each to a phrase, not a ' +
+        'sentence. If there were none, write "- None recorded."\n\n' +
         "Output only that.\n\nTRANSCRIPT:\n" + transcript,
     },
   ], 900);
@@ -370,25 +369,22 @@ async function generateDetailedSummary(rows, apiKey, model) {
     {
       role: "system",
       content:
-        "You are a sharp meeting summarizer. Summarize what one specific person contributed, in your own words, using only " +
-        "the transcript. Never quote them verbatim or transcribe line by line — distill their points into meaning.",
+        "You are a sharp meeting summarizer who writes terse, minimalist notes. Summarize one person's contribution in your " +
+        "own words from the transcript only — never quote or transcribe. Keep all the substance; cut every word you can.",
     },
     {
       role: "user",
       content:
-        `Summarize what ${name} contributed to this meeting — what they explained, proposed, asked, demonstrated, decided, or ` +
-        "agreed to — as substantive bullet points, in the order things happened.\n\n" +
-        "Rules:\n" +
-        "- SUMMARIZE in your own words, third person. Do NOT quote verbatim and do NOT transcribe sentence by sentence.\n" +
-        '- Skip filler and pleasantries ("okay", "sure", "can you see my screen") and MERGE closely-related statements into a ' +
-        "single point.\n" +
-        `- Each bullet is a meaningful point or step — what ${name} actually conveyed and why — keeping the real substance ` +
-        "(specific features, tools, numbers, examples, the reasoning). If they walked through a process, capture the key steps " +
-        "as separate bullets.\n" +
-        "- Include questions they raised and answers or decisions they gave.\n" +
-        `- Do NOT begin bullets with ${name}'s name — the reader already knows this section is about them.\n` +
-        `- If ${name} barely participated, write 1-2 bullets on what little they added.\n\n` +
-        'Output: 3-10 Markdown "- " bullet points only. No heading, no preamble, no quotes.\n\n' +
+        `In terse note form, summarize everything ${name} contributed — what they explained, proposed, asked, demonstrated, ` +
+        "or decided — as short bullets, in order.\n\n" +
+        "Style:\n" +
+        "- Minimalist meeting notes, NOT prose. Each bullet = a compact fragment (drop filler words, articles, hedging). " +
+        "No full-sentence padding.\n" +
+        "- Cut WORDS, never INFORMATION — keep every specific: features, tools, numbers, names, reasons, decisions.\n" +
+        "- One idea per bullet. Merge related lines; a multi-step walkthrough → one short bullet per step.\n" +
+        "- Skip pleasantries (okay / sure / can you see my screen). No quotes. Don't prefix bullets with the name.\n" +
+        `- If ${name} barely spoke, one bullet.\n\n` +
+        'Output: Markdown "- " bullets only. No heading, no preamble.\n\n' +
         "TRANSCRIPT:\n" + transcript,
     },
   ];
@@ -397,7 +393,7 @@ async function generateDetailedSummary(rows, apiKey, model) {
   if (speakers.length) {
     peoplePromise = Promise.all(
       speakers.map((name) =>
-        openaiChat(apiKey, model, perPersonPrompt(name), 1000)
+        openaiChat(apiKey, model, perPersonPrompt(name), 700)
           .then((notes) => ({ name, notes }))
           .catch((e) => ({ name, notes: `- (Notes unavailable: ${String((e && e.message) || e)})` }))
       )
@@ -407,16 +403,15 @@ async function generateDetailedSummary(rows, apiKey, model) {
       apiKey,
       model,
       [
-        { role: "system", content: "Sharp meeting summarizer. Summarize what happened from the transcript in your own words; never quote verbatim or transcribe." },
+        { role: "system", content: "Sharp summarizer who writes terse, minimalist notes from the transcript only; never quote or transcribe." },
         {
           role: "user",
           content:
-            "Summarize what happened in this meeting as substantive, chronological bullet points — the key topics, the points " +
-            "made, and the decisions — in your own words (no verbatim quotes). Merge related statements and skip filler. " +
-            'Markdown "- " bullets only.\n\nTRANSCRIPT:\n' + transcript,
+            "In terse note form, summarize what happened — key topics, points, decisions — as short Markdown bullets, in " +
+            "order. Compact fragments, no filler, no quotes; cut words, not information.\n\nTRANSCRIPT:\n" + transcript,
         },
       ],
-      1200
+      900
     )
       .then((notes) => [{ name: "", notes }])
       .catch(() => [{ name: "", notes: "- (Notes unavailable)" }]);
