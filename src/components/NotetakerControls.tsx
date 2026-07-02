@@ -164,12 +164,20 @@ const RECUR_LABEL: Record<string, string> = {
 /** Upcoming: calendar meetings + scheduled notetaker runs together. Send the bot,
  *  remove a calendar meeting, cancel a schedule, and sync the calendar — all here. */
 export function SchedulesCard() {
-  const { schedules, deleteSchedule, calendarEvents, calendarLoading, syncCalendar, sendBot, removeCalendarEvent } =
-    useAppData()
+  const {
+    schedules,
+    deleteSchedule,
+    calendarEvents,
+    calendarLoading,
+    syncCalendar,
+    sendBot,
+    removeCalendarEvent,
+    removeCalendarEvents,
+  } = useAppData()
   const upcoming = useMemo(() => [...schedules].sort((a, b) => a.nextRun - b.nextRun), [schedules])
-  const events = useMemo(() => calendarEvents.filter((e) => e.id != null || eventUrl(e)), [calendarEvents])
+  const groups = useMemo(() => groupEvents(calendarEvents), [calendarEvents])
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
-  const empty = upcoming.length === 0 && events.length === 0
+  const empty = upcoming.length === 0 && groups.length === 0
 
   return (
     <Card>
@@ -205,24 +213,33 @@ export function SchedulesCard() {
         </p>
       ) : (
         <ul className="flex flex-col gap-2">
-          {events.map((ev, i) => (
-            <CalendarRow
-              key={`cal-${ev.id ?? i}`}
-              event={ev}
+          {groups.map((g) => (
+            <MeetingGroupRow
+              key={g.key}
+              group={g}
               onSend={async () => {
                 setMsg(null)
                 try {
-                  await sendBot(eventUrl(ev), 'join')
+                  await sendBot(g.url, 'join')
                   setMsg({ kind: 'ok', text: 'Notetaker is joining.' })
                 } catch {
                   setMsg({ kind: 'err', text: 'Could not send the notetaker.' })
                 }
               }}
-              onRemove={async () => {
+              onRemoveOne={async (id) => {
                 setMsg(null)
                 try {
-                  await removeCalendarEvent(ev.id as number | string)
-                  setMsg({ kind: 'ok', text: "Removed — the bot won't join it." })
+                  await removeCalendarEvent(id)
+                  setMsg({ kind: 'ok', text: "Removed — the bot won't join that one." })
+                } catch {
+                  setMsg({ kind: 'err', text: 'Could not remove the meeting.' })
+                }
+              }}
+              onRemoveAll={async () => {
+                setMsg(null)
+                try {
+                  await removeCalendarEvents(g.occurrences.map((o) => o.id))
+                  setMsg({ kind: 'ok', text: 'Recurring meeting removed.' })
                 } catch {
                   setMsg({ kind: 'err', text: 'Could not remove the meeting.' })
                 }
@@ -277,74 +294,178 @@ function eventUrl(ev: CalendarEvent): string {
 function eventTitle(ev: CalendarEvent): string {
   return String(ev.title || ev.summary || 'Meeting')
 }
-function eventWhen(ev: CalendarEvent): string {
-  const raw = ev.start || ev.start_time
-  if (!raw) return ''
-  const d = new Date(raw as string)
-  return Number.isFinite(d.getTime())
-    ? d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
-    : String(raw)
-}
-
 function platformLabel(p: unknown): string {
   const s = String(p || '')
   if (s === 'google_meet') return 'Google Meet'
   if (s === 'browser_session') return 'Browser'
   return s.replace(/_/g, ' ')
 }
+function startMs(s?: string): number {
+  if (!s) return Number.POSITIVE_INFINITY
+  const t = new Date(s).getTime()
+  return Number.isFinite(t) ? t : Number.POSITIVE_INFINITY
+}
+function occLabel(start?: string): string {
+  if (!start) return '—'
+  const d = new Date(start)
+  return Number.isFinite(d.getTime())
+    ? d.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : start
+}
 
-/** One calendar meeting: name + when + platform/status, with send-bot and remove. */
-function CalendarRow({
-  event,
-  onSend,
-  onRemove,
-}: {
-  event: CalendarEvent
-  onSend: () => Promise<void>
-  onRemove: () => Promise<void>
-}) {
-  const [busy, setBusy] = useState<'send' | 'remove' | null>(null)
-  const url = eventUrl(event)
-  async function run(kind: 'send' | 'remove', fn: () => Promise<void>) {
-    setBusy(kind)
-    try {
-      await fn()
-    } finally {
-      setBusy(null)
+interface Occurrence {
+  id: number | string
+  start?: string
+  status?: string
+}
+interface MeetingGroup {
+  key: string
+  title: string
+  url: string
+  platform?: string
+  occurrences: Occurrence[]
+  next?: Occurrence
+}
+
+// Collapse repeated calendar instances (same meeting link = one recurring series)
+// into a single group each, ordered by their next occurrence.
+function groupEvents(events: CalendarEvent[]): MeetingGroup[] {
+  const map = new Map<string, MeetingGroup>()
+  for (const ev of events) {
+    const url = eventUrl(ev)
+    const key = url || eventTitle(ev)
+    let g = map.get(key)
+    if (!g) {
+      g = { key, title: eventTitle(ev), url, platform: ev.platform, occurrences: [] }
+      map.set(key, g)
+    }
+    if (ev.id != null) {
+      g.occurrences.push({ id: ev.id, start: ev.start_time || ev.start, status: ev.status })
     }
   }
+  const now = Date.now()
+  const groups = [...map.values()]
+  for (const g of groups) {
+    g.occurrences.sort((a, b) => startMs(a.start) - startMs(b.start))
+    g.next = g.occurrences.find((o) => startMs(o.start) >= now) || g.occurrences[0]
+  }
+  groups.sort((a, b) => startMs(a.next?.start) - startMs(b.next?.start))
+  return groups
+}
+
+/** One meeting series: name + next date + recurrence count, with send-bot and a
+ *  remove menu that drops either one occurrence or the whole recurrence. */
+function MeetingGroupRow({
+  group,
+  onSend,
+  onRemoveOne,
+  onRemoveAll,
+}: {
+  group: MeetingGroup
+  onSend: () => Promise<void>
+  onRemoveOne: (id: number | string) => Promise<void>
+  onRemoveAll: () => Promise<void>
+}) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const recurring = group.occurrences.length > 1
+  const next = group.next
+
+  async function run(fn: () => Promise<void>, close = false) {
+    setBusy(true)
+    try {
+      await fn()
+      if (close) setOpen(false)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
-    <li className="flex items-center gap-3 rounded-lg border border-outline-variant bg-surface px-3 py-2.5">
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-metadata font-semibold text-on-surface">{eventTitle(event)}</p>
-        <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-secondary">
-          {eventWhen(event) && <span>{eventWhen(event)}</span>}
-          {event.platform ? <span>· {platformLabel(event.platform)}</span> : null}
-          {event.status ? (
-            <span className="rounded-full bg-surface-container-high px-1.5 py-0.5 text-[11px] font-medium capitalize text-on-surface-variant">
-              {String(event.status)}
-            </span>
-          ) : null}
-        </p>
-      </div>
-      {url ? (
+    <li className="rounded-lg border border-outline-variant bg-surface">
+      <div className="flex items-center gap-3 px-3 py-2.5">
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-metadata font-semibold text-on-surface">{group.title}</p>
+          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-secondary">
+            {next?.start ? <span>{occLabel(next.start)}</span> : null}
+            {group.platform ? <span>· {platformLabel(group.platform)}</span> : null}
+            {recurring ? (
+              <span className="rounded-full bg-primary-fixed px-2 py-0.5 text-[11px] font-semibold text-on-primary-container">
+                Recurring · {group.occurrences.length}×
+              </span>
+            ) : next?.status ? (
+              <span className="rounded-full bg-surface-container-high px-1.5 py-0.5 text-[11px] font-medium capitalize text-on-surface-variant">
+                {String(next.status)}
+              </span>
+            ) : null}
+          </p>
+        </div>
+        {group.url ? (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => run(onSend)}
+            className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-primary hover:bg-surface-container-low disabled:opacity-50"
+          >
+            Send bot
+          </button>
+        ) : null}
         <button
           type="button"
-          disabled={busy !== null}
-          onClick={() => run('send', onSend)}
-          className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-primary hover:bg-surface-container-low disabled:opacity-50"
+          disabled={busy}
+          onClick={() => setOpen((v) => !v)}
+          className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-secondary hover:bg-surface-container-low hover:text-error disabled:opacity-50"
         >
-          {busy === 'send' ? '…' : 'Send bot'}
+          Remove
         </button>
+      </div>
+      {open ? (
+        <div className="border-t border-outline-variant px-3 py-2.5">
+          {recurring ? (
+            <>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => run(onRemoveAll, true)}
+                className="press w-full rounded-lg bg-error-container/70 px-3 py-2 text-metadata font-semibold text-error hover:bg-error-container disabled:opacity-50"
+              >
+                Remove whole recurring meeting ({group.occurrences.length})
+              </button>
+              <p className="mb-1 mt-2.5 text-[11px] font-medium uppercase tracking-wide text-outline">Or remove one date</p>
+              <ul className="flex flex-col gap-1">
+                {group.occurrences.map((o) => (
+                  <li
+                    key={String(o.id)}
+                    className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 hover:bg-surface-container-low"
+                  >
+                    <span className="text-[12px] text-secondary">
+                      {occLabel(o.start)}
+                      {o.status ? <span className="ml-1.5 capitalize text-outline">· {String(o.status)}</span> : null}
+                    </span>
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => run(() => onRemoveOne(o.id))}
+                      className="press shrink-0 rounded-md border border-outline-variant px-2 py-1 text-[12px] font-medium text-secondary hover:text-error disabled:opacity-50"
+                    >
+                      Remove
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => run(() => onRemoveOne(group.occurrences[0]?.id ?? ''), true)}
+              className="press w-full rounded-lg bg-error-container/70 px-3 py-2 text-metadata font-semibold text-error hover:bg-error-container disabled:opacity-50"
+            >
+              Remove this meeting
+            </button>
+          )}
+        </div>
       ) : null}
-      <button
-        type="button"
-        disabled={busy !== null}
-        onClick={() => run('remove', onRemove)}
-        className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-secondary hover:bg-surface-container-low hover:text-error disabled:opacity-50"
-      >
-        {busy === 'remove' ? '…' : 'Remove'}
-      </button>
     </li>
   )
 }

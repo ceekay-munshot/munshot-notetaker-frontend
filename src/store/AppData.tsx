@@ -42,6 +42,7 @@ interface AppData {
   syncCalendar: () => Promise<void>
   refreshCalendar: () => Promise<void>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
+  removeCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
   // bulk weekly processing
   weekProcessing: boolean
   weekProgress: { done: number; total: number; title: string }
@@ -210,6 +211,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [refreshCalendar],
   )
 
+  // Remove several occurrences at once (a whole recurring series).
+  const removeCalendarEvents = useCallback(
+    async (eventIds: (number | string)[]) => {
+      const drop = new Set(eventIds.map(String))
+      setCalendarEvents((prev) => prev.filter((e) => !drop.has(String(e.id)))) // optimistic
+      try {
+        await Promise.all(eventIds.map((id) => api.calendarRemove(id)))
+      } finally {
+        await refreshCalendar()
+      }
+    },
+    [refreshCalendar],
+  )
+
   const processWeek = useCallback(
     async (targets: Episode[]) => {
       if (weekRunning.current || !targets.length) return
@@ -265,6 +280,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       syncCalendar,
       refreshCalendar,
       removeCalendarEvent,
+      removeCalendarEvents,
       weekProcessing,
       weekProgress,
       processWeek,
@@ -295,6 +311,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       syncCalendar,
       refreshCalendar,
       removeCalendarEvent,
+      removeCalendarEvents,
       weekProcessing,
       weekProgress,
       processWeek,
