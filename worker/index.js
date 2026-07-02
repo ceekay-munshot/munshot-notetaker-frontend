@@ -308,6 +308,130 @@ function buildTranscriptText(rows) {
   return full.slice(0, head) + "\n…[transcript truncated]…\n" + full.slice(full.length - tail);
 }
 
+// ── Detailed summary (multi-call) ──────────────────────────────────────────────
+// A summary is built from several OpenAI calls for depth: one for the overview +
+// decisions/action items, then one per participant capturing — step by step —
+// what that person actually said and did (not a vague one-liner). The pieces are
+// stitched into Markdown (bold section titles + "- " bullets) the dashboard renders.
+
+async function openaiChat(apiKey, model, messages, maxTokens, temperature = 0.2) {
+  const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model, messages, temperature, max_tokens: maxTokens }),
+  });
+  const data = await upstream.json().catch(() => ({}));
+  if (!upstream.ok) {
+    throw new Error((data && data.error && data.error.message) || `HTTP ${upstream.status}`);
+  }
+  return String((data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "").trim();
+}
+
+// Distinct named speakers, most-talkative first (skips blank / "Unknown").
+function distinctSpeakers(rows, max = 8) {
+  const counts = new Map();
+  for (const r of rows) {
+    const s = String(r.speaker || "").trim();
+    if (!s || s.toLowerCase() === "unknown") continue;
+    counts.set(s, (counts.get(s) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, max).map(([s]) => s);
+}
+
+async function generateDetailedSummary(rows, apiKey, model) {
+  const transcript = buildTranscriptText(rows);
+  const speakers = distinctSpeakers(rows);
+
+  // 1) Overview prose (no header, so it reads clean as a teaser) + decisions.
+  const overviewPromise = openaiChat(apiKey, model, [
+    {
+      role: "system",
+      content:
+        "You are a precise meeting analyst. Use ONLY the transcript; never invent names, numbers, decisions, or owners. " +
+        "Use **bold** for section titles — never # headings.",
+    },
+    {
+      role: "user",
+      content:
+        "From the meeting transcript, write:\n\n" +
+        "First, a 3-5 sentence plain-prose overview of the meeting — its purpose, the main topics, and the outcome. " +
+        "Do NOT put a header before it.\n\n" +
+        "Then a blank line, then this section:\n\n" +
+        "**Decisions & Action Items**\n" +
+        'A bullet list ("- " per line), one concrete decision or action item per bullet, with the owner and any deadline ' +
+        'in parentheses when the transcript states them, e.g. "- Add multiselect filter options (Owner: Tarandeep)." ' +
+        'If there were none, write "- None recorded."\n\n' +
+        "Output only that.\n\nTRANSCRIPT:\n" + transcript,
+    },
+  ], 900);
+
+  // 2) One detailed, step-by-step call per participant (run in parallel).
+  const perPersonPrompt = (name) => [
+    {
+      role: "system",
+      content:
+        "You are a meticulous meeting note-taker. Capture EXACTLY what one specific person said and did, in detail, using " +
+        "only the transcript. Never generalize (no 'discussed the UI' / 'gave a walkthrough') — write the actual content.",
+    },
+    {
+      role: "user",
+      content:
+        `Write detailed, step-by-step notes of everything ${name} said and did in this meeting, in chronological order.\n\n` +
+        "Requirements:\n" +
+        `- Only ${name}'s own contributions: what they said, asked, proposed, explained, demonstrated, agreed to, or decided. ` +
+        `Use other speakers only as context to make ${name}'s points clear.\n` +
+        "- Be specific and concrete: capture each distinct point separately, keeping the real content — names, numbers, " +
+        "tool/feature names, examples, and the reasoning given.\n" +
+        `- If ${name} gave a walkthrough or multi-step explanation, break it into the individual steps they actually described ` +
+        "(step by step), not a one-line summary.\n" +
+        `- Record questions ${name} raised and answers they gave.\n` +
+        '- Do NOT write vague lines like "provided a detailed walkthrough" or "discussed X" — write what was actually covered.\n' +
+        `- If ${name} barely spoke, still capture whatever they did say.\n\n` +
+        'Output: Markdown "- " bullet points only (no heading, no preamble).\n\n' +
+        "TRANSCRIPT:\n" + transcript,
+    },
+  ];
+
+  let peoplePromise;
+  if (speakers.length) {
+    peoplePromise = Promise.all(
+      speakers.map((name) =>
+        openaiChat(apiKey, model, perPersonPrompt(name), 1600)
+          .then((notes) => ({ name, notes }))
+          .catch((e) => ({ name, notes: `- (Notes unavailable: ${String((e && e.message) || e)})` }))
+      )
+    );
+  } else {
+    peoplePromise = openaiChat(
+      apiKey,
+      model,
+      [
+        { role: "system", content: "Meticulous meeting note-taker. Detailed step-by-step notes from the transcript only; never vague." },
+        {
+          role: "user",
+          content:
+            "Write detailed, chronological, step-by-step notes of everything discussed — the actual content (specific points, " +
+            'numbers, examples, the steps walked through), as Markdown "- " bullets.\n\nTRANSCRIPT:\n' + transcript,
+        },
+      ],
+      2000
+    )
+      .then((notes) => [{ name: "", notes }])
+      .catch(() => [{ name: "", notes: "- (Notes unavailable)" }]);
+  }
+
+  const [overviewMd, people] = await Promise.all([overviewPromise, peoplePromise]);
+
+  let md = String(overviewMd || "").trim();
+  if (speakers.length) {
+    md += "\n\n**Discussion by Person**";
+    for (const p of people) md += `\n\n**${p.name}**\n${String(p.notes || "").trim()}`;
+  } else {
+    md += `\n\n**Detailed Discussion**\n${String((people[0] && people[0].notes) || "").trim()}`;
+  }
+  return md.trim();
+}
+
 // Chat over a single meeting's transcript with OpenAI. The transcript is loaded
 // server-side and scoped to the session (all meetings for admin), and the OpenAI
 // key is a Worker secret that never reaches the browser. Same ACL as transcripts.
@@ -345,6 +469,17 @@ async function handleAiChat(request, env) {
   const rows = (res && res.results) || [];
   if (!rows.length) return json({ error: "No transcript found for that meeting yet" }, 404);
 
+  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  // A summary request runs the richer multi-call pipeline (overview + decisions,
+  // then detailed per-person notes) for far more depth than a single call.
+  if (summarize) {
+    try {
+      return json({ ok: true, reply: await generateDetailedSummary(rows, apiKey, model) });
+    } catch (err) {
+      return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
+    }
+  }
+
   const messages = [
     {
       role: "system",
@@ -360,8 +495,8 @@ async function handleAiChat(request, env) {
     const content = String((m && m.content) || "").slice(0, 4000);
     if (content) messages.push({ role, content });
   }
-  // First open (or an explicit summarize): ask for a per-person breakdown.
-  if (summarize || messages.length === 1) {
+  // Chat opened with no user message yet: seed with a quick per-person breakdown.
+  if (messages.length === 1) {
     messages.push({
       role: "user",
       content:
@@ -378,7 +513,6 @@ async function handleAiChat(request, env) {
     });
   }
 
-  const model = env.OPENAI_MODEL || "gpt-4o-mini";
   let upstream;
   try {
     upstream = await fetch("https://api.openai.com/v1/chat/completions", {

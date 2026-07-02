@@ -286,8 +286,8 @@ function SummaryTab({ episode }: { episode: Episode }) {
               key={i}
               className={
                 i === 0
-                  ? 'text-body-lg leading-relaxed text-on-surface'
-                  : 'text-body-md leading-relaxed text-on-surface-variant'
+                  ? 'whitespace-pre-line text-body-lg leading-relaxed text-on-surface'
+                  : 'whitespace-pre-line text-body-md leading-relaxed text-on-surface-variant'
               }
             >
               <RichText text={p} terms={terms} />
