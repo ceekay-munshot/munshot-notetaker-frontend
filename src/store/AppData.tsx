@@ -178,8 +178,16 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
   const createSchedule = useCallback(
     async (input: api.NewSchedule) => {
-      await api.createSchedule(input)
-      await refreshSchedules()
+      const created = await api.createSchedule(input)
+      // Show it immediately. Workers KV `list` is eventually consistent, so
+      // re-listing right after the write often misses the new key — which made
+      // freshly-created schedules "vanish" from Upcoming. Add optimistically
+      // instead of relying on that immediate re-list.
+      if (created && created.id) {
+        setSchedules((prev) => [...prev.filter((s) => s.id !== created.id), created])
+      } else {
+        await refreshSchedules()
+      }
     },
     [refreshSchedules],
   )
