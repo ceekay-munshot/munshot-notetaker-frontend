@@ -24,6 +24,60 @@ import { anchorSegment } from '../lib/topics'
 
 type Tab = 'summary' | 'highlights' | 'qa' | 'transcript'
 
+// Renders the AI summary body: an optional bold section header per block, any
+// prose paragraphs, and "- " lines as a real bullet list. The model returns
+// lightly-marked text (bold **titles**, "- " bullets); we render it structurally
+// rather than dumping raw dashes.
+function SummaryBody({ blocks, terms }: { blocks: string[]; terms: string[] }) {
+  const isBullet = (l: string) => /^([-*•]|\d+[.)])\s+/.test(l)
+  const stripBullet = (l: string) => l.replace(/^([-*•]|\d+[.)])\s+/, '')
+  return (
+    <div className="space-y-5">
+      {blocks.map((block, i) => {
+        const lines = block
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+        const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
+        const header = headMatch ? headMatch[1] : null
+        const rest = header ? lines.slice(1) : lines
+        const bullets = rest.filter(isBullet).map(stripBullet)
+        const paras = rest.filter((l) => !isBullet(l))
+        const lead = i === 0
+        return (
+          <div key={i}>
+            {header && <h3 className="mb-2 text-[15px] font-semibold text-on-surface">{header}</h3>}
+            {paras.map((p, j) => (
+              <p
+                key={`p${j}`}
+                className={
+                  lead
+                    ? 'text-body-lg leading-relaxed text-on-surface'
+                    : 'text-body-md leading-relaxed text-on-surface-variant'
+                }
+              >
+                <RichText text={p} terms={terms} />
+              </p>
+            ))}
+            {bullets.length > 0 && (
+              <ul className="mt-1.5 space-y-1.5">
+                {bullets.map((b, j) => (
+                  <li key={`b${j}`} className="flex gap-2.5 text-body-md leading-relaxed text-on-surface-variant">
+                    <span className="mt-[9px] h-1.5 w-1.5 shrink-0 rounded-full bg-primary/50" />
+                    <span className="min-w-0">
+                      <RichText text={b} terms={terms} />
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // Old deep links (the two tabs this one replaced) still land somewhere sensible.
 const LEGACY_TABS: Record<string, Tab> = { takeaways: 'highlights', moments: 'highlights' }
 
@@ -280,20 +334,7 @@ function SummaryTab({ episode }: { episode: Episode }) {
         </div>
         {/* Overview — lead paragraph reads larger + darker for editorial
             hierarchy; the rest settle into calm body text. */}
-        <div className="space-y-4">
-          {s.synthesis.map((p, i) => (
-            <p
-              key={i}
-              className={
-                i === 0
-                  ? 'whitespace-pre-line text-body-lg leading-relaxed text-on-surface'
-                  : 'whitespace-pre-line text-body-md leading-relaxed text-on-surface-variant'
-              }
-            >
-              <RichText text={p} terms={terms} />
-            </p>
-          ))}
-        </div>
+        <SummaryBody blocks={s.synthesis} terms={terms} />
 
         {/* Investable insight — the analyst read (what changed / why it matters /
             who benefits / who's at risk / diligence) when the summary has it. It

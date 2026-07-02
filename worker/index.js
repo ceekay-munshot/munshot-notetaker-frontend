@@ -370,24 +370,25 @@ async function generateDetailedSummary(rows, apiKey, model) {
     {
       role: "system",
       content:
-        "You are a meticulous meeting note-taker. Capture EXACTLY what one specific person said and did, in detail, using " +
-        "only the transcript. Never generalize (no 'discussed the UI' / 'gave a walkthrough') — write the actual content.",
+        "You are a sharp meeting summarizer. Summarize what one specific person contributed, in your own words, using only " +
+        "the transcript. Never quote them verbatim or transcribe line by line — distill their points into meaning.",
     },
     {
       role: "user",
       content:
-        `Write detailed, step-by-step notes of everything ${name} said and did in this meeting, in chronological order.\n\n` +
-        "Requirements:\n" +
-        `- Only ${name}'s own contributions: what they said, asked, proposed, explained, demonstrated, agreed to, or decided. ` +
-        `Use other speakers only as context to make ${name}'s points clear.\n` +
-        "- Be specific and concrete: capture each distinct point separately, keeping the real content — names, numbers, " +
-        "tool/feature names, examples, and the reasoning given.\n" +
-        `- If ${name} gave a walkthrough or multi-step explanation, break it into the individual steps they actually described ` +
-        "(step by step), not a one-line summary.\n" +
-        `- Record questions ${name} raised and answers they gave.\n` +
-        '- Do NOT write vague lines like "provided a detailed walkthrough" or "discussed X" — write what was actually covered.\n' +
-        `- If ${name} barely spoke, still capture whatever they did say.\n\n` +
-        'Output: Markdown "- " bullet points only (no heading, no preamble).\n\n' +
+        `Summarize what ${name} contributed to this meeting — what they explained, proposed, asked, demonstrated, decided, or ` +
+        "agreed to — as substantive bullet points, in the order things happened.\n\n" +
+        "Rules:\n" +
+        "- SUMMARIZE in your own words, third person. Do NOT quote verbatim and do NOT transcribe sentence by sentence.\n" +
+        '- Skip filler and pleasantries ("okay", "sure", "can you see my screen") and MERGE closely-related statements into a ' +
+        "single point.\n" +
+        `- Each bullet is a meaningful point or step — what ${name} actually conveyed and why — keeping the real substance ` +
+        "(specific features, tools, numbers, examples, the reasoning). If they walked through a process, capture the key steps " +
+        "as separate bullets.\n" +
+        "- Include questions they raised and answers or decisions they gave.\n" +
+        `- Do NOT begin bullets with ${name}'s name — the reader already knows this section is about them.\n` +
+        `- If ${name} barely participated, write 1-2 bullets on what little they added.\n\n` +
+        'Output: 3-10 Markdown "- " bullet points only. No heading, no preamble, no quotes.\n\n' +
         "TRANSCRIPT:\n" + transcript,
     },
   ];
@@ -396,7 +397,7 @@ async function generateDetailedSummary(rows, apiKey, model) {
   if (speakers.length) {
     peoplePromise = Promise.all(
       speakers.map((name) =>
-        openaiChat(apiKey, model, perPersonPrompt(name), 1600)
+        openaiChat(apiKey, model, perPersonPrompt(name), 1000)
           .then((notes) => ({ name, notes }))
           .catch((e) => ({ name, notes: `- (Notes unavailable: ${String((e && e.message) || e)})` }))
       )
@@ -406,15 +407,16 @@ async function generateDetailedSummary(rows, apiKey, model) {
       apiKey,
       model,
       [
-        { role: "system", content: "Meticulous meeting note-taker. Detailed step-by-step notes from the transcript only; never vague." },
+        { role: "system", content: "Sharp meeting summarizer. Summarize what happened from the transcript in your own words; never quote verbatim or transcribe." },
         {
           role: "user",
           content:
-            "Write detailed, chronological, step-by-step notes of everything discussed — the actual content (specific points, " +
-            'numbers, examples, the steps walked through), as Markdown "- " bullets.\n\nTRANSCRIPT:\n' + transcript,
+            "Summarize what happened in this meeting as substantive, chronological bullet points — the key topics, the points " +
+            "made, and the decisions — in your own words (no verbatim quotes). Merge related statements and skip filler. " +
+            'Markdown "- " bullets only.\n\nTRANSCRIPT:\n' + transcript,
         },
       ],
-      2000
+      1200
     )
       .then((notes) => [{ name: "", notes }])
       .catch(() => [{ name: "", notes: "- (Notes unavailable)" }]);
