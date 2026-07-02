@@ -39,6 +39,8 @@ export default {
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
       if (method === "POST" && pathname === "/api/calendar/sync") return handleCalendarSync(request, env);
       if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
+      if (method === "GET" && pathname === "/api/config") return handleGetConfig(request, env);
+      if (method === "POST" && pathname === "/api/config") return handleSetConfig(request, env);
       // Unknown API path → JSON 404 (never the SPA shell, so fetch() callers
       // always get JSON back).
       if (pathname === "/api" || pathname.startsWith("/api/")) {
@@ -47,6 +49,7 @@ export default {
       // Everything else is the React SPA: serve the static asset if one matches,
       // otherwise fall back to index.html so client-side routes (e.g. /meetings/42)
       // load. The app itself enforces auth by calling /api/me on boot.
+      if (method === "GET" && pathname === "/__apihead") return handleApiHeadPage(request, env);
       return serveSpa(request, env);
     } catch (err) {
       return json({ error: "Server error", detail: String((err && err.message) || err) }, 500);
@@ -176,25 +179,33 @@ async function handleLogout(request, env) {
   return json({ ok: true }, 200, { "Set-Cookie": clearCookie() });
 }
 
-function joinEndpoint(env) {
-  return env.JOIN_ENDPOINT || DEFAULT_JOIN_ENDPOINT;
-}
+// KV key holding a runtime override of the backend base URL (the "API head").
+// When an admin sets it via /api/config it wins over the wrangler.toml vars, so
+// the head can be repointed at a new tunnel/host without a redeploy.
+const API_BASE_KEY = "config:apiBase";
 
-function leaveEndpoint(env) {
-  if (env.LEAVE_ENDPOINT) return env.LEAVE_ENDPOINT;
-  if (env.JOIN_ENDPOINT) return env.JOIN_ENDPOINT.replace(/\/join\/?$/, "/leave");
-  return DEFAULT_LEAVE_ENDPOINT;
-}
-
-// Origin of the bot API (derived from the join endpoint) — the /calendar/*
-// routes live on the same host alongside /public/join, so a tunnel swap of
-// JOIN_ENDPOINT moves them too.
-function apiBase(env) {
+// The configured fallback base — origin of JOIN_ENDPOINT (or the built-in
+// default) — used when no runtime override is set.
+function fallbackApiBase(env) {
+  const full = env.JOIN_ENDPOINT || DEFAULT_JOIN_ENDPOINT;
   try {
-    return new URL(joinEndpoint(env)).origin;
+    return new URL(full).origin;
   } catch {
     return new URL(DEFAULT_JOIN_ENDPOINT).origin;
   }
+}
+
+// The effective base URL every bot/calendar call is sent to: the KV override if
+// an admin set one, else the configured fallback. All endpoints (/public/join,
+// /public/leave, /calendar/*) are built from this single head.
+async function resolveApiBase(env) {
+  try {
+    const override = await env.KV.get(API_BASE_KEY);
+    if (override) return override.replace(/\/+$/, "");
+  } catch {
+    /* KV read hiccup → fall back to the configured base */
+  }
+  return fallbackApiBase(env);
 }
 
 // Asks the notetaker bot to join or leave a meeting. The email is always taken
@@ -230,7 +241,8 @@ async function handleBot(request, env, action) {
 // Returns { ok, status, data }; throws only on a network failure. Shared by the
 // interactive /api/join|leave routes and the cron-driven schedule runner.
 async function dispatchBot(env, action, email, meetingUrl) {
-  const endpoint = action === "leave" ? leaveEndpoint(env) : joinEndpoint(env);
+  const base = await resolveApiBase(env);
+  const endpoint = base + (action === "leave" ? "/public/leave" : "/public/join");
   const upstream = await fetch(endpoint, {
     method: "POST",
     headers: {
@@ -532,7 +544,8 @@ async function handleCalendarSync(request, env) {
   if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   try {
-    const upstream = await fetch(apiBase(env) + "/calendar/sync", {
+    const base = await resolveApiBase(env);
+    const upstream = await fetch(base + "/calendar/sync", {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({ email: session.identity }),
@@ -551,8 +564,9 @@ async function handleCalendarMeetings(request, env) {
   if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   try {
+    const base = await resolveApiBase(env);
     const upstream = await fetch(
-      apiBase(env) + "/calendar/meetings?email=" + encodeURIComponent(session.identity),
+      base + "/calendar/meetings?email=" + encodeURIComponent(session.identity),
       { headers: { "X-API-Key": env.API_KEY } }
     );
     const calendar = await readUpstreamJson(upstream);
@@ -560,6 +574,131 @@ async function handleCalendarMeetings(request, env) {
   } catch (err) {
     return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
   }
+}
+
+/* ------------------------------ api head (admin) ------------------------------ */
+
+// Read the current head: the effective base, whether it's an override, and the
+// configured fallback it would revert to.
+async function handleGetConfig(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  const override = await env.KV.get(API_BASE_KEY);
+  return json({
+    ok: true,
+    apiBase: override || fallbackApiBase(env),
+    override: override || null,
+    fallback: fallbackApiBase(env),
+  });
+}
+
+// Set (or clear) the head. An empty value clears the override and reverts to the
+// configured fallback. A value is normalized to its origin (any path stripped).
+async function handleSetConfig(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  const body = await request.json().catch(() => ({}));
+  const raw = String(body.apiBase || "").trim();
+  if (!raw) {
+    await env.KV.delete(API_BASE_KEY);
+    return json({ ok: true, apiBase: fallbackApiBase(env), override: null, fallback: fallbackApiBase(env) });
+  }
+  let origin;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("bad protocol");
+    origin = u.origin;
+  } catch {
+    return json({ error: "Enter a valid http(s) URL, e.g. https://name.trycloudflare.com" }, 400);
+  }
+  await env.KV.put(API_BASE_KEY, origin);
+  return json({ ok: true, apiBase: origin, override: origin, fallback: fallbackApiBase(env) });
+}
+
+// Hidden admin page to view/change the API head. Returns 404 for non-admins so
+// it stays out of sight; admins reach it at /__apihead after signing in.
+async function handleApiHeadPage(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return new Response("Not found", { status: 404 });
+  return html(apiHeadPage());
+}
+
+function apiHeadPage() {
+  return `<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>API head — admin</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;padding:24px}
+  .card{width:100%;max-width:560px;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:28px;box-shadow:0 12px 40px rgba(0,0,0,.35)}
+  h1{margin:0 0 4px;font-size:20px}
+  .sub{margin:0 0 20px;color:#94a3b8;font-size:13px}
+  label{display:block;font-size:13px;margin:14px 0 6px;color:#cbd5e1}
+  input{width:100%;box-sizing:border-box;padding:11px 12px;border-radius:9px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-size:14px}
+  input:focus{outline:none;border-color:#38bdf8}
+  .cur{font-size:13px;background:#0f172a;border:1px solid #334155;border-radius:9px;padding:12px;word-break:break-all}
+  .cur b{color:#38bdf8}
+  .tag{display:inline-block;margin-left:8px;font-size:11px;padding:1px 7px;border-radius:999px;font-weight:700;vertical-align:middle}
+  .tag.ov{background:#38bdf8;color:#04263a}
+  .tag.df{background:#334155;color:#cbd5e1}
+  .rowb{display:flex;gap:10px;margin-top:18px}
+  button{flex:1;padding:12px;border:0;border-radius:9px;font-weight:600;font-size:14px;cursor:pointer}
+  .save{background:#38bdf8;color:#04263a}.save:hover{background:#7dd3fc}
+  .reset{background:#475569;color:#e2e8f0}.reset:hover{background:#64748b}
+  button:disabled{opacity:.6;cursor:not-allowed}
+  .msg{margin-top:16px;padding:11px 12px;border-radius:9px;font-size:13px;display:none;word-break:break-word}
+  .msg.err{display:block;background:#450a0a;border:1px solid #7f1d1d;color:#fecaca}
+  .msg.ok{display:block;background:#052e16;border:1px solid #166534;color:#bbf7d0}
+  .hint{font-size:12px;color:#64748b;margin-top:8px}
+</style></head>
+<body>
+  <div class="card">
+    <h1>API head</h1>
+    <p class="sub">The backend base URL every notetaker / calendar call is sent to. Admin only. Changes take effect immediately — no redeploy.</p>
+    <div class="cur" id="cur">Loading…</div>
+    <label for="u">New base URL</label>
+    <input id="u" type="url" placeholder="https://name.trycloudflare.com" autocomplete="off"/>
+    <p class="hint">Just the host, e.g. http://65.1.101.15.nip.io:8080 or https://name.trycloudflare.com — any path is ignored.</p>
+    <div class="rowb">
+      <button class="save" id="save">Save</button>
+      <button class="reset" id="reset">Reset to default</button>
+    </div>
+    <div class="msg" id="msg"></div>
+  </div>
+<script>
+  var cur=document.getElementById('cur'),input=document.getElementById('u'),save=document.getElementById('save'),reset=document.getElementById('reset'),msg=document.getElementById('msg');
+  function showMsg(t,k){msg.textContent=t;msg.className='msg'+(k?' '+k:'');}
+  function renderCur(d){
+    cur.innerHTML='';
+    cur.appendChild(document.createTextNode('Currently calling: '));
+    var b=document.createElement('b');b.textContent=d.apiBase||'(unknown)';cur.appendChild(b);
+    var tag=document.createElement('span');tag.className='tag '+(d.override?'ov':'df');tag.textContent=d.override?'override':'default';cur.appendChild(tag);
+    if(d.override&&d.fallback){var f=document.createElement('div');f.className='hint';f.textContent='Default if reset: '+d.fallback;cur.appendChild(f);}
+  }
+  async function load(){
+    try{
+      var res=await fetch('/api/config');
+      if(res.status===401||res.status===403){cur.textContent='Admin only — sign in as ADMIN first, then reload this page.';return;}
+      var d=await res.json().catch(function(){return{};});
+      if(d.ok){renderCur(d);input.value=d.override||'';}else{cur.textContent=d.error||'Could not load.';}
+    }catch(e){cur.textContent='Network error.';}
+  }
+  async function post(val){
+    save.disabled=true;reset.disabled=true;showMsg('Saving…','');
+    try{
+      var res=await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({apiBase:val})});
+      var d=await res.json().catch(function(){return{};});
+      if(res.ok&&d.ok){renderCur(d);input.value=d.override||'';showMsg('Saved. Now calling '+d.apiBase,'ok');}
+      else{showMsg(d.error||'Failed.','err');}
+    }catch(e){showMsg('Network error.','err');}
+    finally{save.disabled=false;reset.disabled=false;}
+  }
+  save.onclick=function(){var v=input.value.trim();if(!v){showMsg('Enter a URL, or use Reset to default.','err');return;}post(v);};
+  reset.onclick=function(){post('');};
+  load();
+</script>
+</body></html>`;
 }
 
 /* ------------------------------ schedules ------------------------------ */
