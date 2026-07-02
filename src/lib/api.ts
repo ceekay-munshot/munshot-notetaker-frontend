@@ -226,14 +226,20 @@ export function calendarSync(): Promise<{ ok: boolean; status: number; result: u
   return request('/api/calendar/sync', { method: 'POST', body: '{}' })
 }
 
-/** Returns the raw calendar payload from upstream; shape is normalized by the caller. */
-export async function calendarMeetings(): Promise<{ ok: boolean; status: number; calendar: any }> {
-  return request('/api/calendar/meetings')
+/** Returns the raw calendar payload from upstream; shape is normalized by the caller.
+ *  Pass includeCancelled to also get removed (status "cancelled") meetings. */
+export async function calendarMeetings(includeCancelled = false): Promise<{ ok: boolean; status: number; calendar: any }> {
+  return request('/api/calendar/meetings' + (includeCancelled ? '?include_cancelled=true' : ''))
 }
 
 /** Remove a scheduled/upcoming calendar meeting so the bot won't join it. */
 export function calendarRemove(eventId: number | string): Promise<{ ok: boolean; status: number; result: unknown }> {
   return request('/api/calendar/meetings/remove', { method: 'POST', body: JSON.stringify({ event_id: eventId }) })
+}
+
+/** Restore (unremove) a cancelled calendar meeting so the bot will join it again. */
+export function calendarRestore(eventId: number | string): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/restore', { method: 'POST', body: JSON.stringify({ event_id: eventId }) })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

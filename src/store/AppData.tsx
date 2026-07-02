@@ -43,6 +43,9 @@ interface AppData {
   refreshCalendar: () => Promise<void>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
   removeCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
+  cancelledEvents: api.CalendarEvent[]
+  restoreCalendarEvent: (eventId: number | string) => Promise<void>
+  restoreCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
   // bulk weekly processing
   weekProcessing: boolean
   weekProgress: { done: number; total: number; title: string }
@@ -76,6 +79,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [needsApiKey, setNeedsApiKey] = useState(false)
   const [schedules, setSchedules] = useState<api.Schedule[]>([])
   const [calendarEvents, setCalendarEvents] = useState<api.CalendarEvent[]>([])
+  const [cancelledEvents, setCancelledEvents] = useState<api.CalendarEvent[]>([])
   const [calendarLoading, setCalendarLoading] = useState(false)
   const summarizing = useRef<Set<string>>(new Set())
 
@@ -119,8 +123,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
 
   const refreshCalendar = useCallback(async () => {
     try {
-      const { calendar } = await api.calendarMeetings()
-      setCalendarEvents(normalizeCalendar(calendar))
+      // Pull cancelled ones too, then split: active drive "Upcoming", cancelled
+      // drive the "Removed" section (restore).
+      const { calendar } = await api.calendarMeetings(true)
+      const all = normalizeCalendar(calendar)
+      setCalendarEvents(all.filter((e) => String(e.status) !== 'cancelled'))
+      setCancelledEvents(all.filter((e) => String(e.status) === 'cancelled'))
     } catch {
       /* keep prior events */
     }
@@ -225,6 +233,32 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [refreshCalendar],
   )
 
+  const restoreCalendarEvent = useCallback(
+    async (eventId: number | string) => {
+      setCancelledEvents((prev) => prev.filter((e) => String(e.id) !== String(eventId))) // optimistic
+      try {
+        await api.calendarRestore(eventId)
+      } finally {
+        await refreshCalendar()
+      }
+    },
+    [refreshCalendar],
+  )
+
+  // Restore several occurrences at once (undo a whole series).
+  const restoreCalendarEvents = useCallback(
+    async (eventIds: (number | string)[]) => {
+      const back = new Set(eventIds.map(String))
+      setCancelledEvents((prev) => prev.filter((e) => !back.has(String(e.id)))) // optimistic
+      try {
+        await Promise.all(eventIds.map((id) => api.calendarRestore(id)))
+      } finally {
+        await refreshCalendar()
+      }
+    },
+    [refreshCalendar],
+  )
+
   const processWeek = useCallback(
     async (targets: Episode[]) => {
       if (weekRunning.current || !targets.length) return
@@ -281,6 +315,9 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       refreshCalendar,
       removeCalendarEvent,
       removeCalendarEvents,
+      cancelledEvents,
+      restoreCalendarEvent,
+      restoreCalendarEvents,
       weekProcessing,
       weekProgress,
       processWeek,
@@ -312,6 +349,9 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       refreshCalendar,
       removeCalendarEvent,
       removeCalendarEvents,
+      cancelledEvents,
+      restoreCalendarEvent,
+      restoreCalendarEvents,
       weekProcessing,
       weekProgress,
       processWeek,

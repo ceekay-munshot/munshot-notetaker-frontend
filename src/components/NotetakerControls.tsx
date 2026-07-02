@@ -173,10 +173,14 @@ export function SchedulesCard() {
     sendBot,
     removeCalendarEvent,
     removeCalendarEvents,
+    cancelledEvents,
+    restoreCalendarEvent,
+    restoreCalendarEvents,
   } = useAppData()
   const upcoming = useMemo(() => [...schedules].sort((a, b) => a.nextRun - b.nextRun), [schedules])
   const groups = useMemo(() => groupEvents(calendarEvents), [calendarEvents])
-  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
+  const removedGroups = useMemo(() => groupEvents(cancelledEvents), [cancelledEvents])
+  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string; undo?: () => Promise<void> } | null>(null)
   const empty = upcoming.length === 0 && groups.length === 0
 
   return (
@@ -230,16 +234,39 @@ export function SchedulesCard() {
                 setMsg(null)
                 try {
                   await removeCalendarEvent(id)
-                  setMsg({ kind: 'ok', text: "Removed — the bot won't join that one." })
+                  setMsg({
+                    kind: 'ok',
+                    text: "Removed — the bot won't join that one.",
+                    undo: async () => {
+                      try {
+                        await restoreCalendarEvent(id)
+                        setMsg({ kind: 'ok', text: 'Restored.' })
+                      } catch {
+                        setMsg({ kind: 'err', text: 'Could not restore.' })
+                      }
+                    },
+                  })
                 } catch {
                   setMsg({ kind: 'err', text: 'Could not remove the meeting.' })
                 }
               }}
               onRemoveAll={async () => {
+                const ids = g.occurrences.map((o) => o.id)
                 setMsg(null)
                 try {
-                  await removeCalendarEvents(g.occurrences.map((o) => o.id))
-                  setMsg({ kind: 'ok', text: 'Recurring meeting removed.' })
+                  await removeCalendarEvents(ids)
+                  setMsg({
+                    kind: 'ok',
+                    text: 'Recurring meeting removed.',
+                    undo: async () => {
+                      try {
+                        await restoreCalendarEvents(ids)
+                        setMsg({ kind: 'ok', text: 'Restored.' })
+                      } catch {
+                        setMsg({ kind: 'err', text: 'Could not restore.' })
+                      }
+                    },
+                  })
                 } catch {
                   setMsg({ kind: 'err', text: 'Could not remove the meeting.' })
                 }
@@ -251,7 +278,60 @@ export function SchedulesCard() {
           ))}
         </ul>
       )}
-      {msg && <Note kind={msg.kind}>{msg.text}</Note>}
+      {removedGroups.length > 0 ? (
+        <div className="mt-3">
+          <p className="mb-1.5 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wide text-outline">
+            <Icon name="restore_from_trash" size={13} /> Removed
+          </p>
+          <ul className="flex flex-col gap-2">
+            {removedGroups.map((g) => (
+              <RemovedGroupRow
+                key={`x-${g.key}`}
+                group={g}
+                onRestoreOne={async (id) => {
+                  setMsg(null)
+                  try {
+                    await restoreCalendarEvent(id)
+                    setMsg({ kind: 'ok', text: 'Restored — the bot will join it again.' })
+                  } catch {
+                    setMsg({ kind: 'err', text: 'Could not restore the meeting.' })
+                  }
+                }}
+                onRestoreAll={async () => {
+                  setMsg(null)
+                  try {
+                    await restoreCalendarEvents(g.occurrences.map((o) => o.id))
+                    setMsg({ kind: 'ok', text: 'Recurring meeting restored.' })
+                  } catch {
+                    setMsg({ kind: 'err', text: 'Could not restore the meeting.' })
+                  }
+                }}
+              />
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {msg ? (
+        <p
+          className={`mt-2 flex items-center gap-2 rounded-lg px-3 py-2 text-metadata ${
+            msg.kind === 'ok' ? 'bg-success-container/70 text-on-success-container' : 'bg-error-container/70 text-error'
+          }`}
+        >
+          <Icon name={msg.kind === 'ok' ? 'check_circle' : 'error'} size={16} className="shrink-0" />
+          <span className="min-w-0 flex-1 break-words">{msg.text}</span>
+          {msg.undo ? (
+            <button
+              type="button"
+              onClick={() => {
+                void msg?.undo?.()
+              }}
+              className="press shrink-0 rounded-md border border-current px-2 py-0.5 text-[12px] font-semibold"
+            >
+              Undo
+            </button>
+          ) : null}
+        </p>
+      ) : null}
     </Card>
   )
 }
@@ -464,6 +544,84 @@ function MeetingGroupRow({
               Remove this meeting
             </button>
           )}
+        </div>
+      ) : null}
+    </li>
+  )
+}
+
+/** A removed (cancelled) meeting series, with restore for one date or the whole series. */
+function RemovedGroupRow({
+  group,
+  onRestoreOne,
+  onRestoreAll,
+}: {
+  group: MeetingGroup
+  onRestoreOne: (id: number | string) => Promise<void>
+  onRestoreAll: () => Promise<void>
+}) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const recurring = group.occurrences.length > 1
+
+  async function run(fn: () => Promise<void>, close = false) {
+    setBusy(true)
+    try {
+      await fn()
+      if (close) setOpen(false)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <li className="rounded-lg border border-outline-variant bg-surface-container-low">
+      <div className="flex items-center gap-3 px-3 py-2.5">
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-metadata font-medium text-secondary">{group.title}</p>
+          <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[12px] text-outline">
+            {group.next?.start ? <span>{occLabel(group.next.start)}</span> : null}
+            <span>· {recurring ? `${group.occurrences.length}× cancelled` : 'cancelled'}</span>
+          </p>
+        </div>
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => (recurring ? setOpen((v) => !v) : run(() => onRestoreOne(group.occurrences[0]?.id ?? '')))}
+          className="press shrink-0 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-medium text-primary hover:bg-surface disabled:opacity-50"
+        >
+          Restore
+        </button>
+      </div>
+      {open && recurring ? (
+        <div className="border-t border-outline-variant px-3 py-2.5">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => run(onRestoreAll, true)}
+            className="press w-full rounded-lg bg-primary px-3 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container disabled:opacity-50"
+          >
+            Restore whole recurring meeting ({group.occurrences.length})
+          </button>
+          <p className="mb-1 mt-2.5 text-[11px] font-medium uppercase tracking-wide text-outline">Or restore one date</p>
+          <ul className="flex flex-col gap-1">
+            {group.occurrences.map((o) => (
+              <li
+                key={String(o.id)}
+                className="flex items-center justify-between gap-2 rounded-md px-2 py-1.5 hover:bg-surface"
+              >
+                <span className="text-[12px] text-secondary">{occLabel(o.start)}</span>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => run(() => onRestoreOne(o.id))}
+                  className="press shrink-0 rounded-md border border-outline-variant px-2 py-1 text-[12px] font-medium text-primary disabled:opacity-50"
+                >
+                  Restore
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       ) : null}
     </li>

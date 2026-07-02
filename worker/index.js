@@ -40,6 +40,7 @@ export default {
       if (method === "POST" && pathname === "/api/calendar/sync") return handleCalendarSync(request, env);
       if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/remove") return handleCalendarRemove(request, env);
+      if (method === "POST" && pathname === "/api/calendar/meetings/restore") return handleCalendarRestore(request, env);
       if (method === "GET" && pathname === "/api/config") return handleGetConfig(request, env);
       if (method === "POST" && pathname === "/api/config") return handleSetConfig(request, env);
       // Unknown API path → JSON 404 (never the SPA shell, so fetch() callers
@@ -566,10 +567,11 @@ async function handleCalendarMeetings(request, env) {
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   try {
     const base = await resolveApiBase(env);
-    const upstream = await fetch(
-      base + "/calendar/meetings?email=" + encodeURIComponent(session.identity),
-      { headers: { "X-API-Key": env.API_KEY } }
-    );
+    const includeCancelled = new URL(request.url).searchParams.get("include_cancelled") === "true";
+    const target =
+      base + "/calendar/meetings?email=" + encodeURIComponent(session.identity) +
+      (includeCancelled ? "&include_cancelled=true" : "");
+    const upstream = await fetch(target, { headers: { "X-API-Key": env.API_KEY } });
     const calendar = await readUpstreamJson(upstream);
     return json({ ok: upstream.ok, status: upstream.status, calendar }, upstream.ok ? 200 : 502);
   } catch (err) {
@@ -593,6 +595,33 @@ async function handleCalendarRemove(request, env) {
   try {
     const base = await resolveApiBase(env);
     const upstream = await fetch(base + "/calendar/meetings/remove", {
+      method: "POST",
+      headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ email: session.identity, event_id: eventId }),
+    });
+    const result = await readUpstreamJson(upstream);
+    return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
+  } catch (err) {
+    return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
+  }
+}
+
+// POST /calendar/meetings/restore {email, event_id} — flips a removed meeting
+// (cancelled -> pending) so the bot will auto-join it again. A restore of a
+// meeting that wasn't removed comes back as a 200 "noop".
+async function handleCalendarRestore(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
+  if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
+  const body = await request.json().catch(() => ({}));
+  const eventId = body.event_id;
+  if (eventId === undefined || eventId === null || eventId === "") {
+    return json({ error: "event_id is required" }, 400);
+  }
+  try {
+    const base = await resolveApiBase(env);
+    const upstream = await fetch(base + "/calendar/meetings/restore", {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({ email: session.identity, event_id: eventId }),
