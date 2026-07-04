@@ -263,8 +263,11 @@ async function dispatchBot(env, action, email, meetingUrl) {
   return { ok: upstream.ok, status: upstream.status, data };
 }
 
-// Returns transcripts from D1. A normal user sees only rows whose owner_email
-// matches their session email (derived server-side). Admin sees every row.
+// Returns transcripts from D1. A normal user sees every meeting they own via
+// the meeting_owners table (every calendar attendee is a co-owner now), plus a
+// fallback to legacy rows still tagged with their transcriptions.owner_email so
+// meetings created before the backend started mirroring ownership still show.
+// Admin sees every row.
 async function handleTranscripts(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
@@ -278,10 +281,15 @@ async function handleTranscripts(request, env) {
         "FROM transcriptions ORDER BY meeting_id, start_time"
       ).all();
     } else {
+      // owner_email is stored lowercased/trimmed, so match the normalized email.
+      const email = normalizeEmail(session.identity);
       res = await env.DB.prepare(
         "SELECT meeting_id, segment_id, start_time, end_time, text, speaker, created_at " +
-        "FROM transcriptions WHERE owner_email = ?1 ORDER BY meeting_id, start_time"
-      ).bind(session.identity).all();
+        "FROM transcriptions " +
+        "WHERE meeting_id IN (SELECT meeting_id FROM meeting_owners WHERE owner_email = ?1) " +
+        "OR owner_email = ?1 " +
+        "ORDER BY meeting_id, start_time"
+      ).bind(email).all();
     }
     return json({ ok: true, admin: session.isAdmin, segments: res.results || [] });
   } catch (err) {
@@ -456,9 +464,18 @@ async function handleAiChat(request, env) {
         "SELECT start_time, text, speaker FROM transcriptions WHERE meeting_id = ?1 ORDER BY start_time"
       ).bind(meetingId).all();
     } else {
+      // Authorize per-meeting: if this client is an owner of the meeting in
+      // meeting_owners they may read ALL of its transcript rows (co-viewers see
+      // the whole meeting, not just their own rows); otherwise fall back to the
+      // legacy per-row owner_email match for meetings not yet mirrored.
+      const email = normalizeEmail(ownerScope);
       res = await env.DB.prepare(
-        "SELECT start_time, text, speaker FROM transcriptions WHERE owner_email = ?1 AND meeting_id = ?2 ORDER BY start_time"
-      ).bind(ownerScope, meetingId).all();
+        "SELECT start_time, text, speaker FROM transcriptions " +
+        "WHERE meeting_id = ?2 AND (" +
+        "EXISTS (SELECT 1 FROM meeting_owners WHERE meeting_id = ?2 AND owner_email = ?1) " +
+        "OR owner_email = ?1) " +
+        "ORDER BY start_time"
+      ).bind(email, meetingId).all();
     }
   } catch (err) {
     return json({ error: "Failed to load the transcript", detail: String((err && err.message) || err) }, 500);
@@ -579,9 +596,15 @@ async function handleWeeklyPeople(request, env) {
         "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions ORDER BY meeting_id, start_time"
       ).all();
     } else {
+      // Same visibility rule as /api/transcripts: meetings owned via
+      // meeting_owners, plus legacy owner_email rows for un-mirrored meetings.
+      const email = normalizeEmail(session.identity);
       res = await env.DB.prepare(
-        "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions WHERE owner_email = ?1 ORDER BY meeting_id, start_time"
-      ).bind(session.identity).all();
+        "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions " +
+        "WHERE meeting_id IN (SELECT meeting_id FROM meeting_owners WHERE owner_email = ?1) " +
+        "OR owner_email = ?1 " +
+        "ORDER BY meeting_id, start_time"
+      ).bind(email).all();
     }
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
