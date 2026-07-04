@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import type { ReactNode } from 'react'
+import type { ChangeEvent, ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { useAppData } from '../store/AppData'
 import { useSentiment } from '../store/Sentiment'
 import { downloadSummary } from '../lib/exportSummary'
 import { downloadSummaryPdf } from '../lib/pdfRender'
-import { emailEpisodeSummary, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
+import { ApiError, chatMeeting, emailEpisodeSummary, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
 import { addRecipient, loadRecipients, removeRecipient } from '../lib/recipientsStore'
 import { formatDuration, longDate, statusMeta } from '../lib/format'
 import type { Episode, EpisodeInsight, ProcessingStatus, QuantPoint, Takeaway, TranscriptSegment } from '../lib/types'
@@ -22,7 +22,7 @@ import { SourceLink } from '../components/SourceLink'
 import { StatusBadge } from '../components/StatusBadge'
 import { anchorSegment } from '../lib/topics'
 
-type Tab = 'summary' | 'highlights' | 'qa' | 'transcript'
+type Tab = 'summary' | 'highlights' | 'qa' | 'transcript' | 'chat'
 
 // Renders the AI summary body: an optional bold section header per block, any
 // prose paragraphs, and "- " lines as a real bullet list. The model returns
@@ -185,6 +185,7 @@ export default function EpisodeDetail() {
     { id: 'highlights', label: 'Highlights', show: !!episode.summary?.highlights.length },
     { id: 'qa', label: 'Q&A', show: !!episode.summary?.qa.length },
     { id: 'transcript', label: 'Transcript', show: true },
+    { id: 'chat', label: 'Chat', show: hasTranscript },
   ]
 
   function openTranscript(segmentId?: string, label?: string) {
@@ -289,6 +290,7 @@ export default function EpisodeDetail() {
           {tab === 'transcript' && (
             <TranscriptTab episode={episode} focusId={jumpTo} focusLabel={jumpLabel} focusTick={jumpTick} />
           )}
+          {tab === 'chat' && <ChatTab episode={episode} />}
         </>
       )}
     </div>
@@ -721,6 +723,247 @@ function QATab({ episode }: { episode: Episode }) {
         ))}
       </ul>
     </section>
+  )
+}
+
+// ── Chat tab — free-form Q&A over this meeting's transcript ──────────────────
+// The Worker loads the (length-bounded) transcript server-side and answers with
+// OpenAI, so even a very long meeting stays a tiny request from the browser and
+// the transcript itself never leaves the Worker. Same per-meeting ACL as the
+// summary. The conversation is per-visit (not persisted) — a fresh thread each
+// time the tab is opened.
+type ChatMsg = { role: 'user' | 'assistant'; content: string }
+
+const CHAT_SUGGESTIONS = [
+  'Summarize the key decisions',
+  'List the action items and who owns them',
+  'What was left unresolved?',
+  'Give me a quick recap of what each person said',
+]
+
+function ChatTab({ episode }: { episode: Episode }) {
+  const terms = useMemo(() => entityTerms(episode.entities), [episode.entities])
+  const [messages, setMessages] = useState<ChatMsg[]>([])
+  const [input, setInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Keep the newest message (and the typing indicator) in view.
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' })
+  }, [messages, busy])
+
+  async function send(text: string) {
+    const q = text.trim()
+    if (!q || busy) return
+    const next: ChatMsg[] = [...messages, { role: 'user', content: q }]
+    setMessages(next)
+    setInput('')
+    setError(null)
+    setBusy(true)
+    // Reset the composer height after clearing it.
+    if (inputRef.current) inputRef.current.style.height = 'auto'
+    try {
+      const reply = await chatMeeting(episode, next)
+      setMessages((m) => [...m, { role: 'assistant', content: reply.trim() || '(No answer.)' }])
+    } catch (err) {
+      setError(
+        err instanceof ApiError && err.status === 503
+          ? 'The meeting assistant isn’t configured yet — set the OPENAI_API_KEY secret on the Worker.'
+          : (err as Error)?.message || 'The assistant could not answer just now. Please try again.',
+      )
+    } finally {
+      setBusy(false)
+      inputRef.current?.focus()
+    }
+  }
+
+  function onInput(e: ChangeEvent<HTMLTextAreaElement>) {
+    setInput(e.target.value)
+    const el = e.target
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+  }
+
+  return (
+    <section className="mx-auto max-w-reading">
+      <div className="flex h-[60vh] min-h-[440px] flex-col overflow-hidden rounded-2xl border border-outline-variant bg-surface-container-lowest shadow-card">
+        {/* Header */}
+        <div className="flex items-center gap-2.5 border-b border-outline-variant px-md py-3">
+          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg chip-signal">
+            <Icon name="forum" size={18} className="text-primary" fill />
+          </span>
+          <div className="min-w-0">
+            <h2 className="text-[16px] font-semibold text-on-surface">Chat with this meeting</h2>
+            <p className="truncate text-metadata text-secondary">Answers come only from the transcript.</p>
+          </div>
+          {messages.length > 0 && (
+            <button
+              onClick={() => {
+                setMessages([])
+                setError(null)
+              }}
+              className="press ml-auto inline-flex items-center gap-1.5 rounded-lg border border-outline-variant bg-surface px-2.5 py-1.5 text-metadata font-semibold text-on-surface hover:bg-surface-container-low"
+            >
+              <Icon name="restart_alt" size={16} /> <span className="hidden sm:inline">New chat</span>
+            </button>
+          )}
+        </div>
+
+        {/* Messages */}
+        <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto px-md py-md">
+          {messages.length === 0 && !busy && !error ? (
+            <div className="grid h-full place-items-center">
+              <div className="max-w-md text-center">
+                <span className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-full chip-signal">
+                  <Icon name="forum" size={24} className="text-primary" fill />
+                </span>
+                <h3 className="text-[16px] font-semibold text-on-surface">Ask about this meeting</h3>
+                <p className="mt-1 text-body-md text-secondary">
+                  Decisions, action items, who said what — I’ll answer from what the transcript covers.
+                </p>
+                <div className="mt-4 flex flex-wrap justify-center gap-2">
+                  {CHAT_SUGGESTIONS.map((s) => (
+                    <button
+                      key={s}
+                      onClick={() => void send(s)}
+                      className="press rounded-full border border-outline-variant bg-surface px-3 py-1.5 text-[13px] font-medium text-on-surface hover:border-primary hover:text-primary"
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+          ) : (
+            messages.map((m, i) =>
+              m.role === 'user' ? (
+                <div key={i} className="flex justify-end">
+                  <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2.5 text-[14px] leading-relaxed text-on-primary">
+                    {m.content}
+                  </div>
+                </div>
+              ) : (
+                <div key={i} className="flex gap-2.5">
+                  <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full chip-signal">
+                    <Icon name="auto_awesome" size={16} className="text-primary" fill />
+                  </span>
+                  <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-3.5 py-2.5">
+                    <ChatAnswer text={m.content} terms={terms} />
+                  </div>
+                </div>
+              ),
+            )
+          )}
+
+          {busy && (
+            <div className="flex gap-2.5">
+              <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full chip-signal">
+                <Icon name="auto_awesome" size={16} className="text-primary" fill />
+              </span>
+              <div className="flex items-center gap-1 rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-4 py-3.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-secondary motion-safe:animate-bounce [animation-delay:-0.2s]" />
+                <span className="h-1.5 w-1.5 rounded-full bg-secondary motion-safe:animate-bounce [animation-delay:-0.1s]" />
+                <span className="h-1.5 w-1.5 rounded-full bg-secondary motion-safe:animate-bounce" />
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div className="flex items-start gap-2 rounded-xl border border-error/30 bg-error-container/40 px-3 py-2.5 text-[13px] text-error">
+              <Icon name="error" size={16} className="mt-0.5 shrink-0" />
+              <span>{error}</span>
+            </div>
+          )}
+        </div>
+
+        {/* Composer */}
+        <div className="border-t border-outline-variant p-3">
+          <form
+            onSubmit={(e) => {
+              e.preventDefault()
+              void send(input)
+            }}
+            className="flex items-end gap-2"
+          >
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={onInput}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault()
+                  void send(input)
+                }
+              }}
+              rows={1}
+              placeholder="Ask about this meeting…"
+              className="max-h-40 flex-1 resize-none rounded-xl border border-outline-variant bg-surface-container-low px-3.5 py-2.5 text-[14px] leading-relaxed outline-none focus:border-primary focus:bg-surface"
+            />
+            <button
+              type="submit"
+              disabled={!input.trim() || busy}
+              aria-label="Send"
+              className="press grid h-11 w-11 shrink-0 place-items-center rounded-xl bg-primary text-on-primary transition-opacity hover:bg-primary-container disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Icon name={busy ? 'progress_activity' : 'send'} size={20} className={busy ? 'motion-safe:animate-spin' : ''} />
+            </button>
+          </form>
+          <p className="mt-1.5 px-1 text-[11px] text-secondary">Enter to send · Shift + Enter for a new line</p>
+        </div>
+      </div>
+    </section>
+  )
+}
+
+// Renders a chat answer with the same light markdown the summary uses (bold
+// **headers**, "- " bullets, paragraphs) but at a compact, uniform chat size.
+function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
+  const isBullet = (l: string) => /^([-*•]|\d+[.)])\s+/.test(l)
+  const stripBullet = (l: string) => l.replace(/^([-*•]|\d+[.)])\s+/, '')
+  const blocks = text
+    .split(/\n{2,}/)
+    .map((b) => b.trim())
+    .filter(Boolean)
+  if (!blocks.length) return <p className="text-[14px] leading-relaxed text-on-surface">{text}</p>
+  return (
+    <div className="space-y-2.5 text-[14px] leading-relaxed text-on-surface">
+      {blocks.map((block, i) => {
+        const lines = block
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+        const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
+        const header = headMatch ? headMatch[1] : null
+        const rest = header ? lines.slice(1) : lines
+        const bullets = rest.filter(isBullet).map(stripBullet)
+        const paras = rest.filter((l) => !isBullet(l))
+        return (
+          <div key={i}>
+            {header && <p className="mb-1 font-semibold text-on-surface">{header}</p>}
+            {paras.map((p, j) => (
+              <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
+                <RichText text={p} terms={terms} />
+              </p>
+            ))}
+            {bullets.length > 0 && (
+              <ul className="mt-1 space-y-1">
+                {bullets.map((b, j) => (
+                  <li key={`b${j}`} className="flex gap-2">
+                    <span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
+                    <span className="min-w-0">
+                      <RichText text={b} terms={terms} />
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )
+      })}
+    </div>
   )
 }
 

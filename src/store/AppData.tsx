@@ -157,7 +157,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     summarizing.current.add(episode.id)
     setEpisodes((prev) => prev.map((e) => (e.id === episode.id ? { ...e, status: 'summarizing' } : e)))
     try {
-      const summary = await api.summarizeMeeting(episode)
+      const summary = await api.summarizeMeeting(episode, { force: opts?.force })
       setEpisodes((prev) => prev.map((e) => (e.id === episode.id ? { ...e, status: 'ready', summary } : e)))
       setNeedsApiKey(false)
     } catch (err) {

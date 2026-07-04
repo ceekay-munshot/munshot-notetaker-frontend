@@ -115,12 +115,14 @@ function summaryFromReply(reply: string): Summary {
   return { synthesis: synthesis.length ? synthesis : [reply.trim()], highlights: [], qa: [] }
 }
 
-/** Ask the meeting assistant for a one-page summary of a meeting (OpenAI, server-side). */
-export async function summarizeMeeting(episode: Episode): Promise<Summary> {
+/** Ask the meeting assistant for a one-page summary of a meeting (OpenAI, server-side).
+ *  The Worker generates a summary once and caches it, so every co-owner sees the
+ *  same one; pass { force } (the Refresh button) to regenerate and overwrite it. */
+export async function summarizeMeeting(episode: Episode, opts?: { force?: boolean }): Promise<Summary> {
   const { owner, meetingId } = decodeMeetingId(episode.id)
   const data = await request<{ ok: boolean; reply?: string }>('/api/ai', {
     method: 'POST',
-    body: JSON.stringify({ meeting_id: meetingId, owner, summarize: true }),
+    body: JSON.stringify({ meeting_id: meetingId, owner, summarize: true, force: !!opts?.force }),
   })
   return summaryFromReply(String(data.reply || ''))
 }

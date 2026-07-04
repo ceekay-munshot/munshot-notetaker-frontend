@@ -299,6 +299,13 @@ async function handleTranscripts(request, env) {
 
 /* ------------------------------ AI assistant ------------------------------ */
 
+// KV key under which a meeting's generated summary is cached. Keyed by meeting_id
+// only (shared across all co-owners); bump the version suffix to invalidate every
+// cached summary at once after a summary-format change.
+function summaryCacheKey(meetingId) {
+  return `summary:v1:${String(meetingId).trim()}`;
+}
+
 // Builds a readable, length-bounded transcript for the model. Keeps the start
 // and (when long) the tail, where decisions and action items usually land.
 function buildTranscriptText(rows) {
@@ -487,8 +494,32 @@ async function handleAiChat(request, env) {
   // A summary request runs the richer multi-call pipeline (overview + decisions,
   // then detailed per-person notes) for far more depth than a single call.
   if (summarize) {
+    // A meeting is summarized ONCE and the result is cached server-side, keyed by
+    // meeting_id (a meeting's transcript is identical for every co-owner). Every
+    // user who opens the meeting then sees the exact same summary and we never pay
+    // to re-summarize. The dashboard's Refresh button sends force:true to
+    // regenerate and overwrite the cache. Authorization already happened above
+    // (an unauthorized user gets 0 rows → 404 before reaching this point).
+    const cacheKey = summaryCacheKey(meetingId);
+    const force = !!body.force;
+    if (!force && env.KV) {
+      try {
+        const cached = await env.KV.get(cacheKey);
+        if (cached) return json({ ok: true, reply: cached, cached: true });
+      } catch {
+        /* KV hiccup — fall through and generate fresh */
+      }
+    }
     try {
-      return json({ ok: true, reply: await generateDetailedSummary(rows, apiKey, model) });
+      const reply = await generateDetailedSummary(rows, apiKey, model);
+      if (env.KV) {
+        try {
+          await env.KV.put(cacheKey, reply);
+        } catch {
+          /* best-effort cache write — still return the summary we just made */
+        }
+      }
+      return json({ ok: true, reply });
     } catch (err) {
       return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
     }
