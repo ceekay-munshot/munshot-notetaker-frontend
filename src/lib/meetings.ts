@@ -101,8 +101,10 @@ export interface Meeting {
   podcast: Podcast
 }
 
-/** Build one Meeting (Episode + synthetic Podcast) from its segments. */
-function buildMeeting(meetingId: string, owner: string, segs: RawSegment[]): Meeting {
+/** Build one Meeting (Episode + synthetic Podcast) from its segments. `name` is
+ *  the AI-minted title (shown to everyone) when the meeting has one; otherwise we
+ *  fall back to "Meeting <id>". */
+function buildMeeting(meetingId: string, owner: string, segs: RawSegment[], name?: string): Meeting {
   const ordered = [...segs].sort((a, b) => num(a.start_time) - num(b.start_time))
   const id = encodeMeetingId(owner, meetingId)
   const people = participantsOf(ordered)
@@ -132,7 +134,7 @@ function buildMeeting(meetingId: string, owner: string, segs: RawSegment[]): Mee
       .slice(0, 200)
       .trim() || 'Transcript recorded by the Munshot notetaker.'
 
-  const title = `Meeting ${meetingId}`
+  const title = (name && name.trim()) || `Meeting ${meetingId}`
 
   const episode: Episode = {
     id,
@@ -164,8 +166,13 @@ function buildMeeting(meetingId: string, owner: string, segs: RawSegment[]): Mee
   return { episode, podcast }
 }
 
-/** Group raw transcript rows into meetings, most recent first. */
-export function meetingsFromSegments(segments: RawSegment[]): Meeting[] {
+/** Group raw transcript rows into meetings, most recent first. `titles` maps a
+ *  meeting_id to its AI-minted display name (from the Worker); a meeting without
+ *  one keeps the "Meeting <id>" fallback. */
+export function meetingsFromSegments(
+  segments: RawSegment[],
+  titles?: Record<string, string>,
+): Meeting[] {
   const groups = new Map<string, { meetingId: string; owner: string; segs: RawSegment[] }>()
   for (const s of segments) {
     const meetingId = String(s.meeting_id)
@@ -178,7 +185,9 @@ export function meetingsFromSegments(segments: RawSegment[]): Meeting[] {
     }
     g.segs.push(s)
   }
-  const meetings = [...groups.values()].map((g) => buildMeeting(g.meetingId, g.owner, g.segs))
+  const meetings = [...groups.values()].map((g) =>
+    buildMeeting(g.meetingId, g.owner, g.segs, titles?.[g.meetingId]),
+  )
   meetings.sort((a, b) => +new Date(b.episode.publishedAt) - +new Date(a.episode.publishedAt))
   return meetings
 }

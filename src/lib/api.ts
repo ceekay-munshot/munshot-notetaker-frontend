@@ -95,8 +95,13 @@ export interface MeetingData {
 
 /** Load every meeting the signed-in user can see and map it onto the UI model. */
 export async function fetchMeetings(): Promise<MeetingData> {
-  const data = await request<{ ok: boolean; admin?: boolean; segments?: RawSegment[] }>('/api/transcripts')
-  const meetings = meetingsFromSegments(data.segments || [])
+  const data = await request<{
+    ok: boolean
+    admin?: boolean
+    segments?: RawSegment[]
+    titles?: Record<string, string>
+  }>('/api/transcripts')
+  const meetings = meetingsFromSegments(data.segments || [], data.titles || {})
   return {
     episodes: meetings.map((m) => m.episode),
     podcasts: meetings.map((m) => m.podcast),
@@ -117,14 +122,21 @@ function summaryFromReply(reply: string): Summary {
 
 /** Ask the meeting assistant for a one-page summary of a meeting (OpenAI, server-side).
  *  The Worker generates a summary once and caches it, so every co-owner sees the
- *  same one; pass { force } (the Refresh button) to regenerate and overwrite it. */
-export async function summarizeMeeting(episode: Episode, opts?: { force?: boolean }): Promise<Summary> {
+ *  same one; pass { force } (the Refresh button) to regenerate and overwrite it.
+ *  `title` is the AI-minted display name for an otherwise-unnamed meeting (also
+ *  generated once, while summarizing) — undefined when the meeting already has one
+ *  or naming failed. */
+export async function summarizeMeeting(
+  episode: Episode,
+  opts?: { force?: boolean },
+): Promise<{ summary: Summary; title?: string }> {
   const { owner, meetingId } = decodeMeetingId(episode.id)
-  const data = await request<{ ok: boolean; reply?: string }>('/api/ai', {
+  const data = await request<{ ok: boolean; reply?: string; title?: string }>('/api/ai', {
     method: 'POST',
     body: JSON.stringify({ meeting_id: meetingId, owner, summarize: true, force: !!opts?.force }),
   })
-  return summaryFromReply(String(data.reply || ''))
+  const title = typeof data.title === 'string' ? data.title.trim() : ''
+  return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
 /** Free-form chat over a single meeting's transcript. `messages` is the running

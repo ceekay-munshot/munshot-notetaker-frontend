@@ -291,10 +291,41 @@ async function handleTranscripts(request, env) {
         "ORDER BY meeting_id, start_time"
       ).bind(email).all();
     }
-    return json({ ok: true, admin: session.isAdmin, segments: res.results || [] });
+    const segments = res.results || [];
+    const titles = await loadTitlesFor(env, segments);
+    return json({ ok: true, admin: session.isAdmin, segments, titles });
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
   }
+}
+
+// Fetches any stored AI-generated titles for the meetings in these rows, as a
+// { meeting_id: title } map, so the dashboard can show real names instead of
+// "Meeting <id>". Scoped to the caller's own (already-authorized) meetings, and
+// capped so a huge history can't blow the Worker's subrequest budget — meetings
+// past the cap keep the "Meeting <id>" fallback until they're opened.
+async function loadTitlesFor(env, segments) {
+  const out = {};
+  if (!env.KV || !segments || !segments.length) return out;
+  const ids = [];
+  const seen = new Set();
+  for (const s of segments) {
+    const id = String(s.meeting_id);
+    if (!seen.has(id)) {
+      seen.add(id);
+      ids.push(id);
+    }
+  }
+  const pick = ids.slice(0, 200);
+  try {
+    const vals = await Promise.all(pick.map((id) => env.KV.get(titleCacheKey(id)).catch(() => null)));
+    pick.forEach((id, i) => {
+      if (vals[i]) out[id] = vals[i];
+    });
+  } catch {
+    /* best-effort — return whatever resolved */
+  }
+  return out;
 }
 
 /* ------------------------------ AI assistant ------------------------------ */
@@ -304,6 +335,51 @@ async function handleTranscripts(request, env) {
 // cached summary at once after a summary-format change.
 function summaryCacheKey(meetingId) {
   return `summary:v1:${String(meetingId).trim()}`;
+}
+
+// KV key for a meeting's AI-generated display title. Ad-hoc meetings arrive with
+// no name (the UI shows "Meeting <id>"); we mint a short title once, while
+// summarizing, and cache it here so every user sees the same name everywhere.
+function titleCacheKey(meetingId) {
+  return `title:v1:${String(meetingId).trim()}`;
+}
+
+// Normalizes the model's title output: strips quotes / a "Title:" prefix / a
+// trailing period, and hard-caps it at 5 words. Returns "" for junk so callers
+// fall back to "Meeting <id>".
+function cleanTitle(raw) {
+  let t = String(raw || "").trim();
+  t = t.replace(/^["'“”\s]+|["'“”\s]+$/g, "").replace(/^title\s*[:\-–]\s*/i, "").trim();
+  t = t.replace(/[.。]+$/g, "").trim();
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length > 5) t = words.slice(0, 5).join(" ");
+  if (!t || t.length > 80) return "";
+  return t;
+}
+
+// Mints a short, human title (≤5 words) for an otherwise-unnamed meeting from the
+// opening of its transcript (where the topic is usually set), keeping the call
+// cheap. Returns "" on any failure so summarizing never breaks over a title.
+async function generateMeetingTitle(rows, apiKey, model) {
+  const text = buildTranscriptText(rows).slice(0, 6000);
+  if (!text.trim()) return "";
+  const raw = await openaiChat(
+    apiKey,
+    model,
+    [
+      {
+        role: "system",
+        content:
+          "You name meetings. Given a transcript, reply with a specific, natural title of AT MOST 5 " +
+          "words that captures what the meeting was about. Use Title Case. No quotes, no trailing " +
+          "punctuation, and do not start with the word \"Meeting\". Reply with the title only.",
+      },
+      { role: "user", content: "TRANSCRIPT:\n" + text },
+    ],
+    24,
+    0.3,
+  );
+  return cleanTitle(raw);
 }
 
 // Builds a readable, length-bounded transcript for the model. Keeps the start
@@ -501,25 +577,53 @@ async function handleAiChat(request, env) {
     // regenerate and overwrite the cache. Authorization already happened above
     // (an unauthorized user gets 0 rows → 404 before reaching this point).
     const cacheKey = summaryCacheKey(meetingId);
+    const titleKey = titleCacheKey(meetingId);
     const force = !!body.force;
     if (!force && env.KV) {
       try {
         const cached = await env.KV.get(cacheKey);
-        if (cached) return json({ ok: true, reply: cached, cached: true });
+        if (cached) {
+          // Summary is cached; return the stored title too. If this meeting was
+          // summarized before titles existed, mint one now (once) so it still
+          // gets a name.
+          let title = "";
+          try {
+            title = (await env.KV.get(titleKey)) || "";
+            if (!title) {
+              title = await generateMeetingTitle(rows, apiKey, model);
+              if (title) await env.KV.put(titleKey, title);
+            }
+          } catch {
+            /* title is best-effort */
+          }
+          return json({ ok: true, reply: cached, title: title || undefined, cached: true });
+        }
       } catch {
         /* KV hiccup — fall through and generate fresh */
       }
     }
     try {
-      const reply = await generateDetailedSummary(rows, apiKey, model);
+      // Summary + a short display title are minted together (title generation is
+      // best-effort — a title failure must never sink the summary).
+      const [reply, title] = await Promise.all([
+        generateDetailedSummary(rows, apiKey, model),
+        generateMeetingTitle(rows, apiKey, model).catch(() => ""),
+      ]);
       if (env.KV) {
         try {
           await env.KV.put(cacheKey, reply);
         } catch {
           /* best-effort cache write — still return the summary we just made */
         }
+        if (title) {
+          try {
+            await env.KV.put(titleKey, title);
+          } catch {
+            /* best-effort */
+          }
+        }
       }
-      return json({ ok: true, reply });
+      return json({ ok: true, reply, title: title || undefined });
     } catch (err) {
       return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
     }

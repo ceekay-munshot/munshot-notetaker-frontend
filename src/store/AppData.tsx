@@ -157,8 +157,14 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     summarizing.current.add(episode.id)
     setEpisodes((prev) => prev.map((e) => (e.id === episode.id ? { ...e, status: 'summarizing' } : e)))
     try {
-      const summary = await api.summarizeMeeting(episode, { force: opts?.force })
-      setEpisodes((prev) => prev.map((e) => (e.id === episode.id ? { ...e, status: 'ready', summary } : e)))
+      const { summary, title } = await api.summarizeMeeting(episode, { force: opts?.force })
+      setEpisodes((prev) =>
+        prev.map((e) => (e.id === episode.id ? { ...e, status: 'ready', summary, title: title || e.title } : e)),
+      )
+      // A freshly-minted name replaces the "Meeting <id>" fallback across this
+      // session (some views read the podcast title). It's already stored
+      // server-side, so any reload — for any user — shows it too.
+      if (title) setPodcasts((prev) => prev.map((p) => (p.id === episode.id ? { ...p, title } : p)))
       setNeedsApiKey(false)
     } catch (err) {
       if (err instanceof api.ApiError && err.status === 503) {
