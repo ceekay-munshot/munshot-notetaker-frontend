@@ -39,7 +39,7 @@ interface AppData {
   // calendar
   calendarEvents: api.CalendarEvent[]
   calendarLoading: boolean
-  syncCalendar: () => Promise<{ count: number; note?: string }>
+  syncCalendar: () => Promise<{ count: number; note?: string; connectUrl?: string }>
   refreshCalendar: () => Promise<api.CalendarEvent[]>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
   removeCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
@@ -76,6 +76,19 @@ function syncNote(result: unknown): string | undefined {
   for (const key of ['error', 'message', 'detail', 'status', 'note']) {
     const v = r[key]
     if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 200)
+  }
+  return undefined
+}
+
+// When the calendar isn't connected yet, the upstream sync hands back an OAuth
+// authorization link to send the user to. The field name isn't guaranteed, so
+// check the common spellings and only accept a real http(s) URL.
+function syncConnectUrl(result: unknown): string | undefined {
+  if (!result || typeof result !== 'object') return undefined
+  const r = result as Record<string, unknown>
+  for (const key of ['connect_url', 'connectUrl', 'authorize_url', 'auth_url', 'authUrl', 'url']) {
+    const v = r[key]
+    if (typeof v === 'string' && /^https?:\/\//i.test(v.trim())) return v.trim()
   }
   return undefined
 }
@@ -232,12 +245,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   // landed. A 200 from /calendar/sync only means the request was accepted — it
   // does NOT guarantee any meetings were imported — so we return the resulting
   // count (and any note the upstream sent) rather than assuming success.
-  const syncCalendar = useCallback(async (): Promise<{ count: number; note?: string }> => {
+  const syncCalendar = useCallback(async (): Promise<{ count: number; note?: string; connectUrl?: string }> => {
     setCalendarLoading(true)
     try {
       const res = await api.calendarSync()
       const events = await refreshCalendar()
-      return { count: events.length, note: syncNote(res?.result) }
+      return { count: events.length, note: syncNote(res?.result), connectUrl: syncConnectUrl(res?.result) }
     } finally {
       setCalendarLoading(false)
     }

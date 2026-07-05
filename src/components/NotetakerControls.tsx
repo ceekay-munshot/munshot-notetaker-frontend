@@ -180,7 +180,9 @@ export function SchedulesCard() {
   const upcoming = useMemo(() => [...schedules].sort((a, b) => a.nextRun - b.nextRun), [schedules])
   const groups = useMemo(() => groupEvents(calendarEvents), [calendarEvents])
   const removedGroups = useMemo(() => groupEvents(cancelledEvents), [cancelledEvents])
-  const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string; undo?: () => Promise<void> } | null>(null)
+  const [msg, setMsg] = useState<
+    { kind: 'ok' | 'err'; text: string; undo?: () => Promise<void>; connectUrl?: string } | null
+  >(null)
   const empty = upcoming.length === 0 && groups.length === 0
 
   return (
@@ -195,9 +197,17 @@ export function SchedulesCard() {
           onClick={async () => {
             setMsg(null)
             try {
-              const { count, note } = await syncCalendar()
+              const { count, note, connectUrl } = await syncCalendar()
               if (count > 0) {
                 setMsg({ kind: 'ok', text: `Calendar synced — ${count} upcoming meeting${count === 1 ? '' : 's'}.` })
+              } else if (connectUrl) {
+                // Not connected yet: the upstream handed back an authorization
+                // link. Show a real button so the user can grant access.
+                setMsg({
+                  kind: 'err',
+                  text: 'Your calendar isn’t connected yet. Authorize access to import your meetings.',
+                  connectUrl,
+                })
               } else {
                 // The request succeeded but nothing came back. Say so honestly
                 // (and pass along any note the server sent) instead of a
@@ -331,6 +341,17 @@ export function SchedulesCard() {
         >
           <Icon name={msg.kind === 'ok' ? 'check_circle' : 'error'} size={16} className="shrink-0" />
           <span className="min-w-0 flex-1 break-words">{msg.text}</span>
+          {msg.connectUrl ? (
+            <a
+              href={msg.connectUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="press inline-flex shrink-0 items-center gap-1 rounded-md border border-current px-2 py-0.5 text-[12px] font-semibold"
+            >
+              <Icon name="link" size={14} />
+              Connect calendar
+            </a>
+          ) : null}
           {msg.undo ? (
             <button
               type="button"
