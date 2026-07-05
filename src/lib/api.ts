@@ -85,6 +85,13 @@ export function logout(): Promise<{ ok: boolean }> {
   return request('/api/logout', { method: 'POST' })
 }
 
+/** Trigger a password reset: the server emails a working temporary password to
+ *  the address (if an account exists). Always resolves the same way regardless
+ *  of whether the account exists, so it can't be used to probe registrations. */
+export function forgotPassword(email: string): Promise<{ ok: boolean }> {
+  return request('/api/forgot-password', { method: 'POST', body: JSON.stringify({ email }) })
+}
+
 // ── Meetings (transcripts → Episode/Podcast model) ──────────────────────────────
 
 export interface MeetingData {

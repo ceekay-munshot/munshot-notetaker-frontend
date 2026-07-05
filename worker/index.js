@@ -28,6 +28,7 @@ export default {
       if (method === "GET" && pathname === "/api/me") return handleMe(request, env);
       if (method === "POST" && pathname === "/api/register") return handleRegister(request, env);
       if (method === "POST" && pathname === "/api/login") return handleLogin(request, env);
+      if (method === "POST" && pathname === "/api/forgot-password") return handleForgotPassword(request, env);
       if (method === "POST" && pathname === "/api/logout") return handleLogout(request, env);
       if (method === "POST" && pathname === "/api/join") return handleBot(request, env, "join");
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
@@ -173,6 +174,52 @@ async function handleLogin(request, env) {
 
   const cookie = await createSession(env, email);
   return json({ ok: true, email }, 200, { "Set-Cookie": cookie });
+}
+
+// "Forgot password" — the user enters their email and we email them working
+// credentials. Passwords are stored hashed (never recoverable), so we mint a
+// fresh temporary password, email it via the Muns raw email API, and only then
+// swap the account's hash over to it — that way a delivery failure leaves the
+// old password intact. Responds the same way whether or not the account exists,
+// so it can't be used to probe which emails are registered.
+async function handleForgotPassword(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const email = normalizeEmail(body.email);
+  if (!email) return json({ error: "Email is required" }, 400);
+  if (!isValidEmail(email)) return json({ error: "Enter a valid email address" }, 400);
+
+  const raw = await env.KV.get(`user:${email}`);
+  if (raw) {
+    if (!env.MUNS_TOKEN) {
+      return json({ error: "Email isn't configured on the server yet" }, 500);
+    }
+    const user = JSON.parse(raw);
+    const tempPassword = generateTempPassword();
+
+    try {
+      await sendMunsEmail(env, {
+        email,
+        subject: "Your Munshot Notetaker password",
+        text:
+          "Here are your login details for Munshot Notetaker:\n\n" +
+          `Email: ${email}\n` +
+          `Temporary password: ${tempPassword}\n\n` +
+          "Sign in with this password. You can keep using it, or create a new " +
+          "account password later.",
+      });
+    } catch (err) {
+      return json({ error: "Couldn't send the email. Please try again." }, 502);
+    }
+
+    // Delivery succeeded — now make the emailed password the live one.
+    const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+    user.salt = toHex(saltBytes);
+    user.hash = await deriveHash(tempPassword, saltBytes);
+    await env.KV.put(`user:${email}`, JSON.stringify(user));
+  }
+
+  // Generic response regardless of whether the account existed.
+  return json({ ok: true });
 }
 
 async function handleLogout(request, env) {
@@ -1400,6 +1447,35 @@ function parseCookies(request) {
     if (idx > -1) out[part.slice(0, idx).trim()] = part.slice(idx + 1).trim();
   }
   return out;
+}
+
+// A short, human-typable temporary password. Ambiguous characters (0/O, 1/l/I)
+// are left out so it survives being read out of an email. Comfortably clears
+// the 6-character minimum the register/login flow enforces.
+function generateTempPassword(len = 12) {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
+  const bytes = crypto.getRandomValues(new Uint8Array(len));
+  let out = "";
+  for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length];
+  return out;
+}
+
+// Send a plain-text email through the Muns raw email API. The bearer token is
+// read from the MUNS_TOKEN secret (never hardcoded); callers must ensure it's
+// set before calling. Throws on a non-2xx response so the caller can react.
+async function sendMunsEmail(env, { email, subject, text }) {
+  const res = await fetch("https://devde.muns.io/email/send/raw", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${env.MUNS_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ email, subject, text }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`Muns email send failed (${res.status})${detail ? `: ${detail}` : ""}`);
+  }
 }
 
 function normalizeEmail(v) {
