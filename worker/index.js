@@ -12,6 +12,11 @@ const DEFAULT_JOIN_ENDPOINT =
   "http://65.1.101.15.nip.io:8080/public/join";
 const DEFAULT_LEAVE_ENDPOINT =
   "http://65.1.101.15.nip.io:8080/public/leave";
+// The calendar Google-auth entry point. Unlike the API base (http, :8080), this
+// is a browser-facing HTTPS endpoint on the default port — the tested, working
+// URL the user is sent to. Override with the CALENDAR_CONNECT_ENDPOINT var.
+const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
+  "https://65.1.101.15.nip.io/calendar/connect/start";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
@@ -39,6 +44,7 @@ export default {
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
       if (method === "POST" && pathname === "/api/calendar/sync") return handleCalendarSync(request, env);
+      if (method === "GET" && pathname === "/api/calendar/connect") return handleCalendarConnect(request, env);
       if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/remove") return handleCalendarRemove(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/restore") return handleCalendarRestore(request, env);
@@ -247,6 +253,12 @@ function fallbackApiBase(env) {
 // The effective base URL every bot/calendar call is sent to: the KV override if
 // an admin set one, else the configured fallback. All endpoints (/public/join,
 // /public/leave, /calendar/*) are built from this single head.
+// The calendar connect-start URL (browser-facing). Configurable so the host can
+// change without a redeploy; defaults to the tested endpoint.
+function calendarConnectEndpoint(env) {
+  return env.CALENDAR_CONNECT_ENDPOINT || DEFAULT_CALENDAR_CONNECT_ENDPOINT;
+}
+
 async function resolveApiBase(env) {
   try {
     const override = await env.KV.get(API_BASE_KEY);
@@ -893,6 +905,28 @@ async function handleCalendarSync(request, env) {
   } catch (err) {
     return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
   }
+}
+
+// GET /api/calendar/connect — starts the calendar Google-auth flow. This is a
+// top-level browser navigation (the "Connect calendar" button), so it redirects
+// straight to the calendar service's connect-start page, which runs the Google
+// OAuth dance in the browser (consent → callback) and links the calendar.
+//
+// The email comes from the SESSION (never the client) so the connected calendar
+// is tied to the right account. Note this is a dedicated HTTPS endpoint on the
+// default port — NOT the :8080 API base the server-side calls use — so it's set
+// separately (calendarConnectEndpoint), overridable via CALENDAR_CONNECT_ENDPOINT.
+async function handleCalendarConnect(request, env) {
+  const appRoot = new URL("/", request.url).toString();
+  const session = await getSession(request, env);
+  // Browser navigation, not an XHR — bounce back to the app (which shows the
+  // login screen) instead of returning a bare 401.
+  if (!session || session.isAdmin) return Response.redirect(appRoot, 302);
+
+  const base = calendarConnectEndpoint(env);
+  const target =
+    base + (base.includes("?") ? "&" : "?") + "email=" + encodeURIComponent(session.identity);
+  return Response.redirect(target, 302);
 }
 
 // GET /calendar/meetings?email=<session email>.
