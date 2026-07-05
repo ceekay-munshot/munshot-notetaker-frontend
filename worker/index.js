@@ -12,6 +12,11 @@ const DEFAULT_JOIN_ENDPOINT =
   "http://65.1.101.15.nip.io:8080/public/join";
 const DEFAULT_LEAVE_ENDPOINT =
   "http://65.1.101.15.nip.io:8080/public/leave";
+// The calendar Google-auth entry point. Unlike the API base (http, :8080), this
+// is a browser-facing HTTPS endpoint on the default port — the tested, working
+// URL the user is sent to. Override with the CALENDAR_CONNECT_ENDPOINT var.
+const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
+  "https://65.1.101.15.nip.io/calendar/connect/start";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
@@ -248,6 +253,12 @@ function fallbackApiBase(env) {
 // The effective base URL every bot/calendar call is sent to: the KV override if
 // an admin set one, else the configured fallback. All endpoints (/public/join,
 // /public/leave, /calendar/*) are built from this single head.
+// The calendar connect-start URL (browser-facing). Configurable so the host can
+// change without a redeploy; defaults to the tested endpoint.
+function calendarConnectEndpoint(env) {
+  return env.CALENDAR_CONNECT_ENDPOINT || DEFAULT_CALENDAR_CONNECT_ENDPOINT;
+}
+
 async function resolveApiBase(env) {
   try {
     const override = await env.KV.get(API_BASE_KEY);
@@ -896,59 +907,26 @@ async function handleCalendarSync(request, env) {
   }
 }
 
-// GET /api/calendar/connect — starts the calendar OAuth flow WITHOUT ever
-// exposing the backend to the browser. This is a top-level browser navigation
-// (the "Connect calendar" button), so it redirects rather than returns JSON.
+// GET /api/calendar/connect — starts the calendar Google-auth flow. This is a
+// top-level browser navigation (the "Connect calendar" button), so it redirects
+// straight to the calendar service's connect-start page, which runs the Google
+// OAuth dance in the browser (consent → callback) and links the calendar.
 //
-// The backend's own sync response advertises a raw connect_url on an internal
-// host/port the browser can't reach (and shouldn't see). Instead we call the
-// backend's connect-start server-side, on the same API base as every other
-// call, capture wherever it wants to send the user (the OAuth provider's
-// consent page), and forward the browser straight there.
+// The email comes from the SESSION (never the client) so the connected calendar
+// is tied to the right account. Note this is a dedicated HTTPS endpoint on the
+// default port — NOT the :8080 API base the server-side calls use — so it's set
+// separately (calendarConnectEndpoint), overridable via CALENDAR_CONNECT_ENDPOINT.
 async function handleCalendarConnect(request, env) {
   const appRoot = new URL("/", request.url).toString();
   const session = await getSession(request, env);
   // Browser navigation, not an XHR — bounce back to the app (which shows the
   // login screen) instead of returning a bare 401.
   if (!session || session.isAdmin) return Response.redirect(appRoot, 302);
-  if (!env.API_KEY) return html("Calendar isn't configured on the server yet.", 500);
 
-  try {
-    const base = await resolveApiBase(env);
-    const target =
-      base + "/calendar/connect/start?email=" + encodeURIComponent(session.identity);
-    // Don't follow the redirect — we want to hand its target to the browser,
-    // not fetch it ourselves (and never leak the backend's own URL).
-    const upstream = await fetch(target, {
-      headers: { "X-API-Key": env.API_KEY },
-      redirect: "manual",
-    });
-
-    // Case 1: the backend 3xx-redirects to the OAuth provider → forward that.
-    const location = upstream.headers.get("Location");
-    if (upstream.status >= 300 && upstream.status < 400 && location) {
-      return Response.redirect(location, 302);
-    }
-
-    // Case 2: the backend returns JSON carrying the authorization URL.
-    const text = await upstream.text();
-    let authUrl = null;
-    try {
-      const data = JSON.parse(text);
-      authUrl =
-        data.authorize_url || data.auth_url || data.authUrl || data.connect_url ||
-        data.connectUrl || data.url || null;
-    } catch {
-      /* not JSON */
-    }
-    if (typeof authUrl === "string" && /^https?:\/\//i.test(authUrl)) {
-      return Response.redirect(authUrl, 302);
-    }
-
-    return html("Couldn't start calendar authorization. Please try again later.", 502);
-  } catch (err) {
-    return html("Couldn't reach the calendar service to start authorization.", 502);
-  }
+  const base = calendarConnectEndpoint(env);
+  const target =
+    base + (base.includes("?") ? "&" : "?") + "email=" + encodeURIComponent(session.identity);
+  return Response.redirect(target, 302);
 }
 
 // GET /calendar/meetings?email=<session email>.
