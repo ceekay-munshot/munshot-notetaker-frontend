@@ -45,6 +45,8 @@ id = "759a21557c7d4e118296479f9b4c50a6"
 #   Worker → Settings → Variables and Secrets → Add → type "Secret"
 #     API_KEY      (required)  the X-API-Key value
 #     SIGNUP_CODE  (optional)  require a code to register
+#     MUNS_TOKEN   (required for password reset)  bearer token for the Muns
+#                  raw email API (POST https://devde.muns.io/email/send/raw)
 
 # Transcripts database (D1).
 [[d1_databases]]
