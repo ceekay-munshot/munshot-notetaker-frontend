@@ -39,7 +39,7 @@ interface AppData {
   // calendar
   calendarEvents: api.CalendarEvent[]
   calendarLoading: boolean
-  syncCalendar: () => Promise<{ count: number; note?: string; connectUrl?: string }>
+  syncCalendar: () => Promise<{ count: number; note?: string; needsConnect: boolean }>
   refreshCalendar: () => Promise<api.CalendarEvent[]>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
   removeCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
@@ -245,12 +245,17 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   // landed. A 200 from /calendar/sync only means the request was accepted — it
   // does NOT guarantee any meetings were imported — so we return the resulting
   // count (and any note the upstream sent) rather than assuming success.
-  const syncCalendar = useCallback(async (): Promise<{ count: number; note?: string; connectUrl?: string }> => {
+  const syncCalendar = useCallback(async (): Promise<{ count: number; note?: string; needsConnect: boolean }> => {
     setCalendarLoading(true)
     try {
       const res = await api.calendarSync()
       const events = await refreshCalendar()
-      return { count: events.length, note: syncNote(res?.result), connectUrl: syncConnectUrl(res?.result) }
+      const note = syncNote(res?.result)
+      // The backend signals "not connected" via a connect_url and/or a note.
+      // We only need the boolean — the browser is sent through the Worker's
+      // /api/calendar/connect route, never the raw backend URL.
+      const needsConnect = !!syncConnectUrl(res?.result) || /not connected|authori[sz]e|connect your/i.test(note || '')
+      return { count: events.length, note, needsConnect }
     } finally {
       setCalendarLoading(false)
     }

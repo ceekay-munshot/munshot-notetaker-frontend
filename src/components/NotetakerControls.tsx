@@ -181,7 +181,7 @@ export function SchedulesCard() {
   const groups = useMemo(() => groupEvents(calendarEvents), [calendarEvents])
   const removedGroups = useMemo(() => groupEvents(cancelledEvents), [cancelledEvents])
   const [msg, setMsg] = useState<
-    { kind: 'ok' | 'err'; text: string; undo?: () => Promise<void>; connectUrl?: string } | null
+    { kind: 'ok' | 'err'; text: string; undo?: () => Promise<void>; connect?: boolean } | null
   >(null)
   const empty = upcoming.length === 0 && groups.length === 0
 
@@ -197,16 +197,16 @@ export function SchedulesCard() {
           onClick={async () => {
             setMsg(null)
             try {
-              const { count, note, connectUrl } = await syncCalendar()
+              const { count, note, needsConnect } = await syncCalendar()
               if (count > 0) {
                 setMsg({ kind: 'ok', text: `Calendar synced — ${count} upcoming meeting${count === 1 ? '' : 's'}.` })
-              } else if (connectUrl) {
-                // Not connected yet: the upstream handed back an authorization
-                // link. Show a real button so the user can grant access.
+              } else if (needsConnect) {
+                // Not connected yet. Offer a Connect button that goes through the
+                // Worker (/api/calendar/connect) — never the raw backend URL.
                 setMsg({
                   kind: 'err',
                   text: 'Your calendar isn’t connected yet. Authorize access to import your meetings.',
-                  connectUrl,
+                  connect: true,
                 })
               } else {
                 // The request succeeded but nothing came back. Say so honestly
@@ -341,11 +341,9 @@ export function SchedulesCard() {
         >
           <Icon name={msg.kind === 'ok' ? 'check_circle' : 'error'} size={16} className="shrink-0" />
           <span className="min-w-0 flex-1 break-words">{msg.text}</span>
-          {msg.connectUrl ? (
+          {msg.connect ? (
             <a
-              href={msg.connectUrl}
-              target="_blank"
-              rel="noopener noreferrer"
+              href="/api/calendar/connect"
               className="press inline-flex shrink-0 items-center gap-1 rounded-md border border-current px-2 py-0.5 text-[12px] font-semibold"
             >
               <Icon name="link" size={14} />

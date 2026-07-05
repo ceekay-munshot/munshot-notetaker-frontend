@@ -39,6 +39,7 @@ export default {
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
       if (method === "POST" && pathname === "/api/calendar/sync") return handleCalendarSync(request, env);
+      if (method === "GET" && pathname === "/api/calendar/connect") return handleCalendarConnect(request, env);
       if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/remove") return handleCalendarRemove(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/restore") return handleCalendarRestore(request, env);
@@ -892,6 +893,61 @@ async function handleCalendarSync(request, env) {
     return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
   } catch (err) {
     return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
+  }
+}
+
+// GET /api/calendar/connect — starts the calendar OAuth flow WITHOUT ever
+// exposing the backend to the browser. This is a top-level browser navigation
+// (the "Connect calendar" button), so it redirects rather than returns JSON.
+//
+// The backend's own sync response advertises a raw connect_url on an internal
+// host/port the browser can't reach (and shouldn't see). Instead we call the
+// backend's connect-start server-side, on the same API base as every other
+// call, capture wherever it wants to send the user (the OAuth provider's
+// consent page), and forward the browser straight there.
+async function handleCalendarConnect(request, env) {
+  const appRoot = new URL("/", request.url).toString();
+  const session = await getSession(request, env);
+  // Browser navigation, not an XHR — bounce back to the app (which shows the
+  // login screen) instead of returning a bare 401.
+  if (!session || session.isAdmin) return Response.redirect(appRoot, 302);
+  if (!env.API_KEY) return html("Calendar isn't configured on the server yet.", 500);
+
+  try {
+    const base = await resolveApiBase(env);
+    const target =
+      base + "/calendar/connect/start?email=" + encodeURIComponent(session.identity);
+    // Don't follow the redirect — we want to hand its target to the browser,
+    // not fetch it ourselves (and never leak the backend's own URL).
+    const upstream = await fetch(target, {
+      headers: { "X-API-Key": env.API_KEY },
+      redirect: "manual",
+    });
+
+    // Case 1: the backend 3xx-redirects to the OAuth provider → forward that.
+    const location = upstream.headers.get("Location");
+    if (upstream.status >= 300 && upstream.status < 400 && location) {
+      return Response.redirect(location, 302);
+    }
+
+    // Case 2: the backend returns JSON carrying the authorization URL.
+    const text = await upstream.text();
+    let authUrl = null;
+    try {
+      const data = JSON.parse(text);
+      authUrl =
+        data.authorize_url || data.auth_url || data.authUrl || data.connect_url ||
+        data.connectUrl || data.url || null;
+    } catch {
+      /* not JSON */
+    }
+    if (typeof authUrl === "string" && /^https?:\/\//i.test(authUrl)) {
+      return Response.redirect(authUrl, 302);
+    }
+
+    return html("Couldn't start calendar authorization. Please try again later.", 502);
+  } catch (err) {
+    return html("Couldn't reach the calendar service to start authorization.", 502);
   }
 }
 
