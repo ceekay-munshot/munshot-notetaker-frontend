@@ -39,8 +39,8 @@ interface AppData {
   // calendar
   calendarEvents: api.CalendarEvent[]
   calendarLoading: boolean
-  syncCalendar: () => Promise<void>
-  refreshCalendar: () => Promise<void>
+  syncCalendar: () => Promise<{ count: number; note?: string }>
+  refreshCalendar: () => Promise<api.CalendarEvent[]>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
   removeCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
   cancelledEvents: api.CalendarEvent[]
@@ -65,6 +65,19 @@ function normalizeCalendar(payload: any): api.CalendarEvent[] {
     ? payload
     : payload.calendar_events || payload.meetings || payload.events || payload.items || payload.calendar || []
   return Array.isArray(arr) ? arr : []
+}
+
+// Best-effort human note from the upstream /calendar/sync result body. The exact
+// shape isn't guaranteed, so we look at the common places a message/error could
+// live and surface the first non-empty string we find (kept short for the UI).
+function syncNote(result: unknown): string | undefined {
+  if (!result || typeof result !== 'object') return undefined
+  const r = result as Record<string, unknown>
+  for (const key of ['error', 'message', 'detail', 'status', 'note']) {
+    const v = r[key]
+    if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 200)
+  }
+  return undefined
 }
 
 export function AppDataProvider({ children }: { children: ReactNode }) {
@@ -121,18 +134,23 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
-  const refreshCalendar = useCallback(async () => {
+  // Returns the active (non-cancelled) events so callers (e.g. sync) can report
+  // the real outcome instead of assuming success.
+  const refreshCalendar = useCallback(async (): Promise<api.CalendarEvent[]> => {
     try {
       // Pull cancelled ones too, then split: active drive "Upcoming", cancelled
       // drive the "Removed" section (restore).
       const { calendar } = await api.calendarMeetings(true)
       const all = normalizeCalendar(calendar)
-      setCalendarEvents(all.filter((e) => String(e.status) !== 'cancelled'))
+      const active = all.filter((e) => String(e.status) !== 'cancelled')
+      setCalendarEvents(active)
       setCancelledEvents(all.filter((e) => String(e.status) === 'cancelled'))
+      return active
     } catch {
       /* keep prior events */
+      return calendarEvents
     }
-  }, [])
+  }, [calendarEvents])
 
   // Boot / re-boot whenever the signed-in user changes.
   useEffect(() => {
@@ -210,11 +228,16 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [refreshSchedules],
   )
 
-  const syncCalendar = useCallback(async () => {
+  // Runs the upstream sync, then reloads the calendar and reports what actually
+  // landed. A 200 from /calendar/sync only means the request was accepted — it
+  // does NOT guarantee any meetings were imported — so we return the resulting
+  // count (and any note the upstream sent) rather than assuming success.
+  const syncCalendar = useCallback(async (): Promise<{ count: number; note?: string }> => {
     setCalendarLoading(true)
     try {
-      await api.calendarSync()
-      await refreshCalendar()
+      const res = await api.calendarSync()
+      const events = await refreshCalendar()
+      return { count: events.length, note: syncNote(res?.result) }
     } finally {
       setCalendarLoading(false)
     }

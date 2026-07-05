@@ -195,8 +195,20 @@ export function SchedulesCard() {
           onClick={async () => {
             setMsg(null)
             try {
-              await syncCalendar()
-              setMsg({ kind: 'ok', text: 'Calendar synced.' })
+              const { count, note } = await syncCalendar()
+              if (count > 0) {
+                setMsg({ kind: 'ok', text: `Calendar synced — ${count} upcoming meeting${count === 1 ? '' : 's'}.` })
+              } else {
+                // The request succeeded but nothing came back. Say so honestly
+                // (and pass along any note the server sent) instead of a
+                // misleading "synced" with an empty list.
+                setMsg({
+                  kind: 'err',
+                  text: note
+                    ? `Synced, but no upcoming meetings found: ${note}`
+                    : 'Synced, but no upcoming meetings were found. Make sure your calendar is connected.',
+                })
+              }
             } catch {
               setMsg({ kind: 'err', text: 'Could not sync the calendar.' })
             }
