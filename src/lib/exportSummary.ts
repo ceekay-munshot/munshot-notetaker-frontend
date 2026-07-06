@@ -1,6 +1,45 @@
 import type { Episode, Podcast } from './types'
 import { formatDuration, longDate } from './format'
 import { cover, docFooter, downloadWord, esc, inline, leadParagraph, sanitizeFilename, section, wordShell } from './exportDoc'
+import { parseSummaryBlock, splitBulletLabel } from './summaryFormat'
+
+// Render the AI summary's light Markdown into Word HTML: the opening classification
+// prose in the cream lead box, each top-level **section** as a gold subhead, each
+// person / owner **sub-header** as a navy heading, and "- " lines as a real bullet
+// list (a bold thematic label kept distinct). Reuses the existing doc CSS classes,
+// and still reads cleanly for older prose-only summaries.
+function synthesisDocHtml(synthesis: string[]): string {
+  const blocks = synthesis.map(parseSummaryBlock)
+  let i = 0
+  const lead: string[] = []
+  while (i < blocks.length && !blocks[i].header && blocks[i].bullets.length === 0) {
+    lead.push(...blocks[i].paras)
+    i++
+  }
+  let html = ''
+  if (lead.length) {
+    html += `<div class="lead">${lead
+      .map((p, j) => `<p${j === lead.length - 1 ? ' class="last"' : ''}>${j === 0 ? leadParagraph(p) : inline(p)}</p>`)
+      .join('')}</div>`
+  }
+  for (; i < blocks.length; i++) {
+    const b = blocks[i]
+    if (b.header) {
+      html += b.isSection ? `<div class="subhead">${esc(b.header)}</div>` : `<div class="kpt-heading">${esc(b.header)}</div>`
+    }
+    if (b.paras.length) html += `<div class="prose">${b.paras.map((p) => `<p>${inline(p)}</p>`).join('')}</div>`
+    if (b.bullets.length) {
+      html += `<ul class="tlist">${b.bullets
+        .map((bl) => {
+          const { label, text } = splitBulletLabel(bl)
+          const body = label ? `<span class="ti">${esc(label)}:</span> ${inline(text)}` : inline(bl)
+          return `<li><span class="sq">&#9642;</span>${body}</li>`
+        })
+        .join('')}</ul>`
+    }
+  }
+  return html
+}
 
 // Builds the institution-grade single-episode Word document: a navy cover, then
 // AI Summary (lead) · Ideas Pitched · Highlights · Q&A.
@@ -9,11 +48,7 @@ export function summaryToWord(episode: Episode, podcast?: Podcast, logo?: string
   const s = episode.summary
 
   const synthesis = s?.synthesis ?? []
-  const summaryBody = synthesis.length
-    ? `<div class="lead">${synthesis
-        .map((p, i) => `<p${i === synthesis.length - 1 ? ' class="last"' : ''}>${i === 0 ? leadParagraph(p) : inline(p)}</p>`)
-        .join('')}</div>`
-    : ''
+  const summaryBody = synthesis.length ? synthesisDocHtml(synthesis) : ''
 
   // Concrete ideas pitched — the call, who made it, gold-diamond thesis bullets.
   const ideas = s?.ideas ?? []
