@@ -393,7 +393,7 @@ async function loadTitlesFor(env, segments) {
 // only (shared across all co-owners); bump the version suffix to invalidate every
 // cached summary at once after a summary-format change.
 function summaryCacheKey(meetingId) {
-  return `summary:v1:${String(meetingId).trim()}`;
+  return `summary:v2:${String(meetingId).trim()}`;
 }
 
 // KV key for a meeting's AI-generated display title. Ad-hoc meetings arrive with
@@ -459,10 +459,21 @@ function buildTranscriptText(rows) {
 }
 
 // ── Detailed summary (multi-call) ──────────────────────────────────────────────
-// A summary is built from several OpenAI calls for depth: one for the overview +
-// decisions/action items, then one per participant capturing — step by step —
-// what that person actually said and did (not a vague one-liner). The pieces are
-// stitched into Markdown (bold section titles + "- " bullets) the dashboard renders.
+// The summary is assembled from several OpenAI calls, mirroring the structure of a
+// NotebookLM-style briefing: (1) a one-line meeting classification + a rich
+// narrative overview, (2) one thematic, per-participant breakdown per speaker, and
+// (3) the action items organised BY OWNER (the "task tracking" view). The pieces are
+// stitched into the light Markdown (bold **titles**, "- " bullets) that the
+// dashboard, PDF, Word, and email renderers all understand.
+
+// Every call gets the same guardrails: the transcript is auto-generated from mixed
+// Hindi/English speech, so it carries speech-to-text errors — especially in proper
+// nouns. The model must repair those from context and never invent anything.
+const TRANSCRIPT_CAVEAT =
+  "Work ONLY from the transcript — never invent names, numbers, decisions, deadlines, or owners. " +
+  "The transcript is auto-generated from mixed Hindi/English speech and contains speech-to-text errors, " +
+  "especially in proper nouns (people, companies, products, tools, clients): infer the most likely intended " +
+  "spelling from context and use it consistently. Translate everything into clear, professional English.";
 
 async function openaiChat(apiKey, model, messages, maxTokens, temperature = 0.2) {
   const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -492,48 +503,51 @@ async function generateDetailedSummary(rows, apiKey, model) {
   const transcript = buildTranscriptText(rows);
   const speakers = distinctSpeakers(rows);
 
-  // 1) Overview prose (no header, so it reads clean as a teaser) + decisions.
+  // 1) A one-line meeting classification + a rich, narrative overview.
   const overviewPromise = openaiChat(apiKey, model, [
     {
       role: "system",
       content:
-        "You are a precise meeting analyst. Use ONLY the transcript; never invent names, numbers, decisions, or owners. " +
-        "Use **bold** for section titles — never # headings.",
+        "You are an expert meeting analyst who writes crisp, information-dense briefings in the style of a top " +
+        "research assistant. " + TRANSCRIPT_CAVEAT + " Use **bold** for emphasis and section titles; never use # headings.",
     },
     {
       role: "user",
       content:
-        "From the meeting transcript, write:\n\n" +
-        "First, a 2-3 sentence overview — purpose, main topics, outcome. Concise; no header before it.\n\n" +
-        "Then a blank line, then this section:\n\n" +
-        "**Decisions & Action Items**\n" +
-        'Short bullets ("- " per line), one decision or action item each, with the owner/deadline in parentheses when the ' +
-        'transcript states them (e.g. "- Multiselect filter options (Owner: Tarandeep)."). Keep each to a phrase, not a ' +
-        'sentence. If there were none, write "- None recorded."\n\n' +
-        "Output only that.\n\nTRANSCRIPT:\n" + transcript,
+        "Write two things from the meeting transcript:\n\n" +
+        "1) ONE opening sentence that classifies the meeting and states its focus, with the meeting type in " +
+        '**bold** — e.g. "This was an **Internal Operations & Dashboard Sync** focused on reviewing client ' +
+        'dashboards and standardising customer reporting." No header before this sentence.\n\n' +
+        "2) A blank line, then exactly this section:\n\n" +
+        "**Meeting Summary**\n" +
+        "A flowing 4–6 sentence narrative covering the context and purpose, the main topics with the specific " +
+        "tools / products / dashboards / clients named, the key protocols or decisions established, and the " +
+        "outcome. Prose, not bullets.\n\n" +
+        "Output only those two parts.\n\nTRANSCRIPT:\n" + transcript,
     },
-  ], 900);
+  ], 700);
 
-  // 2) One detailed, step-by-step call per participant (run in parallel).
+  // 2) One thematic, per-participant breakdown per speaker (run in parallel).
   const perPersonPrompt = (name) => [
     {
       role: "system",
       content:
-        "You are a sharp meeting summarizer who writes terse, minimalist notes. Summarize one person's contribution in your " +
-        "own words from the transcript only — never quote or transcribe. Keep all the substance; cut every word you can.",
+        "You summarize one participant's contribution to a meeting as tight, thematic notes, in your own words " +
+        "from the transcript only — never quote or transcribe. " + TRANSCRIPT_CAVEAT + " Keep every specific " +
+        "(features, tools, numbers, clients, decisions, deadlines); cut filler. Use **bold** only for the short " +
+        "label that opens each bullet.",
     },
     {
       role: "user",
       content:
-        `In terse note form, summarize everything ${name} contributed — what they explained, proposed, asked, demonstrated, ` +
-        "or decided — as short bullets, in order.\n\n" +
+        `Summarize everything ${name} contributed, grouped by theme.\n\n` +
         "Style:\n" +
-        "- Minimalist meeting notes, NOT prose. Each bullet = a compact fragment (drop filler words, articles, hedging). " +
-        "No full-sentence padding.\n" +
-        "- Cut WORDS, never INFORMATION — keep every specific: features, tools, numbers, names, reasons, decisions.\n" +
-        "- One idea per bullet. Merge related lines; a multi-step walkthrough → one short bullet per step.\n" +
-        "- Skip pleasantries (okay / sure / can you see my screen). No quotes. Don't prefix bullets with the name.\n" +
-        `- If ${name} barely spoke, one bullet.\n\n` +
+        "- Format every bullet exactly as: - **<Theme>:** <note>\n" +
+        "- <Theme> is a 1–3 word label naming the topic (e.g. Data Correction, CG Checklist, Storage Strategy, New Projects).\n" +
+        "- Merge related remarks under one theme; one theme per bullet; keep the order they arose.\n" +
+        "- Keep all substance — tools, numbers, clients, reasons, decisions — but drop pleasantries and hedging. " +
+        "No quotes. Don't repeat the person's name.\n" +
+        `- If ${name} barely spoke, a single bullet is fine.\n\n` +
         'Output: Markdown "- " bullets only. No heading, no preamble.\n\n' +
         "TRANSCRIPT:\n" + transcript,
     },
@@ -553,12 +567,12 @@ async function generateDetailedSummary(rows, apiKey, model) {
       apiKey,
       model,
       [
-        { role: "system", content: "Sharp summarizer who writes terse, minimalist notes from the transcript only; never quote or transcribe." },
+        { role: "system", content: "You write tight, thematic meeting notes from the transcript only; never quote or transcribe. " + TRANSCRIPT_CAVEAT },
         {
           role: "user",
           content:
-            "In terse note form, summarize what happened — key topics, points, decisions — as short Markdown bullets, in " +
-            "order. Compact fragments, no filler, no quotes; cut words, not information.\n\nTRANSCRIPT:\n" + transcript,
+            "In thematic note form, summarize what happened — group by topic, each bullet as - **<Theme>:** <note>, " +
+            "in the order things arose. Keep every specific; no filler, no quotes.\n\nTRANSCRIPT:\n" + transcript,
         },
       ],
       900
@@ -567,7 +581,34 @@ async function generateDetailedSummary(rows, apiKey, model) {
       .catch(() => [{ name: "", notes: "- (Notes unavailable)" }]);
   }
 
-  const [overviewMd, people] = await Promise.all([overviewPromise, peoplePromise]);
+  // 3) The action items, organised BY OWNER — the task-tracking view.
+  const todosPromise = openaiChat(apiKey, model, [
+    {
+      role: "system",
+      content:
+        "You extract the concrete action items from a meeting and organise them BY OWNER. " + TRANSCRIPT_CAVEAT +
+        " Use **bold** for the owner sub-headers and for each task's short label.",
+    },
+    {
+      role: "user",
+      content:
+        "List the actionable to-dos from the transcript, grouped by the person responsible.\n\n" +
+        "Format:\n" +
+        "- For each owner, a sub-header line on its own: **For <Name>:**\n" +
+        "- Under it, one or more bullets, each exactly: - **<Task>:** <specific action, including any deadline, " +
+        "client, or condition stated>.\n" +
+        "- <Task> is a 1–4 word label. Keep tasks concrete; include timing verbatim when stated (e.g. by tonight, " +
+        "before Thursday's call, 9 PM daily).\n" +
+        "- Separate each owner group with a blank line. Order owners by how much they were assigned; include only " +
+        "people actually given tasks.\n" +
+        "- If the whole team was given a shared task, end with a **General Team Requirement** sub-header and its bullet(s).\n" +
+        "- If no action items were recorded at all, output exactly: - None recorded.\n\n" +
+        "Start directly with the first **For <Name>:** line — no other heading, no preamble.\n\n" +
+        "TRANSCRIPT:\n" + transcript,
+    },
+  ], 1100);
+
+  const [overviewMd, people, todosMd] = await Promise.all([overviewPromise, peoplePromise, todosPromise]);
 
   let md = String(overviewMd || "").trim();
   if (speakers.length) {
@@ -576,6 +617,8 @@ async function generateDetailedSummary(rows, apiKey, model) {
   } else {
     md += `\n\n**Detailed Discussion**\n${String((people[0] && people[0].notes) || "").trim()}`;
   }
+  const todos = String(todosMd || "").trim();
+  if (todos) md += `\n\n**Actionable To-Dos**\n\n${todos}`;
   return md.trim();
 }
 
@@ -625,7 +668,7 @@ async function handleAiChat(request, env) {
   const rows = (res && res.results) || [];
   if (!rows.length) return json({ error: "No transcript found for that meeting yet" }, 404);
 
-  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  const model = env.OPENAI_MODEL || "gpt-4o";
   // A summary request runs the richer multi-call pipeline (overview + decisions,
   // then detailed per-person notes) for far more depth than a single call.
   if (summarize) {
@@ -831,7 +874,7 @@ async function handleWeeklyPeople(request, env) {
     },
   ];
 
-  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  const model = env.OPENAI_MODEL || "gpt-4o";
   let upstream;
   try {
     upstream = await fetch("https://api.openai.com/v1/chat/completions", {

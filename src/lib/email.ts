@@ -3,6 +3,7 @@ import { esc } from './exportDoc'
 import { weeklyReportTitle } from './reportName'
 import { formatDuration, longDate } from './format'
 import { groupQuantByEpisode } from './weeklyQuant'
+import { parseSummaryBlock } from './summaryFormat'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Email delivery — the real wiring behind the Weekly-brief subscription seam.
@@ -497,6 +498,52 @@ function qaBlockHtml(qa: QAItem[]): string {
     .join('')
 }
 
+// Render the AI summary's light Markdown as structured email HTML: the opening
+// classification prose sits in the cream call-out, each top-level **section** is a
+// gold label, each person / owner **sub-header** is bold navy, and "- " lines
+// become a real bullet list. Mirrors the in-app SummaryBody + the Word/PDF exports
+// (and still reads cleanly for older, prose-only cached summaries).
+function synthesisEmailHtml(synthesis: string[]): string {
+  if (!synthesis.length) return ''
+  const blocks = synthesis.map(parseSummaryBlock)
+  const para = (p: string, last: boolean) =>
+    `<p style="font-family:${SANS};font-size:14px;line-height:1.62;color:${C.prose};margin:0 0 ${last ? '0' : '9px'};">${richInline(p)}</p>`
+  const bulletList = (items: string[]) =>
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:2px 0 6px;">${items
+      .map(
+        (b) =>
+          `<tr><td style="font-family:${SANS};font-size:14px;line-height:1.55;color:${C.body};padding:0 0 6px;vertical-align:top;"><span style="color:${C.gold};font-weight:700;">&bull;</span>&nbsp;&nbsp;${richInline(
+            b,
+          )}</td></tr>`,
+      )
+      .join('')}</table>`
+
+  // Lead = the run of header-less prose at the very top (the standfirst), boxed.
+  let i = 0
+  const leadParas: string[] = []
+  while (i < blocks.length && !blocks[i].header && blocks[i].bullets.length === 0) {
+    leadParas.push(...blocks[i].paras)
+    i++
+  }
+  let html = ''
+  if (leadParas.length) {
+    html += `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${C.cream};border-left:3px solid ${C.gold};margin:0 0 6px;"><tr><td style="padding:14px 18px;">${leadParas
+      .map((p, j) => para(p, j === leadParas.length - 1))
+      .join('')}</td></tr></table>`
+  }
+  for (; i < blocks.length; i++) {
+    const b = blocks[i]
+    if (b.header) {
+      html += b.isSection
+        ? sectionLabel(b.header)
+        : `<div style="font-family:${SANS};font-weight:700;font-size:14px;color:${C.ink};margin:14px 0 5px;">${esc(b.header)}</div>`
+    }
+    b.paras.forEach((p, j) => (html += para(p, j === b.paras.length - 1 && !b.bullets.length)))
+    if (b.bullets.length) html += bulletList(b.bullets)
+  }
+  return html
+}
+
 /** Render a single episode's summary as a designed HTML email (mirrors the
  *  Word/PDF export). Returns '' when the episode has no summary to send. */
 export function episodeBriefEmailHtml(episode: Episode, podcast?: Podcast): string {
@@ -508,17 +555,9 @@ export function episodeBriefEmailHtml(episode: Episode, podcast?: Podcast): stri
       <div style="font-family:${SANS};font-size:11px;color:#8794a8;margin-top:9px;">Read the full episode — highlights, transcript, and sources — on <a href="${MUNS_DASHBOARD}" style="color:${C.gold};font-weight:700;text-decoration:none;">Munshot</a></div>
     </td></tr></table>`
 
-  // AI Summary — the readable one-page synthesis (lead in the cream call-out).
-  const summary = s.synthesis.length
-    ? `${sectionLabel('AI Summary')}<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:${C.cream};border-left:3px solid ${C.gold};"><tr><td style="padding:14px 18px;">${s.synthesis
-        .map(
-          (p, i) =>
-            `<p style="font-family:${SANS};font-size:14px;line-height:1.62;color:${C.prose};margin:0 0 ${
-              i === s.synthesis.length - 1 ? '0' : '9px'
-            };">${richInline(p)}</p>`,
-        )
-        .join('')}</td></tr></table>`
-    : ''
+  // AI Summary — the readable one-page synthesis (classification standfirst in the
+  // cream call-out, then per-person + per-owner sections rendered structurally).
+  const summary = s.synthesis.length ? sectionLabel('AI Summary') + synthesisEmailHtml(s.synthesis) : ''
 
   const insight = s.insight ? sectionLabel('Investable Insight') + insightBlock(s.insight) : ''
 
