@@ -90,7 +90,7 @@ npx wrangler secret put API_KEY
 
 # 3. Enable the Meeting Assistant (paste your OpenAI API key when prompted)
 npx wrangler secret put OPENAI_API_KEY
-#    (optional) override the model — defaults to gpt-4o-mini
+#    (optional) override the model — defaults to gpt-4o
 #    npx wrangler secret put OPENAI_MODEL
 
 # 4. (optional) Require a code to register, to keep signups closed
@@ -105,7 +105,7 @@ Local dev: put secrets in a `.dev.vars` file (git-ignored) and run `npx wrangler
 ```
 API_KEY=vxa_bot_...
 OPENAI_API_KEY=sk-...
-# OPENAI_MODEL=gpt-4o-mini
+# OPENAI_MODEL=gpt-4o
 # SIGNUP_CODE=letmein
 ```
 

@@ -668,7 +668,7 @@ async function handleAiChat(request, env) {
   const rows = (res && res.results) || [];
   if (!rows.length) return json({ error: "No transcript found for that meeting yet" }, 404);
 
-  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  const model = env.OPENAI_MODEL || "gpt-4o";
   // A summary request runs the richer multi-call pipeline (overview + decisions,
   // then detailed per-person notes) for far more depth than a single call.
   if (summarize) {
@@ -874,7 +874,7 @@ async function handleWeeklyPeople(request, env) {
     },
   ];
 
-  const model = env.OPENAI_MODEL || "gpt-4o-mini";
+  const model = env.OPENAI_MODEL || "gpt-4o";
   let upstream;
   try {
     upstream = await fetch("https://api.openai.com/v1/chat/completions", {
