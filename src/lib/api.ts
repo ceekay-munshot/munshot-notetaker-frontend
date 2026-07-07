@@ -85,11 +85,19 @@ export function logout(): Promise<{ ok: boolean }> {
   return request('/api/logout', { method: 'POST' })
 }
 
-/** Trigger a password reset: the server emails a working temporary password to
- *  the address (if an account exists). Always resolves the same way regardless
- *  of whether the account exists, so it can't be used to probe registrations. */
+/** Step 1 of a password reset: the server emails a single-use, 15-minute 5-digit
+ *  code to the address (if an account exists) — the account's password is left
+ *  unchanged until step 2. Always resolves the same way regardless of whether the
+ *  account exists, so it can't be used to probe registrations. */
 export function forgotPassword(email: string): Promise<{ ok: boolean }> {
   return request('/api/forgot-password', { method: 'POST', body: JSON.stringify({ email }) })
+}
+
+/** Step 2 of a password reset: verify the emailed code and set a new password.
+ *  The code is single-use, attempt-limited, and expiring; a wrong/expired code
+ *  comes back as ApiError("Invalid or expired reset code"). */
+export function resetPassword(email: string, code: string, password: string): Promise<{ ok: boolean }> {
+  return request('/api/reset-password', { method: 'POST', body: JSON.stringify({ email, code, password }) })
 }
 
 // ── Meetings (transcripts → Episode/Podcast model) ──────────────────────────────
