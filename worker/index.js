@@ -21,6 +21,9 @@ const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
 const MAX_SCHEDULE_ATTEMPTS = 3; // give up on a failing one-time send after this many cron ticks
+const RESET_CODE_TTL = 15 * 60; // password-reset code lifetime, seconds (15 min)
+const RESET_MAX_ATTEMPTS = 5; // wrong-code tries before a reset code is burned
+const RESET_RESEND_COOLDOWN_MS = 60_000; // ignore a repeat "send code" within this window
 const RECURRENCES = ["once", "daily", "weekdays", "weekly"];
 
 export default {
@@ -34,6 +37,7 @@ export default {
       if (method === "POST" && pathname === "/api/register") return handleRegister(request, env);
       if (method === "POST" && pathname === "/api/login") return handleLogin(request, env);
       if (method === "POST" && pathname === "/api/forgot-password") return handleForgotPassword(request, env);
+      if (method === "POST" && pathname === "/api/reset-password") return handleResetPassword(request, env);
       if (method === "POST" && pathname === "/api/logout") return handleLogout(request, env);
       if (method === "POST" && pathname === "/api/join") return handleBot(request, env, "join");
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
@@ -182,12 +186,17 @@ async function handleLogin(request, env) {
   return json({ ok: true, email }, 200, { "Set-Cookie": cookie });
 }
 
-// "Forgot password" — the user enters their email and we email them working
-// credentials. Passwords are stored hashed (never recoverable), so we mint a
-// fresh temporary password, email it via the Muns raw email API, and only then
-// swap the account's hash over to it — that way a delivery failure leaves the
-// old password intact. Responds the same way whether or not the account exists,
-// so it can't be used to probe which emails are registered.
+// KV key holding a pending password-reset code for an email (hashed, TTL'd).
+function resetCodeKey(email) {
+  return `reset:${normalizeEmail(email)}`;
+}
+
+// "Forgot password" step 1 — email a short-lived, single-use reset CODE. The
+// account's existing password is left untouched; the code only authorizes a
+// password change via /api/reset-password. Codes are stored HASHED in KV with a
+// hard TTL, so a KV leak never exposes a usable code and a stale code self-
+// destructs. Responds the same way whether or not the account exists, so it can't
+// be used to probe which emails are registered.
 async function handleForgotPassword(request, env) {
   const body = await request.json().catch(() => ({}));
   const email = normalizeEmail(body.email);
@@ -199,32 +208,115 @@ async function handleForgotPassword(request, env) {
     if (!env.MUNS_TOKEN) {
       return json({ error: "Email isn't configured on the server yet" }, 500);
     }
-    const user = JSON.parse(raw);
-    const tempPassword = generateTempPassword();
 
+    // Throttle repeat sends so the reset can't be used to email-bomb an address:
+    // if a code was issued moments ago, don't mint/send another.
+    const existing = await env.KV.get(resetCodeKey(email));
+    if (existing) {
+      try {
+        const prev = JSON.parse(existing);
+        if (prev && typeof prev.createdAt === "number" && Date.now() - prev.createdAt < RESET_RESEND_COOLDOWN_MS) {
+          return json({ ok: true });
+        }
+      } catch {
+        /* corrupt entry — fall through and mint a fresh one */
+      }
+    }
+
+    const code = generateResetCode();
     try {
       await sendMunsEmail(env, {
         email,
-        subject: "Your Munshot Notetaker password",
+        subject: "Your Munshot password reset code",
         text:
-          "Here are your login details for Munshot Notetaker:\n\n" +
-          `Email: ${email}\n` +
-          `Temporary password (5-digit code): ${tempPassword}\n\n` +
-          "Sign in with this code. You can keep using it, or set a new account " +
-          "password later.",
+          "Use this code to reset your Munshot Notetaker password:\n\n" +
+          `Reset code: ${code}\n\n` +
+          "Enter it on the reset screen along with your new password. The code " +
+          "expires in 15 minutes and can be used once. If you didn't request this, " +
+          "you can ignore this email — your password hasn't changed.",
       });
     } catch (err) {
       return json({ error: "Couldn't send the email. Please try again." }, 502);
     }
 
-    // Delivery succeeded — now make the emailed password the live one.
+    // Delivery succeeded — store the code HASHED (PBKDF2 + per-code salt) with a
+    // hard TTL so it can't outlive its window even if it's never used.
     const saltBytes = crypto.getRandomValues(new Uint8Array(16));
-    user.salt = toHex(saltBytes);
-    user.hash = await deriveHash(tempPassword, saltBytes);
-    await env.KV.put(`user:${email}`, JSON.stringify(user));
+    const entry = {
+      salt: toHex(saltBytes),
+      hash: await deriveHash(code, saltBytes),
+      expiresAt: Date.now() + RESET_CODE_TTL * 1000,
+      attempts: 0,
+      createdAt: Date.now(),
+    };
+    await env.KV.put(resetCodeKey(email), JSON.stringify(entry), { expirationTtl: RESET_CODE_TTL });
   }
 
   // Generic response regardless of whether the account existed.
+  return json({ ok: true });
+}
+
+// "Forgot password" step 2 — verify the emailed code and set a NEW password. The
+// code is single-use and attempt-limited; on success we swap the account's hash
+// and burn the code. Every "can't use this code" case returns the same generic
+// message, so a wrong email and a wrong code are indistinguishable (no
+// enumeration). The new password must meet the same policy as registration.
+async function handleResetPassword(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const email = normalizeEmail(body.email);
+  const code = String(body.code || "").trim();
+  const password = String(body.password || "");
+
+  if (!email || !code || !password) return json({ error: "Email, code, and new password are required" }, 400);
+  if (!isValidEmail(email)) return json({ error: "Enter a valid email address" }, 400);
+  if (password.length < 6) return json({ error: "Password must be at least 6 characters" }, 400);
+
+  const key = resetCodeKey(email);
+  const rawEntry = await env.KV.get(key);
+  const rawUser = await env.KV.get(`user:${email}`);
+  const invalid = () => json({ error: "Invalid or expired reset code" }, 400);
+  if (!rawEntry || !rawUser) return invalid();
+
+  let entry;
+  try {
+    entry = JSON.parse(rawEntry);
+  } catch {
+    await env.KV.delete(key);
+    return invalid();
+  }
+  if (!entry || typeof entry.expiresAt !== "number" || Date.now() > entry.expiresAt) {
+    await env.KV.delete(key);
+    return invalid();
+  }
+  if ((entry.attempts || 0) >= RESET_MAX_ATTEMPTS) {
+    await env.KV.delete(key);
+    return json({ error: "Too many attempts. Request a new reset code." }, 429);
+  }
+
+  const computed = await deriveHash(code, fromHex(String(entry.salt || "")));
+  if (!timingSafeEqual(computed, String(entry.hash || ""))) {
+    // Wrong code — count the attempt and keep the code alive (still self-
+    // destructing) with its remaining TTL, until it's burned through or expires.
+    entry.attempts = (entry.attempts || 0) + 1;
+    const remaining = Math.max(1, Math.ceil((entry.expiresAt - Date.now()) / 1000));
+    await env.KV.put(key, JSON.stringify(entry), { expirationTtl: remaining });
+    return invalid();
+  }
+
+  // Code is good — set the new password and burn the code (single use).
+  let user;
+  try {
+    user = JSON.parse(rawUser);
+  } catch {
+    await env.KV.delete(key);
+    return invalid();
+  }
+  const saltBytes = crypto.getRandomValues(new Uint8Array(16));
+  user.salt = toHex(saltBytes);
+  user.hash = await deriveHash(password, saltBytes);
+  await env.KV.put(`user:${email}`, JSON.stringify(user));
+  await env.KV.delete(key);
+
   return json({ ok: true });
 }
 
@@ -1579,11 +1671,10 @@ function parseCookies(request) {
   return out;
 }
 
-// A short numeric temporary password emailed for a reset: a 5-digit code
-// (00000–99999), so it's easy to read out of an email and type. Only login uses
-// it, and login does NOT enforce the register flow's 6-character minimum, so a
-// 5-digit code still signs in fine.
-function generateTempPassword() {
+// A short numeric password-reset code: 5 digits (00000–99999), easy to read out
+// of an email and type. It is never the account password — it only authorizes a
+// password change — and it's single-use with a 15-minute expiry.
+function generateResetCode() {
   // Uniform 0–99999, zero-padded to a fixed 5 digits (e.g. "04821"). The minute
   // modulo bias over a 32-bit draw is irrelevant for a one-off reset code.
   const n = crypto.getRandomValues(new Uint32Array(1))[0] % 100000;
