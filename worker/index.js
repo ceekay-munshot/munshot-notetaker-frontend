@@ -961,10 +961,46 @@ async function handleCalendarSync(request, env) {
       body: JSON.stringify({ email: session.identity }),
     });
     const result = await readUpstreamJson(upstream);
+    // A revoked/expired Google grant comes back from the calendar service as a 5xx
+    // whose detail points at oauth2.googleapis.com/token / invalid_grant. That's not
+    // a server fault — the user just needs to re-authorize — so normalize it into
+    // the same "needs connect" shape the not-connected case uses (a connect_url the
+    // dashboard turns into a Reconnect prompt) instead of a dead-end 502.
+    if (!upstream.ok && isReauthNeeded(result)) {
+      return json({
+        ok: true,
+        status: upstream.status,
+        result: {
+          connected: false,
+          connect_url: calendarConnectEndpoint(env),
+          detail: "Calendar authorization expired — reconnect your Google Calendar to keep syncing.",
+          upstream_detail: reauthDetail(result),
+        },
+      });
+    }
     return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
   } catch (err) {
     return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
   }
+}
+
+// The stringified detail of an upstream calendar error, wherever it lives.
+function reauthDetail(result) {
+  const s =
+    result && typeof result === "object"
+      ? String(result.detail || result.error || result.raw || "")
+      : String(result || "");
+  return s.slice(0, 300);
+}
+
+// True when a failed /calendar/sync is a Google-authorization problem (revoked or
+// expired grant) rather than a server/gateway fault — i.e. the user should be sent
+// back through OAuth. Deliberately NARROW so a genuine 5xx (gateway "error code:
+// 502", a missing system API key, etc.) still surfaces as an error, not a reconnect.
+function isReauthNeeded(result) {
+  return /invalid_grant|oauth2\.googleapis|refresh token|re-?authori|reconnect|revoked|token (?:expired|invalid)|unauthorized_client/i.test(
+    reauthDetail(result)
+  );
 }
 
 // GET /api/calendar/connect — starts the calendar Google-auth flow. This is a
