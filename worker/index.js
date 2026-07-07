@@ -250,13 +250,30 @@ function fallbackApiBase(env) {
   }
 }
 
-// The effective base URL every bot/calendar call is sent to: the KV override if
-// an admin set one, else the configured fallback. All endpoints (/public/join,
-// /public/leave, /calendar/*) are built from this single head.
+// The effective base URL the bot/schedule calls are sent to: the KV override if an
+// admin set one, else the configured fallback. The notetaker endpoints
+// (/public/join, /public/leave) are built from this head. Calendar calls do NOT
+// use this base — the calendar service runs on its own HTTPS host (see
+// calendarApiBase / calendarConnectEndpoint below).
+
 // The calendar connect-start URL (browser-facing). Configurable so the host can
 // change without a redeploy; defaults to the tested endpoint.
 function calendarConnectEndpoint(env) {
   return env.CALENDAR_CONNECT_ENDPOINT || DEFAULT_CALENDAR_CONNECT_ENDPOINT;
+}
+
+// The calendar SERVICE's API base for the server-side sync / meetings calls. The
+// calendar service runs on its own HTTPS host on the default port — a DIFFERENT
+// origin from the bot API (http, :8080) — so we derive it from the connect
+// endpoint's origin (verified against the live box: POST
+// https://65.1.101.15.nip.io/calendar/sync). This keeps every calendar call (OAuth
+// connect, sync, meetings) pointed at the same host.
+function calendarApiBase(env) {
+  try {
+    return new URL(calendarConnectEndpoint(env)).origin;
+  } catch {
+    return new URL(DEFAULT_CALENDAR_CONNECT_ENDPOINT).origin;
+  }
 }
 
 async function resolveApiBase(env) {
@@ -937,7 +954,7 @@ async function handleCalendarSync(request, env) {
   if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   try {
-    const base = await resolveApiBase(env);
+    const base = calendarApiBase(env);
     const upstream = await fetch(base + "/calendar/sync", {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
@@ -956,9 +973,9 @@ async function handleCalendarSync(request, env) {
 // OAuth dance in the browser (consent → callback) and links the calendar.
 //
 // The email comes from the SESSION (never the client) so the connected calendar
-// is tied to the right account. Note this is a dedicated HTTPS endpoint on the
-// default port — NOT the :8080 API base the server-side calls use — so it's set
-// separately (calendarConnectEndpoint), overridable via CALENDAR_CONNECT_ENDPOINT.
+// is tied to the right account. This HTTPS host (default port) is the calendar
+// service — the same origin the server-side sync / meetings calls now use
+// (calendarApiBase), set via CALENDAR_CONNECT_ENDPOINT.
 async function handleCalendarConnect(request, env) {
   const appRoot = new URL("/", request.url).toString();
   const session = await getSession(request, env);
@@ -979,7 +996,7 @@ async function handleCalendarMeetings(request, env) {
   if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   try {
-    const base = await resolveApiBase(env);
+    const base = calendarApiBase(env);
     const includeCancelled = new URL(request.url).searchParams.get("include_cancelled") === "true";
     const target =
       base + "/calendar/meetings?email=" + encodeURIComponent(session.identity) +
@@ -1006,7 +1023,7 @@ async function handleCalendarRemove(request, env) {
     return json({ error: "event_id is required" }, 400);
   }
   try {
-    const base = await resolveApiBase(env);
+    const base = calendarApiBase(env);
     const upstream = await fetch(base + "/calendar/meetings/remove", {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
@@ -1033,7 +1050,7 @@ async function handleCalendarRestore(request, env) {
     return json({ error: "event_id is required" }, 400);
   }
   try {
-    const base = await resolveApiBase(env);
+    const base = calendarApiBase(env);
     const upstream = await fetch(base + "/calendar/meetings/restore", {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
