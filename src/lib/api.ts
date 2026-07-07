@@ -143,12 +143,14 @@ function summaryFromReply(reply: string): Summary {
  *  or naming failed. */
 export async function summarizeMeeting(
   episode: Episode,
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; hasName?: boolean },
 ): Promise<{ summary: Summary; title?: string }> {
   const { owner, meetingId } = decodeMeetingId(episode.id)
+  // has_name tells the Worker the meeting already carries a real (calendar) name,
+  // so it should NOT mint an AI title — only nameless meetings get one.
   const data = await request<{ ok: boolean; reply?: string; title?: string }>('/api/ai', {
     method: 'POST',
-    body: JSON.stringify({ meeting_id: meetingId, owner, summarize: true, force: !!opts?.force }),
+    body: JSON.stringify({ meeting_id: meetingId, owner, summarize: true, force: !!opts?.force, has_name: !!opts?.hasName }),
   })
   const title = typeof data.title === 'string' ? data.title.trim() : ''
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }

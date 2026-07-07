@@ -3,6 +3,7 @@ import type { ReactNode } from 'react'
 import type { Episode, Podcast, WeeklySummary } from '../lib/types'
 import type { Identity } from '../lib/munshot'
 import * as api from '../lib/api'
+import { decodeMeetingId } from '../lib/meetings'
 import { useAuth } from './Auth'
 
 // The provider loads every meeting the signed-in user can see (GET /api/transcripts,
@@ -176,26 +177,57 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.status, email, isAdmin])
 
-  const podcastById = useCallback((id: string) => podcasts.find((p) => p.id === id), [podcasts])
-  const episodeById = useCallback((id: string) => episodes.find((e) => e.id === id), [episodes])
+  // A meeting synced from the calendar keeps the name it has THERE — only a
+  // meeting with no name gets an AI-minted title. Build meeting_id -> calendar
+  // name from the loaded events (active + cancelled: a meeting can be transcribed
+  // after it's removed), then overlay it so the real name wins over any AI title
+  // in every view, export, and email that reads the episode/podcast title.
+  const calendarTitleById = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const ev of [...calendarEvents, ...cancelledEvents]) {
+      const id = ev.meeting_id != null ? String(ev.meeting_id).trim() : ''
+      const name = String(ev.title || ev.summary || '').trim()
+      if (id && name && name.toLowerCase() !== 'meeting' && !m.has(id)) m.set(id, name)
+    }
+    return m
+  }, [calendarEvents, cancelledEvents])
+
+  const applyCalendarName = useCallback(
+    <T extends { id: string; title: string }>(item: T): T => {
+      if (!calendarTitleById.size) return item
+      const cal = calendarTitleById.get(decodeMeetingId(item.id).meetingId)
+      return cal && cal !== item.title ? { ...item, title: cal } : item
+    },
+    [calendarTitleById],
+  )
+
+  const displayEpisodes = useMemo(() => episodes.map(applyCalendarName), [episodes, applyCalendarName])
+  const displayPodcasts = useMemo(() => podcasts.map(applyCalendarName), [podcasts, applyCalendarName])
+
+  const podcastById = useCallback((id: string) => displayPodcasts.find((p) => p.id === id), [displayPodcasts])
+  const episodeById = useCallback((id: string) => displayEpisodes.find((e) => e.id === id), [displayEpisodes])
   const episodesByPodcast = useCallback(
-    (podcastId: string) => episodes.filter((e) => e.podcastId === podcastId),
-    [episodes],
+    (podcastId: string) => displayEpisodes.filter((e) => e.podcastId === podcastId),
+    [displayEpisodes],
   )
 
   const summarizeEpisode = useCallback(async (episode: Episode, _podcast?: Podcast, opts?: { force?: boolean }) => {
     if ((episode.summary && !opts?.force) || summarizing.current.has(episode.id)) return
     summarizing.current.add(episode.id)
     setEpisodes((prev) => prev.map((e) => (e.id === episode.id ? { ...e, status: 'summarizing' } : e)))
+    // If the meeting already has a calendar name, don't let the worker mint (or
+    // us apply) an AI title — the calendar name is authoritative.
+    const hasName = calendarTitleById.has(decodeMeetingId(episode.id).meetingId)
     try {
-      const { summary, title } = await api.summarizeMeeting(episode, { force: opts?.force })
+      const { summary, title } = await api.summarizeMeeting(episode, { force: opts?.force, hasName })
+      const named = !hasName && title ? title : undefined
       setEpisodes((prev) =>
-        prev.map((e) => (e.id === episode.id ? { ...e, status: 'ready', summary, title: title || e.title } : e)),
+        prev.map((e) => (e.id === episode.id ? { ...e, status: 'ready', summary, title: named || e.title } : e)),
       )
       // A freshly-minted name replaces the "Meeting <id>" fallback across this
       // session (some views read the podcast title). It's already stored
       // server-side, so any reload — for any user — shows it too.
-      if (title) setPodcasts((prev) => prev.map((p) => (p.id === episode.id ? { ...p, title } : p)))
+      if (named) setPodcasts((prev) => prev.map((p) => (p.id === episode.id ? { ...p, title: named } : p)))
       setNeedsApiKey(false)
     } catch (err) {
       if (err instanceof api.ApiError && err.status === 503) {
@@ -207,7 +239,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     } finally {
       summarizing.current.delete(episode.id)
     }
-  }, [])
+  }, [calendarTitleById])
 
   const sendBot = useCallback(async (meetingUrl: string, action: 'join' | 'leave' = 'join') => {
     await api.sendBot(meetingUrl, action)
@@ -348,8 +380,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const value = useMemo<AppData>(
     () => ({
       loading,
-      podcasts,
-      episodes,
+      podcasts: displayPodcasts,
+      episodes: displayEpisodes,
       weekly,
       identity,
       isAdmin,
@@ -382,8 +414,8 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     }),
     [
       loading,
-      podcasts,
-      episodes,
+      displayPodcasts,
+      displayEpisodes,
       weekly,
       identity,
       isAdmin,
