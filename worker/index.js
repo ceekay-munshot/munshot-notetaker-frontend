@@ -209,9 +209,9 @@ async function handleForgotPassword(request, env) {
         text:
           "Here are your login details for Munshot Notetaker:\n\n" +
           `Email: ${email}\n` +
-          `Temporary password: ${tempPassword}\n\n` +
-          "Sign in with this password. You can keep using it, or create a new " +
-          "account password later.",
+          `Temporary password (5-digit code): ${tempPassword}\n\n` +
+          "Sign in with this code. You can keep using it, or set a new account " +
+          "password later.",
       });
     } catch (err) {
       return json({ error: "Couldn't send the email. Please try again." }, 502);
@@ -1579,15 +1579,15 @@ function parseCookies(request) {
   return out;
 }
 
-// A short, human-typable temporary password. Ambiguous characters (0/O, 1/l/I)
-// are left out so it survives being read out of an email. Comfortably clears
-// the 6-character minimum the register/login flow enforces.
-function generateTempPassword(len = 12) {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
-  const bytes = crypto.getRandomValues(new Uint8Array(len));
-  let out = "";
-  for (let i = 0; i < len; i++) out += alphabet[bytes[i] % alphabet.length];
-  return out;
+// A short numeric temporary password emailed for a reset: a 5-digit code
+// (00000–99999), so it's easy to read out of an email and type. Only login uses
+// it, and login does NOT enforce the register flow's 6-character minimum, so a
+// 5-digit code still signs in fine.
+function generateTempPassword() {
+  // Uniform 0–99999, zero-padded to a fixed 5 digits (e.g. "04821"). The minute
+  // modulo bias over a 32-bit draw is irrelevant for a one-off reset code.
+  const n = crypto.getRandomValues(new Uint32Array(1))[0] % 100000;
+  return String(n).padStart(5, "0");
 }
 
 // Send a plain-text email through the Muns raw email API. The bearer token is
