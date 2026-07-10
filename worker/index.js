@@ -54,6 +54,13 @@ export default {
       if (method === "POST" && pathname === "/api/calendar/meetings/restore") return handleCalendarRestore(request, env);
       if (method === "GET" && pathname === "/api/config") return handleGetConfig(request, env);
       if (method === "POST" && pathname === "/api/config") return handleSetConfig(request, env);
+      if (method === "GET" && pathname === "/api/tracking/directory") return handleTrackingDirectory(request, env);
+      if (method === "GET" && pathname === "/api/tracking") return handleGetTracking(request, env);
+      if (method === "POST" && pathname === "/api/tracking") return handleSaveTracking(request, env);
+      // Public, key-gated (not session-gated) so an external dashboard can call
+      // it directly — see TRACKING_CORS_HEADERS / handlePublicTracking below.
+      if (method === "OPTIONS" && pathname === "/api/public/tracking") return handleTrackingPreflight();
+      if (method === "GET" && pathname === "/api/public/tracking") return handlePublicTracking(request, env);
       // Unknown API path → JSON 404 (never the SPA shell, so fetch() callers
       // always get JSON back).
       if (pathname === "/api" || pathname.startsWith("/api/")) {
@@ -71,8 +78,13 @@ export default {
 
   // Cron-triggered (see [triggers] in wrangler.toml). Fires every schedule whose
   // time has arrived, regardless of whether the user has the dashboard open.
+  // Auto-summaries and people-tracking run as their OWN waitUntil calls (not
+  // chained after runDueSchedules) so slow OpenAI generation never delays the
+  // latency-critical bot-join dispatch.
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(runDueSchedules(env));
+    ctx.waitUntil(runAutoSummaries(env));
+    ctx.waitUntil(runTrackingRollups(env));
   },
 };
 
@@ -961,7 +973,31 @@ async function handleWeeklyPeople(request, env) {
   const rows = (res && res.results) || [];
   if (!rows.length) return json({ ok: true, people: [] });
 
+  const model = env.OPENAI_MODEL || "gpt-4o";
+  try {
+    const people = await peopleRollupFromRows(rows, apiKey, model);
+    return json({ ok: true, people });
+  } catch (err) {
+    return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
+  }
+}
+
+// Shared strict-JSON "per-person status rollup" call, factored out of
+// handleWeeklyPeople so the admin people-tracker (below) can ask the same
+// question about a single person over a pre-filtered set of rows. `rows` must
+// already be scoped to what the caller may see. When `focusName` is set, the
+// model is told to report on ONLY that person (tolerating STT misspellings)
+// and to return an empty list if the rows don't actually support anything
+// concrete about them — callers should treat an empty result as "nothing
+// found yet", not an error.
+async function peopleRollupFromRows(rows, apiKey, model, focusName) {
+  if (!rows.length) return [];
   const transcripts = buildMultiMeetingText(rows);
+  const focusInstruction = focusName
+    ? `Only report on "${focusName}" (match case-insensitively and tolerate speech-to-text misspellings of the ` +
+      `name) — ignore everyone else. If the transcripts below don't actually support anything concrete about ` +
+      `them, return {"people":[]}.`
+    : "For each person who actually spoke or was discussed, return an object.";
   const messages = [
     {
       role: "system",
@@ -974,7 +1010,8 @@ async function handleWeeklyPeople(request, env) {
       role: "user",
       content:
         "From the meeting transcripts below, produce a per-person rollup across all the meetings. " +
-        "For each person who actually spoke or was discussed, return an object with:\n" +
+        `${focusInstruction}\n` +
+        'Return an object with:\n' +
         '- "name": their name exactly as it appears in the transcript.\n' +
         '- "overall": one or two sentences describing their role / focus across the meetings.\n' +
         '- "accomplished": an array of concrete things they have completed or made progress on (past tense).\n' +
@@ -986,7 +1023,6 @@ async function handleWeeklyPeople(request, env) {
     },
   ];
 
-  const model = env.OPENAI_MODEL || "gpt-4o";
   let upstream;
   try {
     upstream = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -1001,12 +1037,11 @@ async function handleWeeklyPeople(request, env) {
       }),
     });
   } catch (err) {
-    return json({ error: "Failed to reach the AI service", detail: String((err && err.message) || err) }, 502);
+    throw new Error(`Failed to reach the AI service: ${String((err && err.message) || err)}`);
   }
   const data = await upstream.json().catch(() => ({}));
   if (!upstream.ok) {
-    const detail = (data && data.error && data.error.message) || `HTTP ${upstream.status}`;
-    return json({ error: "AI request failed", detail }, 502);
+    throw new Error((data && data.error && data.error.message) || `HTTP ${upstream.status}`);
   }
   const content =
     (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "{}";
@@ -1016,7 +1051,7 @@ async function handleWeeklyPeople(request, env) {
   } catch {
     parsed = { people: [] };
   }
-  const people = Array.isArray(parsed.people)
+  return Array.isArray(parsed.people)
     ? parsed.people
         .map((p) => ({
           name: String((p && p.name) || "").trim(),
@@ -1026,7 +1061,425 @@ async function handleWeeklyPeople(request, env) {
         }))
         .filter((p) => p.name)
     : [];
-  return json({ ok: true, people });
+}
+
+/* ------------------------------ people tracking (admin) ------------------------------ */
+// Admin picks a set of people to "track" (a name from any meeting's speaker
+// list, or one typed manually for someone who's only ever mentioned). For each
+// tracked person the cron below maintains a durable, auto-updating rollup —
+// what they've done, what's next — mined from every meeting where they spoke
+// OR were mentioned by someone else. Selection lives in KV (small, admin-only,
+// no D1 write access needed); rollups are regenerated wholesale per person
+// (not incrementally patched) so they stay internally consistent. A denormalized
+// blob (tracking:public) is rebuilt after each regen pass so the external,
+// key-gated API can serve it with a single cheap KV read.
+
+const TRACKING_SELECTION_KEY = "tracking:selection";
+const TRACKING_PUBLIC_KEY = "tracking:public";
+const TRACKING_WATERMARK_KEY = "tracking:watermark";
+const SUMMARY_SNAPSHOT_KEY = "summary:snapshot";
+const SUMMARY_LOCK_KEY = "cron:lock:summary";
+const TRACKING_LOCK_KEY = "cron:lock:tracking";
+const LOCK_TTL_SECONDS = 120; // > the 60s cron cadence, so an overrun tick blocks the next one
+const MAX_TRACKED = 25;
+const AUTO_SUMMARY_BATCH = 2; // meetings summarized per cron tick
+const TRACKING_REGEN_INTERVAL_MS = 15 * 60 * 1000; // re-check tracked people at most this often
+// Coarse daily ceiling on background generation units (1 meeting summary = 1
+// unit, 1 person regen = 1 unit) — a cost safety net, not the primary rate
+// limiter (the lock + per-tick batch cap + regen interval already do that).
+const DAILY_AI_BUDGET = 300;
+
+function trackingPersonKey(slug) {
+  return `tracking:person:${slug}`;
+}
+
+// Drops Unicode combining marks (U+0300-U+036F) left behind by NFKD
+// normalization, e.g. turning "é" (NFKD: "e" + combining acute) into "e".
+function stripCombiningMarks(s) {
+  let out = "";
+  for (const ch of s) {
+    const code = ch.codePointAt(0) || 0;
+    if (code >= 0x0300 && code <= 0x036f) continue;
+    out += ch;
+  }
+  return out;
+}
+
+// Lowercase, whitespace-collapsed, diacritic-stripped, URL-safe key for a
+// person's KV record — display casing is kept inside the record itself.
+function slugifyName(name) {
+  const cleaned = stripCombiningMarks(String(name || "").normalize("NFKD"))
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+  return cleaned.replace(/[^a-z0-9 ]/g, "").trim().replace(/ /g, "-");
+}
+
+// Escapes SQL LIKE metacharacters so a name search matches the literal name,
+// not a wildcard pattern the name happens to contain.
+function escapeLike(s) {
+  return String(s || "").replace(/[\\%_]/g, "\\$&");
+}
+
+async function readTrackingSelection(env) {
+  try {
+    const raw = await env.KV.get(TRACKING_SELECTION_KEY);
+    if (!raw) return { names: [], updatedAt: 0 };
+    const parsed = JSON.parse(raw);
+    return { names: Array.isArray(parsed.names) ? parsed.names : [], updatedAt: parsed.updatedAt || 0 };
+  } catch {
+    return { names: [], updatedAt: 0 };
+  }
+}
+
+// A short-lived KV "lease" so the once-a-minute cron can't run two overlapping
+// heavy (OpenAI-calling) passes if a prior tick is still in flight. Not a true
+// atomic compare-and-swap (KV has none), but adequate at this cadence/TTL.
+async function acquireLock(env, key) {
+  const existing = await env.KV.get(key);
+  if (existing) return false;
+  await env.KV.put(key, String(Date.now()), { expirationTtl: LOCK_TTL_SECONDS });
+  return true;
+}
+
+async function releaseLock(env, key) {
+  try {
+    await env.KV.delete(key);
+  } catch {
+    /* best-effort */
+  }
+}
+
+async function withinDailyBudget(env, cost) {
+  const day = new Date().toISOString().slice(0, 10);
+  const key = `tracking:budget:${day}`;
+  let used = 0;
+  try {
+    used = Number((await env.KV.get(key)) || 0);
+  } catch {
+    used = 0;
+  }
+  if (used + cost > DAILY_AI_BUDGET) return false;
+  if (cost > 0) {
+    try {
+      await env.KV.put(key, String(used + cost), { expirationTtl: 60 * 60 * 26 });
+    } catch {
+      /* best-effort */
+    }
+  }
+  return true;
+}
+
+// Every distinct named speaker across every meeting — feeds the admin people
+// picker. Free-text diarization labels: drops blanks and "Unknown"/"Speaker N"
+// placeholders, but otherwise trusts whatever the transcript pipeline produced.
+async function handleTrackingDirectory(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+  let res;
+  try {
+    res = await env.DB.prepare(
+      "SELECT DISTINCT speaker FROM transcriptions WHERE speaker IS NOT NULL AND TRIM(speaker) <> '' ORDER BY speaker"
+    ).all();
+  } catch (err) {
+    return json({ error: "Failed to load speakers", detail: String((err && err.message) || err) }, 500);
+  }
+  const names = ((res && res.results) || [])
+    .map((r) => String(r.speaker || "").trim())
+    .filter((s) => s && !/^unknown$/i.test(s) && !/^speaker\s*\d+$/i.test(s));
+  return json({ ok: true, people: [...new Set(names)] });
+}
+
+// Current tracked selection plus each person's latest stored rollup (or a
+// pending placeholder for a just-added name the cron hasn't reached yet).
+async function handleGetTracking(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  const selection = await readTrackingSelection(env);
+  const people = await Promise.all(
+    selection.names.map(async (name) => {
+      const slug = slugifyName(name);
+      let stored = null;
+      if (slug && env.KV) {
+        try {
+          const raw = await env.KV.get(trackingPersonKey(slug));
+          stored = raw ? JSON.parse(raw) : null;
+        } catch {
+          stored = null;
+        }
+      }
+      return (
+        stored || { name, slug, overall: "", accomplished: [], todo: [], meetingCount: 0, pending: true, updatedAt: null }
+      );
+    })
+  );
+  let watermark = null;
+  try {
+    const raw = await env.KV.get(TRACKING_WATERMARK_KEY);
+    watermark = raw ? JSON.parse(raw) : null;
+  } catch {
+    watermark = null;
+  }
+  return json({ ok: true, selection: selection.names, people, watermark });
+}
+
+// Persists the tracked-people selection. Returns immediately — it does NOT
+// call OpenAI inline (a synchronous regen of a whole tracked roster can take
+// 30-90s and blow past client timeouts). Newly-added names are seeded as
+// `pending`; the cron below fills in real rollups on its next pass.
+async function handleSaveTracking(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  const body = await request.json().catch(() => ({}));
+  const raw = Array.isArray(body.names) ? body.names : [];
+
+  const seen = new Set();
+  const names = [];
+  for (const n of raw) {
+    const trimmed = String(n || "").trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    names.push(trimmed);
+    if (names.length >= MAX_TRACKED) break;
+  }
+
+  await env.KV.put(TRACKING_SELECTION_KEY, JSON.stringify({ names, updatedAt: Date.now() }));
+
+  for (const name of names) {
+    const slug = slugifyName(name);
+    if (!slug) continue;
+    const key = trackingPersonKey(slug);
+    const existing = await env.KV.get(key);
+    if (!existing) {
+      await env.KV.put(
+        key,
+        JSON.stringify({ name, slug, overall: "", accomplished: [], todo: [], meetingCount: 0, pending: true, updatedAt: null })
+      );
+    }
+  }
+
+  return json({ ok: true, selection: names });
+}
+
+// Builds one person's durable rollup from every row where they're the speaker
+// OR are mentioned by name in someone else's line — this is how a meeting
+// that only *discusses* a tracked person (never has them speak) still updates
+// their list. `speaker = ?1` is the precise, primary signal; the LIKE mention
+// is secondary and deliberately permissive (the rollup prompt is instructed to
+// use only what the filtered transcript actually supports, so a meeting that
+// merely name-drops the person yields nothing rather than a hallucinated item).
+async function rollupForPerson(env, name, apiKey, model) {
+  const like = escapeLike(name);
+  let res;
+  try {
+    res = await env.DB.prepare(
+      "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions " +
+      "WHERE speaker = ?1 OR text LIKE '%' || ?2 || '%' ESCAPE '\\' " +
+      "ORDER BY meeting_id, start_time"
+    ).bind(name, like).all();
+  } catch (err) {
+    throw new Error(`Failed to load transcripts for ${name}: ${String((err && err.message) || err)}`);
+  }
+  const rows = (res && res.results) || [];
+  if (!rows.length) return { overall: "", accomplished: [], todo: [], meetingCount: 0 };
+  const meetingCount = new Set(rows.map((r) => String(r.meeting_id))).size;
+  const people = await peopleRollupFromRows(rows, apiKey, model, name);
+  const match = people[0] || { overall: "", accomplished: [], todo: [] };
+  return { overall: match.overall, accomplished: match.accomplished, todo: match.todo, meetingCount };
+}
+
+// Cron pass 1: gradually summarizes the whole meeting history AND every new
+// meeting, without ever caching a summary of a still-recording meeting. A
+// meeting is "settled" when its transcript segment count hasn't grown since
+// the previous tick — this needs only an integer COUNT(*), never a parse of
+// created_at (whose exact format is owned by an external, unmirrored backend).
+async function runAutoSummaries(env) {
+  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  if (!apiKey || !env.DB || !env.KV) return;
+  if (!(await acquireLock(env, SUMMARY_LOCK_KEY))) return;
+  try {
+    let res;
+    try {
+      res = await env.DB.prepare("SELECT meeting_id, COUNT(*) AS n FROM transcriptions GROUP BY meeting_id").all();
+    } catch {
+      return;
+    }
+    const rows = (res && res.results) || [];
+    if (!rows.length) return;
+
+    let snapshot = {};
+    try {
+      const raw = await env.KV.get(SUMMARY_SNAPSHOT_KEY);
+      if (raw) snapshot = JSON.parse(raw) || {};
+    } catch {
+      snapshot = {};
+    }
+
+    const settledUnsummarized = [];
+    const nextSnapshot = {};
+    for (const r of rows) {
+      const id = String(r.meeting_id);
+      const n = Number(r.n) || 0;
+      nextSnapshot[id] = n;
+      const settled = snapshot[id] !== undefined && snapshot[id] === n;
+      if (settled && !(await env.KV.get(summaryCacheKey(id)))) settledUnsummarized.push(id);
+    }
+    // Persist the fresh snapshot every tick (even an empty-work tick) so the
+    // next tick can still tell what's still growing.
+    await env.KV.put(SUMMARY_SNAPSHOT_KEY, JSON.stringify(nextSnapshot));
+    if (!settledUnsummarized.length) return;
+
+    const model = env.OPENAI_MODEL || "gpt-4o";
+    for (const meetingId of settledUnsummarized.slice(0, AUTO_SUMMARY_BATCH)) {
+      if (!(await withinDailyBudget(env, 1))) break;
+      try {
+        let transcriptRes;
+        try {
+          transcriptRes = await env.DB.prepare(
+            "SELECT start_time, text, speaker FROM transcriptions WHERE meeting_id = ?1 ORDER BY start_time"
+          ).bind(meetingId).all();
+        } catch {
+          continue;
+        }
+        const transcriptRows = (transcriptRes && transcriptRes.results) || [];
+        if (!transcriptRows.length) continue;
+        // Re-check right before writing: an overlapping tick or a user opening
+        // this meeting may have summarized it while we were working.
+        if (await env.KV.get(summaryCacheKey(meetingId))) continue;
+        const titleKey = titleCacheKey(meetingId);
+        const hasTitle = !!(await env.KV.get(titleKey));
+        const [summaryMd, title] = await Promise.all([
+          generateDetailedSummary(transcriptRows, apiKey, model),
+          hasTitle ? Promise.resolve("") : generateMeetingTitle(transcriptRows, apiKey, model).catch(() => ""),
+        ]);
+        await env.KV.put(summaryCacheKey(meetingId), summaryMd);
+        if (title) await env.KV.put(titleKey, title);
+      } catch {
+        /* best-effort — move on to the next meeting */
+      }
+    }
+  } finally {
+    await releaseLock(env, SUMMARY_LOCK_KEY);
+  }
+}
+
+// Cron pass 2: regenerates every tracked person's rollup, throttled so it only
+// does AI work when the transcript table has actually grown (a cheap
+// COUNT(*) probe) or the throttle interval has elapsed (periodic refresh even
+// if the count-based signal was missed). Rebuilds the public blob afterward
+// from each person's latest stored record — including ones skipped this tick
+// by the budget cap — so the external API never regresses to older data.
+async function runTrackingRollups(env) {
+  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  if (!apiKey || !env.DB || !env.KV) return;
+  const selection = await readTrackingSelection(env);
+  if (!selection.names.length) return;
+  if (!(await acquireLock(env, TRACKING_LOCK_KEY))) return;
+  try {
+    let countRes;
+    try {
+      countRes = await env.DB.prepare("SELECT COUNT(*) AS n FROM transcriptions").all();
+    } catch {
+      return;
+    }
+    const n = Number((countRes && countRes.results && countRes.results[0] && countRes.results[0].n) || 0);
+
+    let watermark = { n: -1, lastRegenAt: 0 };
+    try {
+      const raw = await env.KV.get(TRACKING_WATERMARK_KEY);
+      if (raw) watermark = { ...watermark, ...JSON.parse(raw) };
+    } catch {
+      /* use default */
+    }
+
+    const now = Date.now();
+    const dataChanged = n !== watermark.n;
+    const throttleElapsed = now - (watermark.lastRegenAt || 0) >= TRACKING_REGEN_INTERVAL_MS;
+    if (!dataChanged && !throttleElapsed) return;
+
+    const model = env.OPENAI_MODEL || "gpt-4o";
+    for (const name of selection.names) {
+      if (!(await withinDailyBudget(env, 1))) break;
+      const slug = slugifyName(name);
+      if (!slug) continue;
+      try {
+        const rollup = await rollupForPerson(env, name, apiKey, model);
+        await env.KV.put(
+          trackingPersonKey(slug),
+          JSON.stringify({
+            name,
+            slug,
+            overall: rollup.overall,
+            accomplished: rollup.accomplished,
+            todo: rollup.todo,
+            meetingCount: rollup.meetingCount,
+            updatedAt: now,
+          })
+        );
+      } catch {
+        /* best-effort — leave this person's previous rollup in place */
+      }
+    }
+
+    const allRecords = await Promise.all(
+      selection.names.map(async (name) => {
+        const slug = slugifyName(name);
+        if (!slug) return null;
+        try {
+          const raw = await env.KV.get(trackingPersonKey(slug));
+          return raw ? JSON.parse(raw) : null;
+        } catch {
+          return null;
+        }
+      })
+    );
+    const publicPeople = allRecords
+      .filter(Boolean)
+      .map((r) => ({ name: r.name, overall: r.overall, accomplished: r.accomplished, todo: r.todo }));
+    await env.KV.put(TRACKING_PUBLIC_KEY, JSON.stringify({ generatedAt: now, people: publicPeople }));
+    await env.KV.put(TRACKING_WATERMARK_KEY, JSON.stringify({ n, lastRegenAt: now }));
+  } finally {
+    await releaseLock(env, TRACKING_LOCK_KEY);
+  }
+}
+
+const TRACKING_CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, X-API-Key, Content-Type",
+  "Access-Control-Max-Age": "86400",
+};
+
+function handleTrackingPreflight() {
+  return new Response(null, { status: 204, headers: TRACKING_CORS_HEADERS });
+}
+
+// External read-only API for another dashboard: any caller holding
+// TRACKING_API_KEY can pull the tracked-people list. Never triggers
+// generation — reads the pre-built tracking:public blob only, so it's cheap
+// and can't be abused into extra AI spend. `*` origin is fine here because
+// auth is a bearer/key header, not a cookie; Allow-Credentials must never be
+// paired with it.
+async function handlePublicTracking(request, env) {
+  if (!env.TRACKING_API_KEY) return json({ error: "Tracking API isn't configured" }, 503, TRACKING_CORS_HEADERS);
+  const authHeader = request.headers.get("Authorization") || "";
+  const bearer = authHeader.replace(/^Bearer\s+/i, "").trim();
+  const apiKeyHeader = (request.headers.get("X-API-Key") || "").trim();
+  const provided = bearer || apiKeyHeader;
+  if (!provided || !timingSafeEqual(provided, env.TRACKING_API_KEY)) {
+    return json({ error: "Unauthorized" }, 401, TRACKING_CORS_HEADERS);
+  }
+  let data = { generatedAt: null, people: [] };
+  try {
+    const raw = await env.KV.get(TRACKING_PUBLIC_KEY);
+    if (raw) data = JSON.parse(raw);
+  } catch {
+    /* corrupt cache — serve the safe default rather than error */
+  }
+  return json({ ok: true, ...data }, 200, TRACKING_CORS_HEADERS);
 }
 
 /* ------------------------------ calendar ------------------------------ */

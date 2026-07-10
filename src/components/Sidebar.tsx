@@ -16,6 +16,10 @@ const NAV: NavItem[] = [
   { to: '/search', label: 'Search', icon: 'search' },
 ]
 
+// Admin-only — appended when signed in as admin (People Tracker manages a
+// cross-meeting rollup that only admins can select/see).
+const ADMIN_NAV_ITEM: NavItem = { to: '/tracking', label: 'People Tracker', icon: 'groups' }
+
 /** The static sidebar — desktop/tablet only; below `md` the drawer takes over. */
 export function Sidebar() {
   return (
@@ -72,6 +76,10 @@ export function MobileSidebar({ open, onClose }: { open: boolean; onClose: () =>
 }
 
 function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onClose?: () => void }) {
+  const { state } = useAuth()
+  const isAdmin = state.status === 'authed' && state.isAdmin
+  const nav = isAdmin ? [...NAV, ADMIN_NAV_ITEM] : NAV
+
   return (
     <>
       <div className="mb-7 flex items-center justify-between">
@@ -103,7 +111,7 @@ function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onCl
 
       {/* Primary nav */}
       <ul className="flex flex-col gap-1">
-        {NAV.map((item) => (
+        {nav.map((item) => (
           <li key={item.to} className={item.sub ? 'ml-4 border-l border-outline-variant pl-1.5' : ''}>
             <NavLink to={item.to} end={item.end} onClick={onNavigate} className={navClass}>
               {({ isActive }) => (
