@@ -189,6 +189,59 @@ export async function fetchWeeklyPeople(): Promise<PersonRollup[]> {
   return data.people || []
 }
 
+// ── Admin people tracker ─────────────────────────────────────────────────────
+// Admin picks a set of people to track across ALL meetings (not just the
+// caller's own); the Worker's cron keeps each person's rollup updated as new
+// meetings mention them. Every /api/tracking* route is admin-only.
+
+export interface TrackedPerson extends PersonRollup {
+  slug: string
+  meetingCount: number
+  updatedAt: number | null
+  /** True until the background cron has produced a real rollup for a
+   *  just-added name — the UI should poll fetchTracking() while this is set. */
+  pending?: boolean
+}
+
+export interface TrackingWatermark {
+  n: number
+  lastRegenAt: number
+}
+
+export interface TrackingState {
+  selection: string[]
+  people: TrackedPerson[]
+  watermark: TrackingWatermark | null
+}
+
+/** Every distinct named speaker across every meeting, for the tracking picker. */
+export async function fetchTrackingDirectory(): Promise<string[]> {
+  const data = await request<{ ok: boolean; people?: string[] }>('/api/tracking/directory')
+  return data.people || []
+}
+
+/** Current tracked selection + each person's latest rollup (or a pending
+ *  placeholder). Poll this while any person is `pending`. */
+export async function fetchTracking(): Promise<TrackingState> {
+  const data = await request<{
+    ok: boolean
+    selection?: string[]
+    people?: TrackedPerson[]
+    watermark?: TrackingWatermark | null
+  }>('/api/tracking')
+  return { selection: data.selection || [], people: data.people || [], watermark: data.watermark ?? null }
+}
+
+/** Persists the tracked-people selection. Returns immediately — a newly added
+ *  name's rollup is built by the background cron, not generated inline. */
+export async function saveTrackingSelection(names: string[]): Promise<string[]> {
+  const data = await request<{ ok: boolean; selection?: string[] }>('/api/tracking', {
+    method: 'POST',
+    body: JSON.stringify({ names }),
+  })
+  return data.selection || []
+}
+
 // ── The notetaker bot ───────────────────────────────────────────────────────────
 
 export function sendBot(

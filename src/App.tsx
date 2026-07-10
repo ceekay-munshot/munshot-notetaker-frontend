@@ -14,6 +14,7 @@ import EpisodeDetail from './pages/EpisodeDetail'
 import Weekly from './pages/Weekly'
 import WeeklyArchive from './pages/WeeklyArchive'
 import Search from './pages/Search'
+import Tracking from './pages/Tracking'
 
 export default function App() {
   return (
@@ -60,6 +61,7 @@ function Dashboard() {
                 <Route path="episodes/:id" element={<EpisodeDetail />} />
                 <Route path="weekly" element={<Weekly />} />
                 <Route path="weekly/archive" element={<WeeklyArchive />} />
+                <Route path="tracking" element={<Tracking />} />
                 <Route path="search" element={<Search />} />
                 <Route path="*" element={<NotFound />} />
               </Route>

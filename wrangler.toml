@@ -47,10 +47,23 @@ id = "759a21557c7d4e118296479f9b4c50a6"
 # Secrets are NOT stored in this file. With git-connected Workers Builds,
 # add them once in the dashboard — they persist across deploys:
 #   Worker → Settings → Variables and Secrets → Add → type "Secret"
-#     API_KEY      (required)  the X-API-Key value
-#     SIGNUP_CODE  (optional)  require a code to register
-#     MUNS_TOKEN   (required for password reset)  bearer token for the Muns
-#                  raw email API (POST https://devde.muns.io/email/send/raw)
+#     API_KEY           (required)  the X-API-Key value
+#     SIGNUP_CODE        (optional)  require a code to register
+#     MUNS_TOKEN         (required for password reset)  bearer token for the Muns
+#                        raw email API (POST https://devde.muns.io/email/send/raw)
+#     OPENAI_API_KEY     (required for AI: summaries, chat, weekly/people, and the
+#                        background auto-summary + people-tracking cron below)
+#     OPENAI_MODEL        (optional, defaults to "gpt-4o")
+#     TRACKING_API_KEY   (required to enable the external GET /api/public/tracking
+#                        API) a bearer token external dashboards send as
+#                        `Authorization: Bearer <key>` (or `X-API-Key: <key>`);
+#                        the endpoint returns 503 until this is set.
+#
+# The auto-summary + people-tracking cron passes (runAutoSummaries /
+# runTrackingRollups, wired into `scheduled` in worker/index.js) run OpenAI
+# calls every minute in the background. Each detailed summary alone fires
+# ~10 subrequests, which needs the Workers PAID plan (Free tier's 50-subrequest
+# / 10ms-CPU limits aren't enough for this to run reliably).
 
 # Transcripts database (D1).
 [[d1_databases]]
