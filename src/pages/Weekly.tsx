@@ -30,11 +30,18 @@ const THEME_STYLES = [
 ]
 
 export default function Weekly() {
-  const { episodes, podcasts, episodeById, podcastById, loading, identity, needsApiKey, weekProcessing, weekProgress, processWeek, cancelProcessWeek } = useAppData()
+  const { episodes, podcasts, episodeById, podcastById, loading, identity, needsApiKey, weekProcessing, weekProgress, processWeek, cancelProcessWeek, hydrateCachedSummaries } = useAppData()
   const { on: sentimentOn } = useSentiment()
   const [params, setParams] = useSearchParams()
   const [weekly, setWeekly] = useState<WeeklySummary | null | undefined>(undefined) // undefined = generating
   const [chatOpen, setChatOpen] = useState(false)
+
+  // Pull in summaries the auto-summary cron (or prior opens) already produced, so
+  // the weekly populates from the real content without opening each meeting first.
+  // Idempotent + guarded inside AppData, so it's safe to re-run as meetings load.
+  useEffect(() => {
+    void hydrateCachedSummaries()
+  }, [hydrateCachedSummaries])
 
   // Where "Email this edition" sends: the signed-in user's address, or the one
   // they subscribed the weekly brief with. Absent → the menu item is hidden.
@@ -173,13 +180,16 @@ export default function Weekly() {
   const WEEK_MS = 7 * 24 * 60 * 60 * 1000
   const unprocessed = useMemo(() => {
     const cutoff = Date.now() - WEEK_MS
+    // A meeting is "not processed" when it has content to summarise but no summary
+    // yet. Meetings arrive as status:'ready' (a transcript exists) with no summary
+    // until one is generated, so gate on "has a transcript / source + no summary",
+    // not on a non-ready status (which only fits the podcast-era ingest lifecycle).
     return episodes.filter(
       (e) =>
         +new Date(e.publishedAt) >= cutoff &&
-        e.status !== 'ready' &&
         e.status !== 'summarizing' &&
         !e.summary &&
-        (!!e.transcriptUrl || !!e.audioUrl || !!(e.notes && e.notes.trim())),
+        (!!(e.transcript && e.transcript.length) || !!e.transcriptUrl || !!e.audioUrl || !!(e.notes && e.notes.trim())),
     )
   }, [episodes])
   // The bulk job itself lives in AppData (so it survives navigation); the page just

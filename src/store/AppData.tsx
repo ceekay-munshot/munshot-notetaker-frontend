@@ -30,6 +30,11 @@ interface AppData {
   // meetings
   refresh: () => Promise<void>
   summarizeEpisode: (episode: Episode, podcast?: Podcast, opts?: { force?: boolean }) => Promise<void>
+  /** Pull server-cached meeting summaries (from the auto-summary cron / prior
+   *  opens) into the episode model, so the Weekly page populates without opening
+   *  each meeting. Best-effort; idempotent; only fetches meetings not already
+   *  summarized or requested this session. */
+  hydrateCachedSummaries: () => Promise<void>
   // notetaker bot
   sendBot: (meetingUrl: string, action?: 'join' | 'leave') => Promise<void>
   // schedules
@@ -284,6 +289,40 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     }
   }, [calendarTitleById])
 
+  // Meetings whose cached summary we've already asked the Worker for this session,
+  // so a re-run (episodes changing) never re-fetches the same set or loops.
+  const hydrateRequested = useRef<Set<string>>(new Set())
+  const hydrateCachedSummaries = useCallback(async () => {
+    const targets = episodes.filter(
+      (e) => e.status === 'ready' && !e.summary && !hydrateRequested.current.has(e.id),
+    )
+    if (!targets.length) return
+    const pick = targets.slice(0, 60)
+    pick.forEach((e) => hydrateRequested.current.add(e.id))
+    const refs = pick.map((e) => {
+      const { owner, meetingId } = decodeMeetingId(e.id)
+      return { meeting_id: meetingId, owner }
+    })
+    try {
+      const summaries = await api.fetchCachedMeetingSummaries(refs)
+      if (!summaries.length) return
+      const byMeetingId = new Map(summaries.map((s) => [s.meetingId, s.summary]))
+      setEpisodes((prev) => {
+        let changed = false
+        const next = prev.map((e) => {
+          if (e.summary) return e
+          const summary = byMeetingId.get(decodeMeetingId(e.id).meetingId)
+          if (!summary) return e
+          changed = true
+          return { ...e, status: 'ready' as const, summary }
+        })
+        return changed ? next : prev
+      })
+    } catch {
+      /* best-effort — the deterministic/empty edition still renders */
+    }
+  }, [episodes])
+
   const sendBot = useCallback(async (meetingUrl: string, action: 'join' | 'leave' = 'join') => {
     await api.sendBot(meetingUrl, action)
   }, [])
@@ -434,6 +473,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       episodesByPodcast,
       refresh,
       summarizeEpisode,
+      hydrateCachedSummaries,
       sendBot,
       schedules,
       refreshSchedules,
@@ -469,6 +509,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       episodesByPodcast,
       refresh,
       summarizeEpisode,
+      hydrateCachedSummaries,
       sendBot,
       schedules,
       refreshSchedules,

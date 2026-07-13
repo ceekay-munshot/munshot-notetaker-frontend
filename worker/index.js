@@ -47,6 +47,7 @@ export default {
       if (method === "POST" && pathname === "/api/weekly/people") return handleWeeklyPeople(request, env);
       if (method === "POST" && pathname === "/api/weekly/summary") return handleWeeklySummary(request, env);
       if (method === "POST" && pathname === "/api/weekly/chat") return handleWeeklyChat(request, env);
+      if (method === "POST" && pathname === "/api/weekly/meetings") return handleWeeklyMeetings(request, env);
       if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
@@ -1371,6 +1372,27 @@ async function handleWeeklySummary(request, env) {
     /* best-effort persist — still return what we just built */
   }
   return json({ ok: true, cached: false, ...payload });
+}
+
+// POST /api/weekly/meetings — peek the already-cached detailed summary for each
+// requested meeting the caller may see, WITHOUT generating anything. Body:
+// { meetings: [{ meeting_id, owner? }] }. Lets the Weekly page hydrate its episode
+// model from the summaries the auto-summary cron (or prior opens) already made, so
+// the weekly populates without the user opening every meeting one by one. No
+// OpenAI key needed — it only reads what's cached.
+async function handleWeeklyMeetings(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+  if (!env.KV) return json({ error: "Storage is not connected yet" }, 503);
+
+  const body = await request.json().catch(() => ({}));
+  const meetings = Array.isArray(body.meetings) ? body.meetings.slice(0, 80) : [];
+  const sources = await loadWeeklyMeetingSummaries(env, session, meetings);
+  return json({
+    ok: true,
+    summaries: sources.map((s) => ({ meeting_id: s.meetingId, title: s.title, summary: s.summary })),
+  });
 }
 
 // Flatten a saved WeeklyAi into plain text, so the chat can ground its answers on
