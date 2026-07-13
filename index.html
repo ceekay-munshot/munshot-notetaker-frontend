@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Munshot Notetaker — your meeting intelligence layer. Send a notetaker to any meeting, get one-page summaries, search transcripts, and read one weekly master summary." />
+    <title>Munshot Notetaker</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block"
+      rel="stylesheet"
+    />
+    <script>
+      // Prevent a flash of raw ligature text (e.g. "home", "graphic_eq") before
+      // the Material Symbols icon font loads: keep icons hidden until the font
+      // is ready, then reveal. A safety timeout guarantees they never stay
+      // hidden if the font is slow or blocked.
+      (function () {
+        var el = document.documentElement
+        el.classList.add('fonts-loading')
+        function reveal() {
+          el.classList.remove('fonts-loading')
+        }
+        try {
+          if (document.fonts && document.fonts.load) {
+            var t = setTimeout(reveal, 4000)
+            document.fonts.load('400 24px "Material Symbols Outlined"').then(
+              function () {
+                clearTimeout(t)
+                reveal()
+              },
+              function () {
+                clearTimeout(t)
+                reveal()
+              },
+            )
+          } else {
+            reveal()
+          }
+        } catch (e) {
+          reveal()
+        }
+      })()
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

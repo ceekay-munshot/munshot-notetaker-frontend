@@ -1,6 +1,28 @@
 name = "munshot-notetaker-frontend"
-main = "src/index.js"
+main = "worker/index.js"
 compatibility_date = "2024-11-01"
+
+# Build the React SPA into ./dist before any deploy/upload. Workers Builds (CI)
+# runs `wrangler versions upload` directly, so this hook is what produces the
+# assets the [assets] block below serves. Runs locally on `wrangler deploy` too.
+[build]
+command = "npm run build"
+
+# The React dashboard is built to ./dist (`npm run build`) and served as static
+# assets. A request that matches a built file (hashed JS/CSS, fonts, the logo)
+# is served directly; everything else invokes the Worker, which handles /api/*
+# and otherwise serves the SPA shell (index.html) via the ASSETS binding so
+# client-side routes load. Nothing is gated at the asset layer — all data is
+# behind the authenticated /api/* routes, and the SPA shows the login screen
+# until /api/me succeeds. (No not_found_handling = "single-page-application":
+# that would shadow /api/* with index.html; the Worker does the SPA fallback.)
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+run_worker_first = true
+# Serve files literally — don't let the asset layer redirect "/index.html" → "/"
+# (its default), which would loop against the Worker's SPA fallback.
+html_handling = "none"
 
 # Cron trigger: runs the scheduled-meeting runner every minute so the notetaker
 # joins on time whether or not anyone has the dashboard open. 1 minute is the
@@ -10,8 +32,12 @@ crons = ["* * * * *"]
 
 # The munshot bot endpoints. Override here if the tunnel changes.
 [vars]
-JOIN_ENDPOINT = "https://courtesy-nightlife-lawyer-pharmacies.trycloudflare.com/public/join"
-LEAVE_ENDPOINT = "https://courtesy-nightlife-lawyer-pharmacies.trycloudflare.com/public/leave"
+JOIN_ENDPOINT = "http://65.1.101.15.nip.io:8080/public/join"
+LEAVE_ENDPOINT = "http://65.1.101.15.nip.io:8080/public/leave"
+# Browser-facing calendar Google-auth entry point (HTTPS, default port — not the
+# :8080 API base). The "Connect calendar" button redirects here via the Worker,
+# which appends the signed-in user's email.
+CALENDAR_CONNECT_ENDPOINT = "https://65.1.101.15.nip.io/calendar/connect/start"
 
 # KV namespace for users + sessions (namespace: meetbot-users).
 [[kv_namespaces]]
@@ -21,8 +47,23 @@ id = "759a21557c7d4e118296479f9b4c50a6"
 # Secrets are NOT stored in this file. With git-connected Workers Builds,
 # add them once in the dashboard — they persist across deploys:
 #   Worker → Settings → Variables and Secrets → Add → type "Secret"
-#     API_KEY      (required)  the X-API-Key value
-#     SIGNUP_CODE  (optional)  require a code to register
+#     API_KEY           (required)  the X-API-Key value
+#     SIGNUP_CODE        (optional)  require a code to register
+#     MUNS_TOKEN         (required for password reset)  bearer token for the Muns
+#                        raw email API (POST https://devde.muns.io/email/send/raw)
+#     OPENAI_API_KEY     (required for AI: summaries, chat, weekly/people, and the
+#                        background auto-summary + people-tracking cron below)
+#     OPENAI_MODEL        (optional, defaults to "gpt-4o")
+#     TRACKING_API_KEY   (required to enable the external GET /api/public/tracking
+#                        API) a bearer token external dashboards send as
+#                        `Authorization: Bearer <key>` (or `X-API-Key: <key>`);
+#                        the endpoint returns 503 until this is set.
+#
+# The auto-summary + people-tracking cron passes (runAutoSummaries /
+# runTrackingRollups, wired into `scheduled` in worker/index.js) run OpenAI
+# calls every minute in the background. Each detailed summary alone fires
+# ~10 subrequests, which needs the Workers PAID plan (Free tier's 50-subrequest
+# / 10ms-CPU limits aren't enough for this to run reliably).
 
 # Transcripts database (D1).
 [[d1_databases]]
