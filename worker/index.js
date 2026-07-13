@@ -43,6 +43,7 @@ export default {
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
       if (method === "GET" && pathname === "/api/transcripts") return handleTranscripts(request, env);
       if (method === "POST" && pathname === "/api/ai") return handleAiChat(request, env);
+      if (method === "POST" && pathname === "/api/meetings/sync-titles") return handleSyncMeetingTitles(request, env);
       if (method === "POST" && pathname === "/api/weekly/people") return handleWeeklyPeople(request, env);
       if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
@@ -507,6 +508,50 @@ async function loadTitlesFor(env, segments) {
     /* best-effort — return whatever resolved */
   }
   return out;
+}
+
+// POST /api/meetings/sync-titles { names: [{ meeting_id, calendar_name }] } —
+// lets a signed-in user's browser push the real calendar names it already
+// knows (built client-side from ITS OWN calendar sync) into the shared title
+// cache. Without this, a meeting only self-heals from a stale/AI title when
+// its owner happens to individually reopen it (see handleAiChat); a viewer
+// with no calendar of their own — chiefly admin, who is denied calendar access
+// entirely — would otherwise keep seeing the stale title indefinitely. Admin
+// never calls this (it has no calendar names to push). Same per-meeting ACL as
+// transcripts/summarize: a meeting_id the caller isn't an owner of is skipped.
+async function handleSyncMeetingTitles(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin || !env.KV || !env.DB) return json({ ok: true, updated: 0 });
+
+  const body = await request.json().catch(() => ({}));
+  const entries = Array.isArray(body.names) ? body.names.slice(0, 200) : [];
+  if (!entries.length) return json({ ok: true, updated: 0 });
+
+  const email = normalizeEmail(session.identity);
+  let updated = 0;
+  for (const entry of entries) {
+    const meetingId = String((entry && entry.meeting_id) || "").trim();
+    const calendarName = String((entry && entry.calendar_name) || "").trim();
+    if (!meetingId || !calendarName) continue;
+    try {
+      const owns = await env.DB.prepare(
+        "SELECT 1 FROM transcriptions WHERE meeting_id = ?2 AND (" +
+        "EXISTS (SELECT 1 FROM meeting_owners WHERE meeting_id = ?2 AND owner_email = ?1) " +
+        "OR owner_email = ?1) LIMIT 1"
+      ).bind(email, meetingId).all();
+      if (!owns.results || !owns.results.length) continue;
+      const key = titleCacheKey(meetingId);
+      const stored = await env.KV.get(key);
+      if (stored !== calendarName) {
+        await env.KV.put(key, calendarName);
+        updated++;
+      }
+    } catch {
+      /* best-effort per entry — one bad row shouldn't sink the batch */
+    }
+  }
+  return json({ ok: true, updated });
 }
 
 /* ------------------------------ AI assistant ------------------------------ */

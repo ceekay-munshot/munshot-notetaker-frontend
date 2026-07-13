@@ -215,6 +215,37 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const displayEpisodes = useMemo(() => episodes.map(applyCalendarName), [episodes, applyCalendarName])
   const displayPodcasts = useMemo(() => podcasts.map(applyCalendarName), [podcasts, applyCalendarName])
 
+  // Every meeting with a known real calendar name, deduped by meeting_id.
+  const calendarNameEntries = useMemo(() => {
+    const seen = new Set<string>()
+    const out: { meetingId: string; calendarName: string }[] = []
+    for (const e of episodes) {
+      const meetingId = decodeMeetingId(e.id).meetingId
+      const calendarName = calendarTitleById.get(meetingId)
+      if (calendarName && !seen.has(meetingId)) {
+        seen.add(meetingId)
+        out.push({ meetingId, calendarName })
+      }
+    }
+    return out
+  }, [episodes, calendarTitleById])
+  // A stable fingerprint of the above, so the sync effect below only refires
+  // when the known names actually change — not on every unrelated episode
+  // status tweak (summarizing → ready, etc).
+  const calendarNameFingerprint = calendarNameEntries.map((e) => `${e.meetingId}:${e.calendarName}`).sort().join('|')
+
+  // Push every known real calendar name to the Worker once calendar data has
+  // settled. Without this, a meeting only self-heals from a stale/AI title
+  // when its owner happens to individually reopen it (see summarizeEpisode) —
+  // a viewer with no calendar of their own (chiefly admin, who the Worker
+  // denies calendar access entirely) would otherwise keep seeing a stale
+  // title indefinitely, however long ago it was minted.
+  useEffect(() => {
+    if (isAdmin || !calendarReady || !calendarNameEntries.length) return
+    void api.syncMeetingTitles(calendarNameEntries).catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin, calendarReady, calendarNameFingerprint])
+
   const podcastById = useCallback((id: string) => displayPodcasts.find((p) => p.id === id), [displayPodcasts])
   const episodeById = useCallback((id: string) => displayEpisodes.find((e) => e.id === id), [displayEpisodes])
   const episodesByPodcast = useCallback(
