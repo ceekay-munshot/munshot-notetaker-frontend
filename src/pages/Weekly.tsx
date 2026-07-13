@@ -5,7 +5,7 @@ import { useAppData } from '../store/AppData'
 import { useSentiment } from '../store/Sentiment'
 import { downloadWeekly } from '../lib/exportWeekly'
 import { downloadWeeklyPdf } from '../lib/pdfRender'
-import { emailWeeklyEdition, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
+import { emailWeeklyEdition, meetingRefs, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
 import { generateWeekly, peekWeekly, pendingWeekly } from '../lib/weeklyApi'
 import { listEditions } from '../lib/weeklyEditions'
 import { weeklyToneView } from '../lib/tone'
@@ -19,6 +19,7 @@ import { EditionSwitcher } from '../components/EditionSwitcher'
 import { RichText, entityTerms } from '../components/RichText'
 import { ToneMeter } from '../components/ToneMeter'
 import { WeeklyPeople } from '../components/WeeklyPeople'
+import { WeeklyChat } from '../components/WeeklyChat'
 
 const THEME_STYLES = [
   { tile: 'bg-[#eff5ff] text-[#2563eb] border-[#dbeafe]', icon: 'cloud' },
@@ -33,6 +34,7 @@ export default function Weekly() {
   const { on: sentimentOn } = useSentiment()
   const [params, setParams] = useSearchParams()
   const [weekly, setWeekly] = useState<WeeklySummary | null | undefined>(undefined) // undefined = generating
+  const [chatOpen, setChatOpen] = useState(false)
 
   // Where "Email this edition" sends: the signed-in user's address, or the one
   // they subscribed the weekly brief with. Absent → the menu item is hidden.
@@ -88,6 +90,11 @@ export default function Weekly() {
   scopeRef.current = currentKey
   const hasEpisodes = editionEpisodes.length > 0
   const [refreshing, setRefreshing] = useState(false)
+
+  // Meeting handles for the "Ask about this week" chat — the edition's analysed
+  // meetings, numbered so the server can cite them and answer across the week.
+  const chatMeetings = useMemo(() => meetingRefs(editionEpisodes), [editionEpisodes])
+  const chatRange = currentKey === 'all' ? 'All meetings' : selected?.rangeLabel ?? weekly?.rangeLabel
 
   // Load the SAVED edition for this scope (instant, no reprocess). Generate only when
   // there's nothing saved yet (first time for this scope). Re-runs on edition switch
@@ -214,6 +221,17 @@ export default function Weekly() {
           {editions.length > 0 && <EditionSwitcher editions={editions} currentKey={currentKey} onSelect={selectEdition} />}
           {editionEpisodes.length > 0 && (
             <button
+              onClick={() => setChatOpen(true)}
+              title="Ask questions across this week's meetings"
+              className="press inline-flex items-center gap-2 rounded-lg bg-primary px-3 py-2.5 text-metadata font-semibold text-on-primary hover:bg-primary-container"
+            >
+              <Icon name="forum" size={18} fill />
+              <span className="hidden sm:inline">Ask about this week</span>
+              <span className="sm:hidden">Ask</span>
+            </button>
+          )}
+          {editionEpisodes.length > 0 && (
+            <button
               onClick={refresh}
               disabled={refreshing || weekly === undefined}
               title={newEpisodes.length ? `Refresh to fold in ${newEpisodes.length} newly detected meeting${newEpisodes.length === 1 ? '' : 's'}` : 'Regenerate this edition from the latest meetings (skips the cache)'}
@@ -320,6 +338,10 @@ export default function Weekly() {
           episodeById={episodeById}
           podcastById={podcastById}
         />
+      )}
+
+      {chatOpen && (
+        <WeeklyChat week={currentKey} meetings={chatMeetings} rangeLabel={chatRange} onClose={() => setChatOpen(false)} />
       )}
     </div>
   )

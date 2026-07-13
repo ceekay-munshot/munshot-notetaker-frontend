@@ -12,7 +12,7 @@
 // compiling; they are hidden in the meetings UI.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { Episode, Podcast, Summary, WeeklySchedule, WeeklySummary } from './types'
+import type { Episode, Podcast, Summary, WeeklyAi, WeeklySchedule, WeeklySummary } from './types'
 import type { EmailResult } from './email'
 import { normalizeRecipients } from './recipientsStore'
 import { meetingsFromSegments, decodeMeetingId, type RawSegment } from './meetings'
@@ -204,13 +204,91 @@ export interface PersonRollup {
 }
 
 /** A per-person status rollup across all the signed-in user's meetings: overall
- *  view, what each participant has accomplished, and their current to-dos. */
-export async function fetchWeeklyPeople(): Promise<PersonRollup[]> {
+ *  view, what each participant has accomplished, and their current to-dos. The
+ *  Worker persists this per user and only rebuilds it when the meetings change;
+ *  pass { force } (the "Regenerate" button) to rebuild it on demand. */
+export async function fetchWeeklyPeople(opts?: { force?: boolean }): Promise<PersonRollup[]> {
   const data = await request<{ ok: boolean; people?: PersonRollup[] }>('/api/weekly/people', {
     method: 'POST',
-    body: '{}',
+    body: JSON.stringify({ force: !!opts?.force }),
   })
   return data.people || []
+}
+
+// ── Weekly master summary ("summary of summaries") ───────────────────────────────
+// The cross-meeting synthesis is built server-side from each meeting's cached
+// detailed summary and persisted per user + week, so once a week's summary exists
+// it is returned as-is and never regenerated on a normal visit (only Refresh /
+// force rebuilds it). Each meeting carries its 1-based `index` so the model's
+// `[n]` citations line up with the client's deterministic source order.
+
+/** A meeting reference the weekly endpoints authorize + read the summary for. */
+export interface WeeklyMeetingRef {
+  meeting_id: string
+  owner: string
+  /** 1-based citation index in the client's source order (for [n] alignment). */
+  index?: number
+}
+
+export interface WeeklyAiResult {
+  /** The synthesised narrative, or null when no meeting in the week is summarized yet. */
+  ai: WeeklyAi | null
+  /** True when the saved edition was returned (not freshly generated). */
+  cached: boolean
+  generatedAt: number | null
+  /** How many of the requested meetings actually had a summary to synthesise from. */
+  usedCount: number
+  skipped: number
+}
+
+/** Turn a set of episodes into the meeting refs the weekly endpoints expect,
+ *  numbered 1-based in the given (source) order for citation alignment. */
+export function meetingRefs(episodes: Episode[]): WeeklyMeetingRef[] {
+  return episodes.map((e, i) => {
+    const { owner, meetingId } = decodeMeetingId(e.id)
+    return { meeting_id: meetingId, owner, index: i + 1 }
+  })
+}
+
+/** Build (or fetch the saved) weekly master summary for a week bucket. Returns
+ *  `ai: null` when none of the week's meetings are summarized yet. */
+export async function fetchWeeklyAiSummary(
+  week: string,
+  meetings: WeeklyMeetingRef[],
+  opts: { range?: string; force?: boolean } = {},
+): Promise<WeeklyAiResult> {
+  const data = await request<{
+    ok: boolean
+    ai?: WeeklyAi | null
+    cached?: boolean
+    generatedAt?: number | null
+    usedCount?: number
+    skipped?: number
+  }>('/api/weekly/summary', {
+    method: 'POST',
+    body: JSON.stringify({ week, range: opts.range || '', force: !!opts.force, meetings }),
+  })
+  return {
+    ai: data.ai ?? null,
+    cached: !!data.cached,
+    generatedAt: data.generatedAt ?? null,
+    usedCount: data.usedCount ?? 0,
+    skipped: data.skipped ?? 0,
+  }
+}
+
+/** Free-form chat over a week's meeting summaries + the saved master summary.
+ *  `messages` is the running conversation; returns the assistant's reply. */
+export async function chatWeekly(
+  week: string,
+  meetings: WeeklyMeetingRef[],
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<string> {
+  const data = await request<{ ok: boolean; reply?: string }>('/api/weekly/chat', {
+    method: 'POST',
+    body: JSON.stringify({ week, meetings, messages }),
+  })
+  return String(data.reply || '')
 }
 
 // ── Admin people tracker ─────────────────────────────────────────────────────

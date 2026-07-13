@@ -45,6 +45,8 @@ export default {
       if (method === "POST" && pathname === "/api/ai") return handleAiChat(request, env);
       if (method === "POST" && pathname === "/api/meetings/sync-titles") return handleSyncMeetingTitles(request, env);
       if (method === "POST" && pathname === "/api/weekly/people") return handleWeeklyPeople(request, env);
+      if (method === "POST" && pathname === "/api/weekly/summary") return handleWeeklySummary(request, env);
+      if (method === "POST" && pathname === "/api/weekly/chat") return handleWeeklyChat(request, env);
       if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
@@ -1031,9 +1033,43 @@ async function handleWeeklyPeople(request, env) {
   const rows = (res && res.results) || [];
   if (!rows.length) return json({ ok: true, people: [] });
 
+  // Persist the rollup per user and only rebuild it when the underlying meetings
+  // change (fingerprint = row count + newest created_at) — so a normal revisit is
+  // instant and free, matching the weekly summary's "don't regenerate" behaviour.
+  // The page's "Regenerate" button sends force:true to rebuild on demand.
+  const body = await request.json().catch(() => ({}));
+  const force = !!(body && body.force);
+  let maxCreated = "";
+  for (const r of rows) {
+    const c = String(r.created_at || "");
+    if (c > maxCreated) maxCreated = c;
+  }
+  const fingerprint = `${rows.length}:${maxCreated}`;
+  const cacheKey = `weekly:people:v1:${weeklyScopeEmail(session)}`;
+  if (!force && env.KV) {
+    try {
+      const cached = await env.KV.get(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (parsed && parsed.fingerprint === fingerprint && Array.isArray(parsed.people)) {
+          return json({ ok: true, people: parsed.people, cached: true });
+        }
+      }
+    } catch {
+      /* fall through and regenerate */
+    }
+  }
+
   const model = env.OPENAI_MODEL || "gpt-4o";
   try {
     const people = await peopleRollupFromRows(rows, apiKey, model);
+    if (env.KV) {
+      try {
+        await env.KV.put(cacheKey, JSON.stringify({ fingerprint, people, generatedAt: Date.now() }));
+      } catch {
+        /* best-effort persist */
+      }
+    }
     return json({ ok: true, people });
   } catch (err) {
     return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
@@ -1119,6 +1155,315 @@ async function peopleRollupFromRows(rows, apiKey, model, focusName) {
         }))
         .filter((p) => p.name)
     : [];
+}
+
+/* ------------------------------ weekly master summary ("summary of summaries") ------------------------------ */
+// The Weekly Summary is a synthesis ACROSS a week's meetings — a summary built on
+// the individual meeting summaries. The per-meeting detailed summaries are already
+// generated and cached in KV (summary:v2:<id>) by /api/ai and the auto-summary
+// cron; this endpoint reads those, feeds them to one model call, and produces the
+// cross-meeting narrative (overview + thematic key points + open questions). The
+// result is persisted per USER, per WEEK (weekly:summary:v1:<email>:<weekKey>), so
+// once a week's summary exists it is served as-is on every later visit and is
+// NEVER regenerated on a normal load — only an explicit Refresh (force) rebuilds
+// it. The [n] citations reuse the client's source order (each meeting carries its
+// 1-based `index`) so they line up with the on-screen "Sources" list.
+
+// KV key for a user's saved weekly master summary for one week bucket. Admin's
+// all-meetings view is scoped under "__admin".
+function weeklySummaryKey(scopeEmail, week) {
+  return `weekly:summary:v1:${scopeEmail}:${week}`;
+}
+
+// The email (or admin marker) a weekly summary / per-person rollup is saved under.
+function weeklyScopeEmail(session) {
+  return session.isAdmin ? "__admin" : normalizeEmail(session.identity);
+}
+
+// A JSON-mode OpenAI call — like openaiChat, but forces a strict-JSON response and
+// returns the parsed object (or {} on unparseable output). Used by the weekly
+// synthesis, which needs structured overview / themes / questions back.
+async function openaiJson(apiKey, model, messages, maxTokens) {
+  const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model, messages, temperature: 0.2, max_tokens: maxTokens, response_format: { type: "json_object" } }),
+  });
+  const data = await upstream.json().catch(() => ({}));
+  if (!upstream.ok) throw new Error((data && data.error && data.error.message) || `HTTP ${upstream.status}`);
+  const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "{}";
+  try {
+    return JSON.parse(content);
+  } catch {
+    return {};
+  }
+}
+
+// Load the cached detailed summary for each requested meeting the caller may see.
+// `meetings` is [{ meeting_id, owner?, index? }] in the client's source order.
+// Admin sees every meeting; a normal user must own the meeting (same ACL as
+// /api/ai). Meetings with no cached summary yet are skipped (the weekly is a
+// summary OF summaries — it never re-transcribes). Returns
+// [{ index, meetingId, title, summary }], deduped, capped by the caller.
+async function loadWeeklyMeetingSummaries(env, session, meetings) {
+  const out = [];
+  const seen = new Set();
+  for (const m of meetings) {
+    const meetingId = String((m && m.meeting_id) || "").trim();
+    if (!meetingId || seen.has(meetingId)) continue;
+    seen.add(meetingId);
+    if (!session.isAdmin) {
+      const email = normalizeEmail(session.identity);
+      try {
+        const owns = await env.DB.prepare(
+          "SELECT 1 FROM transcriptions WHERE meeting_id = ?2 AND (" +
+          "EXISTS (SELECT 1 FROM meeting_owners WHERE meeting_id = ?2 AND owner_email = ?1) " +
+          "OR owner_email = ?1) LIMIT 1"
+        ).bind(email, meetingId).all();
+        if (!owns.results || !owns.results.length) continue;
+      } catch {
+        continue; // one bad lookup shouldn't sink the batch
+      }
+    }
+    let summary = "";
+    try {
+      summary = (await env.KV.get(summaryCacheKey(meetingId))) || "";
+    } catch {
+      /* KV hiccup — treat as no summary */
+    }
+    if (!summary.trim()) continue;
+    let title = "";
+    try {
+      title = (await env.KV.get(titleCacheKey(meetingId))) || "";
+    } catch {
+      /* title is best-effort */
+    }
+    const index = Number(m && m.index);
+    out.push({
+      index: Number.isFinite(index) && index > 0 ? index : out.length + 1,
+      meetingId,
+      title: (title && title.trim()) || `Meeting ${meetingId}`,
+      summary: summary.trim(),
+    });
+  }
+  return out;
+}
+
+// The cross-meeting synthesis call. Feeds each meeting's cached summary (numbered
+// [n] for citations) to the model and asks for a structured weekly briefing.
+// Returns the WeeklyAi shape the client merges over its deterministic base
+// (quantTable / episodeReadouts stay empty — they're podcast-only modules).
+async function synthesizeWeekly(sources, range, apiKey, model) {
+  const MAX = 42000;
+  let text = "";
+  let used = 0;
+  for (const s of sources) {
+    const block = `\n[${s.index}] ${s.title}\n${s.summary}\n`;
+    if (text.length + block.length > MAX) {
+      text += `\n…[${sources.length - used} more meeting summaries omitted]…\n`;
+      break;
+    }
+    text += block;
+    used++;
+  }
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You are an expert chief-of-staff who writes a team's WEEKLY MASTER BRIEFING by synthesizing across " +
+        "several individual meeting summaries — a summary of summaries. Work ONLY from the summaries provided; " +
+        "never invent names, decisions, numbers, or owners. Each summary is numbered like [1], [2]; cite the " +
+        "source meeting(s) for every claim with those bracketed numbers. Group insights by THEME across " +
+        "meetings, not meeting-by-meeting. Write clear, professional English. Respond with STRICT JSON only.",
+    },
+    {
+      role: "user",
+      content:
+        `Produce the weekly cross-meeting synthesis${range ? ` for ${range}` : ""} from the ${sources.length} ` +
+        "meeting summaries below.\n\n" +
+        "Return a JSON object with EXACTLY these keys:\n" +
+        '- "overview": an array of 2-4 paragraph strings — the narrative of the week: the main workstreams, how ' +
+        "they progressed, the key decisions, and where things stand. Weave in [n] citations.\n" +
+        '- "keyThemes": an array (max 6) of {"heading": string, "points": string[]}. Each heading is a short ' +
+        'theme, decision area, or workstream (e.g. "Product & Dashboard", "Key Decisions", "Risks & Blockers"). ' +
+        "Each point is a concrete, claim-first bullet that ends with its [n] citation(s). Include a " +
+        '"Key Decisions" cluster, and — when the meetings surface them — a "Risks & Blockers" cluster.\n' +
+        '- "questions": an array (max 6) of the open questions / unresolved items across the week.\n\n' +
+        "Keep every specific — people, projects, tools, clients, numbers, deadlines. Omit a section (empty " +
+        "array) rather than pad it. Return JSON of the exact shape: " +
+        '{"overview":[],"keyThemes":[{"heading":"","points":[]}],"questions":[]}.\n\n' +
+        "MEETING SUMMARIES:\n" + text,
+    },
+  ];
+  const parsed = await openaiJson(apiKey, model, messages, 2000);
+  const overview = Array.isArray(parsed.overview)
+    ? parsed.overview.map((p) => String(p || "").trim()).filter(Boolean)
+    : [];
+  const keyThemes = Array.isArray(parsed.keyThemes)
+    ? parsed.keyThemes
+        .map((t) => ({
+          heading: String((t && t.heading) || "").trim(),
+          points: Array.isArray(t && t.points) ? t.points.map((p) => String(p || "").trim()).filter(Boolean) : [],
+        }))
+        .filter((t) => t.heading && t.points.length)
+    : [];
+  const questions = Array.isArray(parsed.questions)
+    ? parsed.questions.map((q) => String(q || "").trim()).filter(Boolean)
+    : [];
+  return { overview, keyThemes, quantTable: [], episodeReadouts: [], questions };
+}
+
+// POST /api/weekly/summary — build (or return the saved) weekly master summary for
+// the signed-in user and a week bucket. Body: { week, range?, force?, meetings:
+// [{ meeting_id, owner?, index? }] }. Returns { ok, cached, ai, usedCount,
+// skipped, generatedAt, meetingIds }. `ai` is null when none of the week's
+// meetings have a summary yet (the UI keeps its deterministic edition then).
+async function handleWeeklySummary(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+  if (!env.KV) return json({ error: "Storage is not connected yet" }, 503);
+
+  const body = await request.json().catch(() => ({}));
+  const week = String(body.week || "all").trim() || "all";
+  const range = String(body.range || "").trim();
+  const force = !!body.force;
+  const meetings = Array.isArray(body.meetings) ? body.meetings.slice(0, 40) : [];
+
+  const scopeEmail = weeklyScopeEmail(session);
+  const cacheKey = weeklySummaryKey(scopeEmail, week);
+
+  // Once a week's summary exists for this user it is served as-is — never
+  // regenerated on a normal visit. Only an explicit Refresh (force) rebuilds it.
+  if (!force) {
+    try {
+      const cached = await env.KV.get(cacheKey);
+      if (cached) return json({ ok: true, cached: true, ...JSON.parse(cached) });
+    } catch {
+      /* fall through and rebuild */
+    }
+  }
+
+  const sources = await loadWeeklyMeetingSummaries(env, session, meetings);
+  if (!sources.length) {
+    return json({ ok: true, cached: false, ai: null, usedCount: 0, skipped: meetings.length, generatedAt: null });
+  }
+
+  let ai;
+  try {
+    ai = await synthesizeWeekly(sources, range, apiKey, env.OPENAI_MODEL || "gpt-4o");
+  } catch (err) {
+    return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
+  }
+
+  const payload = {
+    ai,
+    usedCount: sources.length,
+    skipped: meetings.length - sources.length,
+    generatedAt: Date.now(),
+    meetingIds: sources.map((s) => s.meetingId),
+  };
+  try {
+    await env.KV.put(cacheKey, JSON.stringify(payload));
+  } catch {
+    /* best-effort persist — still return what we just built */
+  }
+  return json({ ok: true, cached: false, ...payload });
+}
+
+// Flatten a saved WeeklyAi into plain text, so the chat can ground its answers on
+// the master synthesis as well as the raw meeting summaries.
+function weeklyAiToText(ai) {
+  if (!ai || typeof ai !== "object") return "";
+  const parts = [];
+  const overview = Array.isArray(ai.overview) ? ai.overview : [];
+  if (overview.length) parts.push("OVERVIEW:\n" + overview.join("\n\n"));
+  for (const t of Array.isArray(ai.keyThemes) ? ai.keyThemes : []) {
+    if (!t) continue;
+    const points = Array.isArray(t.points) ? t.points : [];
+    parts.push(`${t.heading || "Theme"}:\n` + points.map((p) => `- ${p}`).join("\n"));
+  }
+  const questions = Array.isArray(ai.questions) ? ai.questions : [];
+  if (questions.length) parts.push("OPEN QUESTIONS:\n" + questions.map((q) => `- ${q}`).join("\n"));
+  return parts.join("\n\n");
+}
+
+// The grounding context for the weekly chat: the master synthesis (when saved)
+// plus the individual meeting summaries, length-bounded so a big week stays a
+// single model call.
+function buildWeeklyChatContext(sources, master) {
+  const MAX = 40000;
+  let out = "";
+  if (master) out += "WEEKLY MASTER SUMMARY:\n" + master + "\n\n";
+  out += "MEETING SUMMARIES:\n";
+  let used = 0;
+  for (const s of sources) {
+    const block = `\n=== ${s.title} ===\n${s.summary}\n`;
+    if (out.length + block.length > MAX) {
+      out += `\n…[${sources.length - used} more meeting summaries omitted]…\n`;
+      break;
+    }
+    out += block;
+    used++;
+  }
+  return out.trim();
+}
+
+// POST /api/weekly/chat — free-form Q&A grounded on a week's meeting summaries
+// (and the saved master summary). Body: { week, meetings: [{ meeting_id, owner? }],
+// messages: [{ role, content }] }. Same per-meeting ACL as /api/ai.
+async function handleWeeklyChat(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+  if (!env.KV) return json({ error: "Storage is not connected yet" }, 503);
+
+  const body = await request.json().catch(() => ({}));
+  const week = String(body.week || "all").trim() || "all";
+  const meetings = Array.isArray(body.meetings) ? body.meetings.slice(0, 40) : [];
+  const clientMessages = Array.isArray(body.messages) ? body.messages : [];
+
+  const sources = await loadWeeklyMeetingSummaries(env, session, meetings);
+  let master = "";
+  try {
+    const cached = await env.KV.get(weeklySummaryKey(weeklyScopeEmail(session), week));
+    if (cached) master = weeklyAiToText(JSON.parse(cached).ai);
+  } catch {
+    /* master is optional extra grounding */
+  }
+  if (!sources.length && !master) {
+    return json({ error: "No summarized meetings for this week yet — analyse some meetings first." }, 404);
+  }
+
+  const messages = [
+    {
+      role: "system",
+      content:
+        "You are a helpful assistant that answers questions about a team's week of meetings. You are given a " +
+        "weekly master summary and the individual meeting summaries it was built from. Answer ONLY from that " +
+        "material; if something isn't covered, say so briefly. Prefer short paragraphs and bullet points, and " +
+        "never invent names, numbers, decisions, or owners.\n\n" + buildWeeklyChatContext(sources, master),
+    },
+  ];
+  for (const m of clientMessages.slice(-12)) {
+    const role = m && m.role === "assistant" ? "assistant" : "user";
+    const content = String((m && m.content) || "").slice(0, 4000);
+    if (content) messages.push({ role, content });
+  }
+  if (messages.length === 1) {
+    messages.push({ role: "user", content: "Give me a concise recap of this week across all the meetings." });
+  }
+
+  try {
+    const reply = await openaiChat(apiKey, env.OPENAI_MODEL || "gpt-4o", messages, 800, 0.3);
+    return json({ ok: true, reply });
+  } catch (err) {
+    return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
+  }
 }
 
 /* ------------------------------ people tracking (admin) ------------------------------ */
