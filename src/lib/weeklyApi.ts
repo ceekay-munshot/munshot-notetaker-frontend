@@ -1,5 +1,6 @@
 import type { Episode, Podcast, WeeklyAi, WeeklySummary } from './types'
 import { scopedKey } from './storageScope'
+import { fetchWeeklyAiSummary, meetingRefs } from './api'
 import { assembleWeekly, buildCitations, buildShowDigests, buildWeeklySources, hashKey, mergeWeeklyAi, rangeLabel } from './weeklyAssemble'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -107,7 +108,7 @@ export async function generateWeekly(
     const base = assembleWeekly(ready, podcastById, { rangeLabel: range, id: `wk-${contentKey}` })
     // Guidepoint AI layer (overview, key themes, quant table, readouts, questions) with
     // the deterministic fallback baked into mergeWeeklyAi.
-    const ai = await aiSynthesize(ready, range, podcastById, { id: `weekly:${contentKey}`, force: opts.force })
+    const ai = await aiSynthesize(ready, range, podcastById, { scope, force: opts.force })
     const weekly = ai ? mergeWeeklyAi(base, ai) : base
     SESSION.set(ck, weekly)
     writeCache(ck, weekly)
@@ -122,18 +123,30 @@ export async function generateWeekly(
 }
 
 // ── AI narrative ──────────────────────────────────────────────────────────────
-// In the visual shell there is no /api/summary backend, so the AI synthesis layer
-// is unavailable. Returning null makes generateWeekly keep the always-real
-// deterministic edition (weeklyAssemble.ts) — the by-show digests, themes,
-// mentions, pull-quote, sources and date range, all built locally from the
-// analysed episodes. No network call is made.
+// The cross-meeting synthesis (overview + thematic key points + open questions) is
+// built server-side (POST /api/weekly/summary) from each meeting's cached detailed
+// summary — a real "summary of summaries". The Worker persists it per user + week,
+// so once a week's edition exists it comes back cached and is never regenerated on
+// a normal load; only Refresh (force) rebuilds it. `ready` is newest-first, so the
+// 1-based meeting order matches the deterministic base's citation map and the
+// model's `[n]` markers line up. Any failure (no key, offline, error) returns null
+// and generateWeekly keeps the deterministic edition — the feature degrades, never
+// breaks.
 async function aiSynthesize(
-  _ready: Episode[],
-  _range: string,
+  ready: Episode[],
+  range: string,
   _podcastById: ById,
-  _opts: { id?: string; force?: boolean } = {},
+  opts: { scope?: string; force?: boolean } = {},
 ): Promise<WeeklyAi | null> {
-  return null
+  try {
+    const res = await fetchWeeklyAiSummary(opts.scope || 'all', meetingRefs(ready), {
+      range,
+      force: opts.force,
+    })
+    return res.ai
+  } catch {
+    return null
+  }
 }
 
 function readCache(storageKey: string): WeeklySummary | null {
