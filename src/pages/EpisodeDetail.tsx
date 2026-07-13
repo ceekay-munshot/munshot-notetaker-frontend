@@ -91,7 +91,7 @@ export default function EpisodeDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const [params] = useSearchParams()
-  const { episodeById, podcastById, summarizeEpisode, needsApiKey, identity } = useAppData()
+  const { episodeById, podcastById, summarizeEpisode, needsApiKey, identity, isAdmin, calendarReady } = useAppData()
   const { on: sentimentOn } = useSentiment()
 
   // Where "Email this edition" sends: the signed-in user's address, or the one
@@ -158,11 +158,15 @@ export default function EpisodeDetail() {
   // the store hit costs no LLM/transcription). Idempotent — AppData dedupes per id.
   useEffect(() => {
     if (!episode || episode.status === 'failed') return
+    // Wait for the calendar to finish loading first — otherwise a meeting with a
+    // real calendar name can get judged nameless (and AI-titled) purely because
+    // calendar data hadn't arrived yet when this fired.
+    if (!isAdmin && !calendarReady) return
     // A meeting already carries its transcript; generate the AI summary the first
     // time it's opened (idempotent — AppData dedupes per id).
     if (!episode.summary && !!episode.transcript?.length) summarizeEpisode(episode, podcast)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [episode?.id])
+  }, [episode?.id, calendarReady, isAdmin])
 
   if (!episode || !podcast) {
     return (
