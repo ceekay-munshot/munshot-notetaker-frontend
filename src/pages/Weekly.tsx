@@ -9,12 +9,11 @@ import { emailWeeklyEdition, meetingRefs, registerWeeklyRecipient, unregisterWee
 import { generateWeekly, peekWeekly, pendingWeekly } from '../lib/weeklyApi'
 import { listEditions } from '../lib/weeklyEditions'
 import { weeklyToneView } from '../lib/tone'
-import type { Episode, WeeklyEpisodeReadout, WeeklyIdea, WeeklyShowDigest, WeeklySummary } from '../lib/types'
+import type { WeeklySummary } from '../lib/types'
 import { Icon } from '../components/Icon'
 import { DownloadMenu } from '../components/DownloadMenu'
 import { readSubscribedEmail } from '../components/WeeklySubscribe'
 import { loadRecipients, addRecipient, removeRecipient } from '../lib/recipientsStore'
-import { groupQuantByEpisode } from '../lib/weeklyQuant'
 import { EditionSwitcher } from '../components/EditionSwitcher'
 import { RichText, entityTerms } from '../components/RichText'
 import { ToneMeter } from '../components/ToneMeter'
@@ -346,7 +345,6 @@ export default function Weekly() {
           ready={editionEpisodes}
           trackedCount={podcasts.filter((p) => p.tracked).length}
           episodeById={episodeById}
-          podcastById={podcastById}
         />
       )}
 
@@ -363,26 +361,20 @@ function WeeklyDoc({
   ready,
   trackedCount,
   episodeById,
-  podcastById,
 }: {
   weekly: WeeklySummary
   ready: ReturnType<typeof useAppData>['episodes']
   trackedCount: number
   episodeById: ReturnType<typeof useAppData>['episodeById']
-  podcastById: ReturnType<typeof useAppData>['podcastById']
 }) {
   const [active, setActive] = useState('overview')
   const terms = entityTerms(weekly.mentions)
-  const interestingEpisode = episodeById(weekly.interesting.episodeId)
-  const hasMentions = weekly.mentions.people.length > 0 || weekly.mentions.companies.length > 0
   const shows = weekly.shows ?? [] // older cached digests predate the by-show shape
   const ideaCount = shows.reduce((n, s) => n + s.ideas.length, 0)
 
-  // The synthesised Guidepoint layers (present once an LLM key has run). When they
-  // exist they ARE the body; the by-show breakdown demotes to the no-AI fallback.
+  // The synthesised Guidepoint key-points layer (present once an LLM key has run;
+  // otherwise the deterministic fallback baked into assembleWeekly).
   const keyThemes = weekly.keyThemes ?? []
-  const quantTable = weekly.quantTable ?? []
-  const readouts = weekly.episodeReadouts ?? []
   const citations = weekly.citations ?? []
   const synthesised = keyThemes.length > 0
   const epForCite = (index: number) => episodeById(citations.find((c) => c.index === index)?.episodeId ?? '')
@@ -394,19 +386,13 @@ function WeeklyDoc({
     { icon: 'forum', label: 'Meetings', value: trackedCount, style: THEME_STYLES[3] },
   ]
 
-  // Only nav to sections that actually have content (zero empty/fake sections). The
-  // synthesised Key Points / Quant / Comparison lead; by-show is the fallback body.
+  // Only Overview, Per Person, and Key Points — the rest of the Guidepoint-shaped
+  // sections (Quantitative, Investment Readout, by-show, Top Themes, Mentions,
+  // Interesting, Sources) are hidden from the weekly by design.
   const nav = [
     { id: 'overview', label: 'Overview', icon: 'play_circle', show: weekly.overview.length > 0 },
     { id: 'people', label: 'Per Person', icon: 'groups', show: true },
     { id: 'key-points', label: 'Key Points', icon: 'format_list_bulleted', show: synthesised },
-    { id: 'quant', label: 'Quantitative', icon: 'monitoring', show: quantTable.length > 0 },
-    { id: 'readout', label: 'Investment Readout', icon: 'fact_check', show: readouts.length > 0 },
-    ...(synthesised ? [] : shows.map((s) => ({ id: `show-${s.podcastId}`, label: s.show, icon: 'forum', show: true }))),
-    { id: 'themes', label: 'Top Themes', icon: 'sell', show: !synthesised && weekly.topThemes.length > 0 },
-    { id: 'mentions', label: 'Mentions', icon: 'alternate_email', show: hasMentions },
-    { id: 'interesting', label: 'Interesting', icon: 'lightbulb', show: !!weekly.interesting.quote },
-    { id: 'sources', label: 'Sources', icon: 'menu_book', show: weekly.sourceEpisodeIds.length > 0 },
   ].filter((n) => n.show)
 
   function go(id: string) {
@@ -490,154 +476,6 @@ function WeeklyDoc({
             </Block>
           )}
 
-          {/* Quantitative Summary — the hard numbers, grouped by source episode */}
-          {quantTable.length > 0 && (
-            <Block id="wk-quant" title="Quantitative Summary">
-              <div className="space-y-4">
-                {groupQuantByEpisode(quantTable, weekly.citations ?? []).map((g, gi) => (
-                  <div key={gi}>
-                    {g.label && <h4 className="mb-1.5 text-[13px] font-semibold text-on-surface">{g.label}</h4>}
-                    <DataTable
-                      cols={[{ h: 'Metric' }, { h: 'Value', align: 'right' }, { h: 'Context' }]}
-                      rows={g.rows.map((q) => [q.metric, q.value, q.context])}
-                    />
-                  </div>
-                ))}
-              </div>
-            </Block>
-          )}
-
-          {/* Investment Readout — per-episode evidence, interpretation, and what to verify */}
-          {readouts.length > 0 && (
-            <Block id="wk-readout" title="Investment Readout">
-              <p className="mb-3 max-w-3xl text-[13px] leading-relaxed text-secondary">
-                One readout per episode — what the podcast <em>actually said</em>, kept strictly separate from the investment interpretation, with the external checks to run next.
-              </p>
-              <DataTable
-                cols={[{ h: 'Episode' }, { h: 'Investable Theme' }, { h: 'Podcast Evidence' }, { h: 'Investment Interpretation' }, { h: 'Names / Sectors' }, { h: 'Confidence' }, { h: 'Action' }]}
-                rows={readouts.map((r) => {
-                  const ep = r.episodeId ? episodeById(r.episodeId) : undefined
-                  const wrap = (s: string, w: string) => <div className={`${w} whitespace-normal`}>{stripCites(s)}</div>
-                  return [
-                    ep ? (
-                      <Link to={`/meetings/${ep.id}`} className="press inline-block max-w-[9rem] font-medium text-primary hover:underline">
-                        {r.episode}
-                      </Link>
-                    ) : (
-                      <div className="max-w-[9rem]">{r.episode}</div>
-                    ),
-                    wrap(r.theme, 'max-w-[11rem] font-medium text-on-surface'),
-                    wrap(r.evidence, 'max-w-[18rem]'),
-                    wrap(r.interpretation, 'max-w-[18rem]'),
-                    <div className="max-w-[10rem] whitespace-normal">{r.namesSectors}</div>,
-                    <ConfidenceBadge level={r.confidence} />,
-                    wrap(r.action, 'max-w-[14rem]'),
-                  ]
-                })}
-              />
-              <div className="mt-5 space-y-3">
-                {readouts.map((r, i) => (
-                  <ReadoutCard key={i} r={r} ep={r.episodeId ? episodeById(r.episodeId) : undefined} />
-                ))}
-              </div>
-            </Block>
-          )}
-
-          {/* By show — the no-AI fallback body (when no synthesised Key Points) */}
-          {!synthesised &&
-            shows.map((digest, i) => (
-              <ShowDigest
-                key={digest.podcastId}
-                digest={digest}
-                first={i === 0 && weekly.overview.length === 0}
-                terms={terms}
-                episodeById={episodeById}
-              />
-            ))}
-
-          {/* Themes (fallback only) */}
-          {!synthesised && weekly.topThemes.length > 0 && (
-            <Block id="wk-themes" title="Top Themes">
-              <div className="flex flex-wrap gap-2.5">
-                {weekly.topThemes.map((t, i) => {
-                  const s = THEME_STYLES[i % THEME_STYLES.length]
-                  return (
-                    <Link
-                      key={t.label}
-                      to={`/search?q=${encodeURIComponent(t.label)}`}
-                      className={`press inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-[14px] font-medium ${s.tile}`}
-                    >
-                      <Icon name={s.icon} size={16} /> {t.label}
-                    </Link>
-                  )
-                })}
-              </div>
-            </Block>
-          )}
-
-          {/* Mentions (cross-show) */}
-          {hasMentions && (
-            <Block id="wk-mentions" title="Mentions">
-              <div className="grid grid-cols-1 gap-md sm:grid-cols-2">
-                {weekly.mentions.people.length > 0 && <MentionGroup title="People" icon="person" items={weekly.mentions.people} />}
-                {weekly.mentions.companies.length > 0 && <MentionGroup title="Companies" icon="domain" items={weekly.mentions.companies} />}
-              </div>
-            </Block>
-          )}
-
-          {/* Interesting (cross-show) */}
-          {weekly.interesting.quote && (
-            <Block id="wk-interesting" title="What Was Actually Interesting">
-              <div className="relative overflow-hidden rounded-xl p-md text-white" style={{ background: 'linear-gradient(135deg, #2563eb, #1d4ed8)' }}>
-                <Icon name="lightbulb" className="absolute -right-5 -top-5 text-[130px] text-white/10" />
-                {weekly.interesting.title && (
-                  <p className="relative text-[19px] font-semibold leading-snug text-white">{weekly.interesting.title}</p>
-                )}
-                <p className="relative mt-1.5 text-body-lg italic text-white/90">{weekly.interesting.quote}</p>
-                <div className="relative mt-md flex items-center justify-between">
-                  <div>
-                    <p className="text-metadata font-bold">{weekly.interesting.speaker}</p>
-                    <p className="text-metadata text-white/70">{weekly.interesting.role}</p>
-                  </div>
-                  {interestingEpisode && (
-                    <Link
-                      to={`/meetings/${interestingEpisode.id}`}
-                      className="press inline-flex items-center gap-1.5 rounded-lg bg-white/15 px-3 py-2 text-metadata font-semibold backdrop-blur hover:bg-white/25"
-                    >
-                      <Icon name="open_in_new" size={16} /> Double-click this
-                    </Link>
-                  )}
-                </div>
-              </div>
-            </Block>
-          )}
-
-          {/* Source citations */}
-          <footer id="wk-sources" className="mt-lg scroll-mt-20 border-t border-outline-variant pt-lg">
-            <h3 className="mb-md text-[17px] font-semibold text-on-surface">Sources</h3>
-            <div className="space-y-1">
-              {weekly.sourceEpisodeIds.map(episodeById).map((ep) => {
-                if (!ep) return null
-                const podcast = podcastById(ep.podcastId)
-                return (
-                  <Link
-                    key={ep.id}
-                    to={`/meetings/${ep.id}`}
-                    className="group flex items-center justify-between gap-md rounded-lg p-2 transition-colors hover:bg-surface-container-low"
-                  >
-                    <div className="flex min-w-0 items-center gap-3">
-                      <Icon name="play_circle" className="shrink-0 text-primary" />
-                      <div className="min-w-0">
-                        <p className="truncate text-body-md font-medium text-on-surface">{ep.title}</p>
-                        <p className="truncate text-metadata text-secondary">{podcast?.title}</p>
-                      </div>
-                    </div>
-                    <Icon name="arrow_forward" size={18} className="shrink-0 text-secondary opacity-0 transition-opacity group-hover:opacity-100" />
-                  </Link>
-                )
-              })}
-            </div>
-          </footer>
         </div>
       </div>
     </div>
@@ -680,238 +518,6 @@ function Cited({ text, terms, epForCite }: { text: string; terms: string[]; epFo
   )
 }
 
-// A clean data table shared by the Quantitative Summary + Comparison sections.
-// Cells accept ReactNode so a source cell can be a link; horizontal-scrolls on
-// mobile so wide tables never break the layout.
-function DataTable({ cols, rows }: { cols: { h: string; align?: 'right' }[]; rows: ReactNode[][] }) {
-  return (
-    <div className="overflow-x-auto rounded-xl border border-outline-variant">
-      <table className="w-full border-collapse text-[13.5px]">
-        <caption className="sr-only">{cols.map((c) => c.h).join(', ')}</caption>
-        <thead>
-          <tr className="border-b border-outline-variant bg-surface-container-low">
-            {cols.map((c, i) => (
-              <th
-                key={i}
-                scope="col"
-                className={`px-3 py-2 text-label-caps uppercase text-secondary ${c.align === 'right' ? 'text-right' : 'text-left'}`}
-              >
-                {c.h}
-              </th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row, ri) => (
-            <tr key={ri} className="border-b border-outline-variant last:border-0 even:bg-surface-container-low/60">
-              {row.map((cell, ci) => (
-                <td
-                  key={ci}
-                  className={`px-3 py-2 align-top ${cols[ci]?.align === 'right' ? 'whitespace-nowrap text-right font-semibold tabular-nums text-on-surface' : 'text-on-surface-variant'}`}
-                >
-                  {cell}
-                </td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
-// Each readout's evidence/interpretation already sits under its episode, so the
-// inline [n] citation markers are redundant noise — strip them for display.
-function stripCites(s: string): string {
-  return s.replace(/\s*\[\d+\]/g, '').replace(/\s{2,}/g, ' ').trim()
-}
-
-function ConfidenceBadge({ level }: { level: 'Low' | 'Medium' | 'High' }) {
-  const tone =
-    level === 'High'
-      ? 'bg-success-container text-on-success-container'
-      : level === 'Low'
-        ? 'bg-surface-container text-secondary'
-        : 'bg-primary/10 text-primary'
-  return <span className={`inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold ${tone}`}>{level}</span>
-}
-
-// Per-episode investment readout card — evidence kept visually distinct from the
-// interpretation, with the external checks and the next action.
-function ReadoutCard({ r, ep }: { r: WeeklyEpisodeReadout; ep?: Episode }) {
-  const Section = ({ label, children }: { label: string; children: ReactNode }) => (
-    <div className="mt-3">
-      <div className="mb-1 text-label-caps uppercase text-secondary">{label}</div>
-      <div className="text-[13px] leading-relaxed text-on-surface-variant">{children}</div>
-    </div>
-  )
-  return (
-    <div className="rounded-xl border border-outline-variant bg-surface-container-lowest p-4">
-      <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
-        <div className="min-w-0">
-          {ep ? (
-            <Link to={`/meetings/${ep.id}`} className="press text-[15px] font-semibold text-on-surface hover:underline">
-              {r.episode}
-            </Link>
-          ) : (
-            <span className="text-[15px] font-semibold text-on-surface">{r.episode}</span>
-          )}
-          <p className="mt-0.5 text-[13px] font-medium text-primary">{r.theme}</p>
-        </div>
-        <ConfidenceBadge level={r.confidence} />
-      </div>
-      {r.namesSectors && r.namesSectors !== '—' && <p className="mt-1.5 text-[11.5px] text-secondary">{r.namesSectors}</p>}
-      <Section label="Podcast evidence">{stripCites(r.evidence)}</Section>
-      <Section label="Investment interpretation">{stripCites(r.interpretation)}</Section>
-      {r.questionsToVerify.length > 0 && (
-        <Section label="Questions to verify">
-          <ul className="list-disc space-y-0.5 pl-4">
-            {r.questionsToVerify.map((q, i) => (
-              <li key={i}>{stripCites(q)}</li>
-            ))}
-          </ul>
-        </Section>
-      )}
-      {r.action && <Section label="Action">{stripCites(r.action)}</Section>}
-    </div>
-  )
-}
-
-const KIND_LABEL: Record<NonNullable<WeeklyIdea['kind']>, string> = {
-  stock: 'Stock',
-  trade: 'Trade',
-  macro: 'Macro',
-  prediction: 'Prediction',
-}
-
-// One show's slice of the week: its pitched ideas first (the headline value), then
-// its key takeaways and open questions. Subheads are hidden when a group is empty.
-function ShowDigest({
-  digest,
-  first,
-  terms,
-  episodeById,
-}: {
-  digest: WeeklyShowDigest
-  first?: boolean
-  terms: string[]
-  episodeById: ReturnType<typeof useAppData>['episodeById']
-}) {
-  return (
-    <section
-      id={`wk-show-${digest.podcastId}`}
-      className={`scroll-mt-20 ${first ? '' : 'mt-lg border-t border-outline-variant pt-lg'}`}
-    >
-      <div className="mb-md flex items-center gap-2.5">
-        <span className="grid h-8 w-8 place-items-center rounded-lg bg-primary-fixed/60 text-primary">
-          <Icon name="forum" size={18} />
-        </span>
-        <h3 className="text-[18px] font-bold tracking-tight text-on-surface">{digest.show}</h3>
-        <span className="text-metadata text-secondary">
-          {digest.episodeCount} meeting{digest.episodeCount === 1 ? '' : 's'}
-        </span>
-      </div>
-
-      {digest.ideas.length > 0 && (
-        <div className="mb-md">
-          <p className="mb-sm flex items-center gap-1.5 text-metadata font-semibold uppercase tracking-wide text-secondary">
-            <Icon name="trending_up" size={15} className="text-primary" /> Ideas Pitched
-          </p>
-          <ul className="space-y-2.5">
-            {digest.ideas.map((idea, i) => (
-              <IdeaCard key={i} idea={idea} terms={terms} episodeById={episodeById} />
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {digest.takeaways.length > 0 && (
-        <div className="mb-md">
-          <p className="mb-sm text-metadata font-semibold uppercase tracking-wide text-secondary">Key Takeaways</p>
-          <ul className="space-y-2.5">
-            {digest.takeaways.map((t, i) => (
-              <li key={i} className="flex gap-2.5 text-body-md text-on-surface-variant">
-                <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
-                <span>
-                  <span className="font-semibold text-on-surface">{t.title}.</span> <RichText text={t.detail} terms={terms} />
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {digest.questions.length > 0 && (
-        <div>
-          <p className="mb-sm text-metadata font-semibold uppercase tracking-wide text-secondary">Questions</p>
-          <ul className="space-y-1.5">
-            {digest.questions.map((q, i) => (
-              <li key={i} className="flex items-start gap-2 text-body-md text-on-surface-variant">
-                <Icon name="help" size={18} className="mt-0.5 shrink-0 text-primary" />
-                <span>
-                  <RichText text={q} terms={terms} />
-                </span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </section>
-  )
-}
-
-// A single pitched idea: the call (with a category badge), who pitched it, the
-// thesis bullets, and a jump to the episode it came from.
-function IdeaCard({
-  idea,
-  terms,
-  episodeById,
-}: {
-  idea: WeeklyIdea
-  terms: string[]
-  episodeById: ReturnType<typeof useAppData>['episodeById']
-}) {
-  const ep = episodeById(idea.episodeId)
-  return (
-    <li className="rounded-xl border border-outline-variant bg-surface-container-low p-md">
-      <div className="flex items-start justify-between gap-3">
-        <p className="text-body-md font-semibold text-on-surface">
-          {idea.kind && (
-            <span className="mr-2 inline-block rounded bg-primary-fixed/70 px-1.5 py-0.5 align-middle text-[10px] font-bold uppercase tracking-wide text-primary">
-              {KIND_LABEL[idea.kind]}
-            </span>
-          )}
-          <RichText text={idea.idea} terms={terms} />
-        </p>
-        {ep && (
-          <Link
-            to={`/meetings/${ep.id}`}
-            title={ep.title}
-            className="press shrink-0 text-secondary hover:text-primary"
-          >
-            <Icon name="open_in_new" size={16} />
-          </Link>
-        )}
-      </div>
-      {idea.proponent && idea.proponent !== '—' && (
-        <p className="mt-1 text-metadata text-secondary">Pitched by {idea.proponent}</p>
-      )}
-      {idea.thesis.length > 0 && (
-        <ul className="mt-2 space-y-1">
-          {idea.thesis.map((t, i) => (
-            <li key={i} className="flex gap-2 text-[13.5px] leading-snug text-on-surface-variant">
-              <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-secondary" />
-              <span>
-                <RichText text={t} terms={terms} />
-              </span>
-            </li>
-          ))}
-        </ul>
-      )}
-    </li>
-  )
-}
-
 function GeneratingState({ count }: { count: number }) {
   return (
     <div className="grid place-items-center gap-sm rounded-2xl border border-outline-variant bg-surface-container-lowest py-[14vh] text-center shadow-card">
@@ -936,27 +542,6 @@ function EmptyState() {
       <Link to="/meetings" className="press mt-1 inline-flex items-center gap-2 rounded-lg bg-primary px-lg py-2.5 text-metadata font-semibold text-on-primary hover:bg-primary-container">
         <Icon name="play_circle" size={18} /> Go to Meetings
       </Link>
-    </div>
-  )
-}
-
-function MentionGroup({ title, icon, items }: { title: string; icon: string; items: string[] }) {
-  return (
-    <div className="rounded-xl border border-outline-variant bg-surface-container-low p-md">
-      <p className="mb-sm flex items-center gap-1.5 text-metadata font-semibold text-on-surface">
-        <Icon name={icon} size={16} className="text-primary" /> {title}
-      </p>
-      <div className="flex flex-wrap gap-1.5">
-        {items.map((it) => (
-          <Link
-            key={it}
-            to={`/search?q=${encodeURIComponent(it)}`}
-            className="press rounded-full border border-outline-variant bg-surface px-2.5 py-1 text-[12px] text-on-surface-variant hover:border-primary hover:text-primary"
-          >
-            {it}
-          </Link>
-        ))}
-      </div>
     </div>
   )
 }
