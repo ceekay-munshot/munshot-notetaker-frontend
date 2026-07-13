@@ -40,6 +40,10 @@ interface AppData {
   // calendar
   calendarEvents: api.CalendarEvent[]
   calendarLoading: boolean
+  /** True once the initial calendar load has settled (or immediately for admin,
+   *  who has no calendar) — gates auto-summarize so it doesn't run before the
+   *  calendar data needed to tell a named meeting from a nameless one exists. */
+  calendarReady: boolean
   syncCalendar: () => Promise<{ count: number; note?: string; needsConnect: boolean }>
   refreshCalendar: () => Promise<api.CalendarEvent[]>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
@@ -108,6 +112,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [calendarEvents, setCalendarEvents] = useState<api.CalendarEvent[]>([])
   const [cancelledEvents, setCancelledEvents] = useState<api.CalendarEvent[]>([])
   const [calendarLoading, setCalendarLoading] = useState(false)
+  const [calendarReady, setCalendarReady] = useState(false)
   const summarizing = useRef<Set<string>>(new Set())
 
   const [weekProcessing, setWeekProcessing] = useState(false)
@@ -169,10 +174,16 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   // Boot / re-boot whenever the signed-in user changes.
   useEffect(() => {
     if (state.status !== 'authed') return
+    setCalendarReady(false)
     void refresh()
     if (!isAdmin) {
       void refreshSchedules()
-      void refreshCalendar()
+      // Auto-summarize (see summarizeEpisode) must not run until this settles —
+      // otherwise a named meeting can be judged nameless just because calendar
+      // data hasn't arrived yet.
+      void refreshCalendar().finally(() => setCalendarReady(true))
+    } else {
+      setCalendarReady(true) // admin accounts have no calendar to wait for
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [state.status, email, isAdmin])
@@ -217,9 +228,10 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     setEpisodes((prev) => prev.map((e) => (e.id === episode.id ? { ...e, status: 'summarizing' } : e)))
     // If the meeting already has a calendar name, don't let the worker mint (or
     // us apply) an AI title — the calendar name is authoritative.
-    const hasName = calendarTitleById.has(decodeMeetingId(episode.id).meetingId)
+    const calendarName = calendarTitleById.get(decodeMeetingId(episode.id).meetingId)
+    const hasName = !!calendarName
     try {
-      const { summary, title } = await api.summarizeMeeting(episode, { force: opts?.force, hasName })
+      const { summary, title } = await api.summarizeMeeting(episode, { force: opts?.force, calendarName })
       const named = !hasName && title ? title : undefined
       setEpisodes((prev) =>
         prev.map((e) => (e.id === episode.id ? { ...e, status: 'ready', summary, title: named || e.title } : e)),
@@ -398,6 +410,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       deleteSchedule,
       calendarEvents,
       calendarLoading,
+      calendarReady,
       syncCalendar,
       refreshCalendar,
       removeCalendarEvent,
@@ -432,6 +445,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       deleteSchedule,
       calendarEvents,
       calendarLoading,
+      calendarReady,
       syncCalendar,
       refreshCalendar,
       removeCalendarEvent,

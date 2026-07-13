@@ -479,7 +479,8 @@ async function handleTranscripts(request, env) {
   }
 }
 
-// Fetches any stored AI-generated titles for the meetings in these rows, as a
+// Fetches any stored titles (a real calendar name, or an AI-minted one for a
+// meeting that never had one) for the meetings in these rows, as a
 // { meeting_id: title } map, so the dashboard can show real names instead of
 // "Meeting <id>". Scoped to the caller's own (already-authorized) meetings, and
 // capped so a huge history can't blow the Worker's subrequest budget — meetings
@@ -517,9 +518,12 @@ function summaryCacheKey(meetingId) {
   return `summary:v2:${String(meetingId).trim()}`;
 }
 
-// KV key for a meeting's AI-generated display title. Ad-hoc meetings arrive with
-// no name (the UI shows "Meeting <id>"); we mint a short title once, while
-// summarizing, and cache it here so every user sees the same name everywhere.
+// KV key for a meeting's display title. Holds either the meeting's real
+// calendar name (set once the client discovers it — see calendar_name in
+// handleAiChat) or, for an ad-hoc meeting with no name (the UI otherwise shows
+// "Meeting <id>"), a short AI-minted title. Cached here so every user —
+// including ones without their own calendar view of the meeting — sees the
+// same name everywhere.
 function titleCacheKey(meetingId) {
   return `title:v1:${String(meetingId).trim()}`;
 }
@@ -802,22 +806,30 @@ async function handleAiChat(request, env) {
     const cacheKey = summaryCacheKey(meetingId);
     const titleKey = titleCacheKey(meetingId);
     const force = !!body.force;
-    // The client sets has_name when the meeting already carries a real name (e.g.
-    // synced from the calendar). Only nameless meetings get an AI-minted title.
-    const hasName = !!body.has_name;
+    // The client sends calendar_name when the meeting already carries a real name
+    // (synced from the calendar). That name is authoritative: it's persisted as
+    // the meeting's title — overwriting any AI title minted before the real name
+    // was known — and an AI title is never minted for it. Only a meeting with no
+    // calendar name gets one.
+    const calendarName = String(body.calendar_name || "").trim();
+    const hasName = !!calendarName || !!body.has_name;
     if (!force && env.KV) {
       try {
         const cached = await env.KV.get(cacheKey);
         if (cached) {
-          // Summary is cached; return the stored title too. If this meeting was
-          // summarized before titles existed, mint one now (once) so it still
-          // gets a name — but never for a meeting that already has a real name.
-          let title = "";
+          let title = calendarName;
           try {
-            title = (await env.KV.get(titleKey)) || "";
-            if (!title && !hasName) {
-              title = await generateMeetingTitle(rows, apiKey, model);
-              if (title) await env.KV.put(titleKey, title);
+            if (calendarName) {
+              await env.KV.put(titleKey, calendarName);
+            } else {
+              // Summary is cached; return the stored title too. If this meeting was
+              // summarized before titles existed, mint one now (once) so it still
+              // gets a name — but never for a meeting that already has a real name.
+              title = (await env.KV.get(titleKey)) || "";
+              if (!title && !hasName) {
+                title = await generateMeetingTitle(rows, apiKey, model);
+                if (title) await env.KV.put(titleKey, title);
+              }
             }
           } catch {
             /* title is best-effort */
@@ -830,10 +842,11 @@ async function handleAiChat(request, env) {
     }
     try {
       // Summary + a short display title are minted together (title generation is
-      // best-effort — a title failure must never sink the summary).
+      // best-effort — a title failure must never sink the summary). A meeting
+      // with a real calendar name stores THAT instead of minting one.
       const [reply, title] = await Promise.all([
         generateDetailedSummary(rows, apiKey, model),
-        hasName ? Promise.resolve("") : generateMeetingTitle(rows, apiKey, model).catch(() => ""),
+        hasName ? Promise.resolve(calendarName) : generateMeetingTitle(rows, apiKey, model).catch(() => ""),
       ]);
       if (env.KV) {
         try {
@@ -1349,14 +1362,14 @@ async function runAutoSummaries(env) {
         // Re-check right before writing: an overlapping tick or a user opening
         // this meeting may have summarized it while we were working.
         if (await env.KV.get(summaryCacheKey(meetingId))) continue;
-        const titleKey = titleCacheKey(meetingId);
-        const hasTitle = !!(await env.KV.get(titleKey));
-        const [summaryMd, title] = await Promise.all([
-          generateDetailedSummary(transcriptRows, apiKey, model),
-          hasTitle ? Promise.resolve("") : generateMeetingTitle(transcriptRows, apiKey, model).catch(() => ""),
-        ]);
+        // Title minting stays out of the cron: it has no session, so it can never
+        // know whether a meeting already carries a real calendar name (only the
+        // browser, via its signed-in user's calendar sync, knows that). Minting
+        // one here would risk permanently overwriting a real name with an AI
+        // guess. Titles are only ever minted in handleAiChat, where the client
+        // supplies calendar_name when the meeting already has a real name.
+        const summaryMd = await generateDetailedSummary(transcriptRows, apiKey, model);
         await env.KV.put(summaryCacheKey(meetingId), summaryMd);
-        if (title) await env.KV.put(titleKey, title);
       } catch {
         /* best-effort — move on to the next meeting */
       }
