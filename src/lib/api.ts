@@ -124,6 +124,21 @@ export async function fetchMeetings(): Promise<MeetingData> {
   }
 }
 
+/** Pushes real calendar names (from this browser's own calendar sync) for
+ *  meetings the signed-in user owns into the Worker's shared title cache, so a
+ *  viewer without their own calendar view of a meeting (chiefly admin) sees
+ *  the real name too — instead of a stale/AI title lingering until the
+ *  meeting is individually reopened. Best-effort; failures are non-fatal. */
+export async function syncMeetingTitles(
+  names: { meetingId: string; calendarName: string }[],
+): Promise<void> {
+  if (!names.length) return
+  await request('/api/meetings/sync-titles', {
+    method: 'POST',
+    body: JSON.stringify({ names: names.map((n) => ({ meeting_id: n.meetingId, calendar_name: n.calendarName })) }),
+  })
+}
+
 // Turn the assistant's markdown reply into the Summary shape the UI renders.
 // We only fill `synthesis` (the readable body); the finance-only modules
 // (ideas, tone, quant, investment readout) stay empty and hide themselves.
