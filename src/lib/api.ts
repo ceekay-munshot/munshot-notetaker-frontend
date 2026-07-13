@@ -277,6 +277,33 @@ export async function fetchWeeklyAiSummary(
   }
 }
 
+/** A meeting's server-cached detailed summary, mapped onto the UI Summary shape. */
+export interface CachedMeetingSummary {
+  meetingId: string
+  title: string
+  summary: Summary
+}
+
+/** Peek the already-cached detailed summary for each requested meeting (no
+ *  generation). Lets the Weekly page hydrate its episode model from summaries the
+ *  auto-summary cron / prior opens already produced, so the weekly populates
+ *  without opening every meeting. Meetings without a cached summary are omitted. */
+export async function fetchCachedMeetingSummaries(meetings: WeeklyMeetingRef[]): Promise<CachedMeetingSummary[]> {
+  if (!meetings.length) return []
+  const data = await request<{
+    ok: boolean
+    summaries?: { meeting_id: string; title: string; summary: string }[]
+  }>('/api/weekly/meetings', {
+    method: 'POST',
+    body: JSON.stringify({ meetings }),
+  })
+  return (data.summaries || []).map((s) => ({
+    meetingId: String(s.meeting_id),
+    title: String(s.title || ''),
+    summary: summaryFromReply(String(s.summary || '')),
+  }))
+}
+
 /** Free-form chat over a week's meeting summaries + the saved master summary.
  *  `messages` is the running conversation; returns the assistant's reply. */
 export async function chatWeekly(
