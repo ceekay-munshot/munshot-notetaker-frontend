@@ -59,6 +59,7 @@ export default {
       if (method === "GET" && pathname === "/api/config") return handleGetConfig(request, env);
       if (method === "POST" && pathname === "/api/config") return handleSetConfig(request, env);
       if (method === "GET" && pathname === "/api/tracking/directory") return handleTrackingDirectory(request, env);
+      if (method === "GET" && pathname === "/api/debug/meetings-schema") return handleDebugMeetingsSchema(request, env);
       if (method === "GET" && pathname === "/api/tracking") return handleGetTracking(request, env);
       if (method === "POST" && pathname === "/api/tracking") return handleSaveTracking(request, env);
       // Public, key-gated (not session-gated) so an external dashboard can call
@@ -483,35 +484,111 @@ async function handleTranscripts(request, env) {
   }
 }
 
+// Which `meetings` column to join transcriptions.meeting_id against. Resolved
+// once per warm isolate via PRAGMA table_info (cheap, side-effect-free) instead
+// of a hardcoded guess: `meeting_id` is documented elsewhere (meetings.ts) as a
+// "short token", which is the bot's own join code (e.g. a Google Meet code like
+// "xzk-jfnr-dhr" — exactly the `meet_code`-style column shown in the meetings
+// table), NOT the table's internal auto-increment `id`. Try any *code* column
+// first, then fall back to `id` in case a different meetings schema shows up.
+// undefined = not yet resolved this isolate; [] = table/columns not found.
+let meetingsJoinColumns;
+
+async function resolveMeetingsJoinColumns(env) {
+  if (meetingsJoinColumns !== undefined) return meetingsJoinColumns;
+  try {
+    const res = await env.DB.prepare("PRAGMA table_info(meetings)").all();
+    const cols = ((res && res.results) || []).map((r) => String((r && r.name) || "")).filter(Boolean);
+    const codeCol = cols.find((c) => /code/i.test(c));
+    meetingsJoinColumns = [codeCol, cols.includes("id") ? "id" : null].filter(Boolean);
+  } catch {
+    meetingsJoinColumns = []; // no `meetings` table (yet) — never throw for this
+  }
+  return meetingsJoinColumns;
+}
+
 // The bot backend's own `meetings` table (D1) now carries a real `name` column —
 // the actual meeting name (e.g. the calendar invite title captured at join time),
 // never AI-generated. It takes priority over EVERYTHING else this Worker knows
 // about a meeting's title: a synced browser calendar name and especially any
-// AI-minted one. Best-effort and defensive: an older D1 snapshot without the
-// `meetings` table (or without a `name` column yet) must never break a caller —
-// missing names just leave the map empty and callers fall back to what they had.
+// AI-minted one. Best-effort and defensive throughout: an older D1 snapshot
+// without the `meetings` table (or without a `name` column yet) must never break
+// a caller — missing names just leave the map empty and callers fall back to
+// what they had.
 async function d1MeetingNames(env, meetingIds) {
   const out = {};
   if (!env.DB || !meetingIds || !meetingIds.length) return out;
   const ids = [...new Set(meetingIds.map((v) => String(v).trim()).filter(Boolean))];
+  if (!ids.length) return out;
+  const columns = await resolveMeetingsJoinColumns(env);
   const CHUNK = 100; // stay under D1's bound-parameter ceiling
-  for (let i = 0; i < ids.length; i += CHUNK) {
-    const chunk = ids.slice(i, i + CHUNK);
-    const placeholders = chunk.map((_, j) => `?${j + 1}`).join(",");
-    try {
-      const res = await env.DB.prepare(
-        `SELECT id, name FROM meetings WHERE CAST(id AS TEXT) IN (${placeholders})`
-      ).bind(...chunk).all();
-      for (const row of (res && res.results) || []) {
-        const name = String((row && row.name) || "").trim();
-        if (name) out[String(row.id)] = name;
+  for (const col of columns) {
+    const remaining = ids.filter((id) => !out[id]);
+    if (!remaining.length) break;
+    for (let i = 0; i < remaining.length; i += CHUNK) {
+      const chunk = remaining.slice(i, i + CHUNK);
+      const placeholders = chunk.map((_, j) => `?${j + 1}`).join(",");
+      try {
+        const res = await env.DB.prepare(
+          `SELECT ${col} AS join_key, name FROM meetings WHERE CAST(${col} AS TEXT) IN (${placeholders})`
+        ).bind(...chunk).all();
+        for (const row of (res && res.results) || []) {
+          const name = String((row && row.name) || "").trim();
+          const key = String((row && row.join_key) || "").trim();
+          if (name && key) out[key] = name;
+        }
+      } catch {
+        /* this column (or chunk) didn't resolve — the next candidate column,
+           if any, still gets a chance */
       }
-    } catch {
-      /* `meetings`/`name` not present yet, or a transient D1 hiccup — this
-         chunk's names stay unresolved; callers use their existing fallback */
     }
   }
   return out;
+}
+
+// GET /api/debug/meetings-schema — admin-only, read-only diagnostic for the D1
+// `meetings` table wiring: does it exist, what columns does it have, which one
+// did we resolve as the join key, and — for a sample of real transcriptions.
+// meeting_id values — does that join actually find a name. Exists because this
+// Worker's coding environment has no live D1 access to verify the join key
+// against the real schema; hit this from the browser (signed in as admin)
+// instead. Safe to remove once the naming rollout is confirmed working.
+async function handleDebugMeetingsSchema(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Admin only" }, 403);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+
+  const out = { hasMeetingsTable: false, columns: [], joinColumns: [], meetingsRowCount: null, sampleMeetingsRows: [], sampleTranscriptionMeetingIds: [], resolvedNames: {} };
+  try {
+    const cols = await env.DB.prepare("PRAGMA table_info(meetings)").all();
+    out.columns = ((cols && cols.results) || []).map((r) => r.name);
+    out.hasMeetingsTable = out.columns.length > 0;
+  } catch (err) {
+    out.columnsError = String((err && err.message) || err);
+  }
+  out.joinColumns = await resolveMeetingsJoinColumns(env);
+  if (out.hasMeetingsTable) {
+    try {
+      const count = await env.DB.prepare("SELECT COUNT(*) AS n FROM meetings").all();
+      out.meetingsRowCount = Number((count.results && count.results[0] && count.results[0].n) || 0);
+    } catch {
+      /* best-effort */
+    }
+    try {
+      const sample = await env.DB.prepare("SELECT * FROM meetings ORDER BY id DESC LIMIT 5").all();
+      out.sampleMeetingsRows = (sample && sample.results) || [];
+    } catch {
+      /* best-effort */
+    }
+  }
+  try {
+    const ids = await env.DB.prepare("SELECT DISTINCT meeting_id FROM transcriptions ORDER BY meeting_id DESC LIMIT 10").all();
+    out.sampleTranscriptionMeetingIds = ((ids && ids.results) || []).map((r) => String(r.meeting_id));
+  } catch {
+    /* best-effort */
+  }
+  out.resolvedNames = await d1MeetingNames(env, out.sampleTranscriptionMeetingIds);
+  return json(out);
 }
 
 // Fetches the real title for the meetings in these rows, as a { meeting_id: title }
