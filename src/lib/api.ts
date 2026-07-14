@@ -85,6 +85,14 @@ export function logout(): Promise<{ ok: boolean }> {
   return request('/api/logout', { method: 'POST' })
 }
 
+/** Exchanges a Munshot host JWT for a real Worker session cookie, so /api/*
+ *  calls made from inside the host iframe are authenticated. See the security
+ *  caveat on the Worker's handleHostLogin — the token's signature isn't
+ *  verified server-side. */
+export function hostLogin(token: string): Promise<{ ok: boolean; email?: string }> {
+  return request('/api/host-login', { method: 'POST', body: JSON.stringify({ token }) })
+}
+
 /** Step 1 of a password reset: the server emails a single-use, 15-minute 5-digit
  *  code to the address (if an account exists) — the account's password is left
  *  unchanged until step 2. Always resolves the same way regardless of whether the
