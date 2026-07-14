@@ -48,6 +48,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const { session } = useHostContext()
   const resolvedOnceRef = useRef(false)
   const loggedTokenRef = useRef(false)
+  const exchangedTokenRef = useRef<string | null>(null)
+  const hostManagedRef = useRef(false)
 
   const refresh = useCallback(async () => {
     try {
@@ -65,36 +67,80 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   useEffect(() => {
-    const claims = decodeHostToken(session.token)
+    let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
 
-    if (session.token && claims && !isExpired(claims)) {
-      if (!loggedTokenRef.current) {
-        loggedTokenRef.current = true
-        console.info('[dashboard] host session token received')
+    async function run() {
+      const claims = decodeHostToken(session.token)
+
+      if (session.token && claims && !isExpired(claims)) {
+        if (!loggedTokenRef.current) {
+          loggedTokenRef.current = true
+          console.info('[dashboard] host session token received')
+        }
+
+        // Exchange the host JWT for a real Worker session cookie, so /api/*
+        // calls succeed from inside the host iframe (see api.hostLogin / the
+        // Worker's handleHostLogin — the token's signature isn't verified
+        // there either; see the caveat on that route). Only once per distinct
+        // token. A failed exchange still lets the UI proceed — data calls
+        // will 401 and the app's existing empty-state handling covers it,
+        // same as a slow/failed /api/me probe today.
+        if (exchangedTokenRef.current !== session.token) {
+          exchangedTokenRef.current = session.token
+          try {
+            await api.hostLogin(session.token)
+          } catch (err) {
+            console.error('[dashboard] host session exchange failed', err)
+          }
+        }
+        if (cancelled) return
+
+        hostManagedRef.current = true
+        resolvedOnceRef.current = true
+        setState({
+          status: 'authed',
+          email: claims.email ?? session.email ?? '',
+          isAdmin: false,
+          hostManaged: true,
+        })
+        return
       }
-      resolvedOnceRef.current = true
-      setState({
-        status: 'authed',
-        email: claims.email ?? session.email ?? '',
-        isAdmin: false,
-        hostManaged: true,
-      })
-      return
+
+      loggedTokenRef.current = false
+      exchangedTokenRef.current = null
+
+      // The host token disappeared after we'd established a host session
+      // (a host-side logout) — clear the Worker's own cookie too, so a
+      // soft-navigated iframe never keeps a stale session around.
+      if (hostManagedRef.current) {
+        hostManagedRef.current = false
+        try {
+          await api.logout()
+        } catch {
+          /* best-effort */
+        }
+        if (cancelled) return
+      }
+
+      // No valid host token. On the very first resolution attempt while
+      // embedded, give the handshake a brief grace period — an early render
+      // can beat host:init even though the SDK's listener is already live.
+      // Once we've resolved once (authed or anon), any later loss of the
+      // token falls back to the standalone probe immediately, so the login
+      // page appears without delay.
+      if (!resolvedOnceRef.current && isEmbeddedWindow()) {
+        timer = setTimeout(() => void refresh(), HOST_HANDSHAKE_GRACE_MS)
+        return
+      }
+      void refresh()
     }
 
-    loggedTokenRef.current = false
-
-    // No valid host token. On the very first resolution attempt while
-    // embedded, give the handshake a brief grace period — an early render can
-    // beat host:init even though the SDK's listener is already live. Once
-    // we've resolved once (authed or anon), any later loss of the token (a
-    // host logout) falls back to the standalone probe immediately, so the
-    // login page appears without delay.
-    if (!resolvedOnceRef.current && isEmbeddedWindow()) {
-      const timer = setTimeout(() => void refresh(), HOST_HANDSHAKE_GRACE_MS)
-      return () => clearTimeout(timer)
+    void run()
+    return () => {
+      cancelled = true
+      if (timer) clearTimeout(timer)
     }
-    void refresh()
   }, [session.token, session.email, refresh])
 
   const signIn = useCallback(

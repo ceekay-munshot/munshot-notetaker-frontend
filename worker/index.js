@@ -33,9 +33,26 @@ export default {
     const method = request.method;
 
     try {
+      // CSRF guard for state-changing requests. The session cookie is
+      // SameSite=None (see sessionCookie() below — required so it still works
+      // when this app is embedded as a cross-site iframe inside the Munshot
+      // host; SameSite=Strict/Lax cookies are silently dropped in that
+      // context), so an Origin check stands in as the CSRF backstop. A
+      // legitimate fetch's Origin header always reflects THIS app's own
+      // script origin, whether the page is loaded standalone or embedded in
+      // another site's iframe — so this holds in both cases. Requests with no
+      // Origin header (curl, same-site top-level navigations) pass through.
+      if (pathname.startsWith("/api/") && method !== "GET" && method !== "OPTIONS" && method !== "HEAD") {
+        const origin = request.headers.get("Origin");
+        if (origin && origin !== url.origin) {
+          return json({ error: "Cross-site request rejected" }, 403);
+        }
+      }
+
       if (method === "GET" && pathname === "/api/me") return handleMe(request, env);
       if (method === "POST" && pathname === "/api/register") return handleRegister(request, env);
       if (method === "POST" && pathname === "/api/login") return handleLogin(request, env);
+      if (method === "POST" && pathname === "/api/host-login") return handleHostLogin(request, env);
       if (method === "POST" && pathname === "/api/forgot-password") return handleForgotPassword(request, env);
       if (method === "POST" && pathname === "/api/reset-password") return handleResetPassword(request, env);
       if (method === "POST" && pathname === "/api/logout") return handleLogout(request, env);
@@ -201,6 +218,47 @@ async function handleLogin(request, env) {
 
   const cookie = await createSession(env, email);
   return json({ ok: true, email }, 200, { "Set-Cookie": cookie });
+}
+
+// Exchanges a Munshot host JWT (the embedded dashboard's session.token, handed
+// over postMessage by the parent Munshot host) for our own Worker session
+// cookie, so /api/* calls made from inside the host iframe are authenticated.
+//
+// SECURITY CAVEAT: this does NOT verify the JWT's signature — we don't have
+// the host's signing secret configured, so we trust the `email` claim as-is,
+// mirroring the frontend's decode-only trust model (see src/lib/hostToken.ts).
+// This means anyone who can reach this endpoint can mint a session for ANY
+// email by handing it a self-signed token. Revisit this once the shared
+// signing secret is available: add it as a Worker secret (e.g.
+// MUNSHOT_JWT_SECRET) and verify the HS256 signature here before trusting the
+// payload.
+async function handleHostLogin(request, env) {
+  const body = await request.json().catch(() => ({}));
+  const claims = decodeJwtPayloadUnverified(body.token);
+  if (!claims || !isValidEmail(String(claims.email || ""))) {
+    return json({ error: "Invalid host token" }, 400);
+  }
+  if (typeof claims.exp === "number" && Date.now() >= claims.exp * 1000) {
+    return json({ error: "Host token expired" }, 401);
+  }
+
+  const email = normalizeEmail(claims.email);
+  const cookie = await createSession(env, email);
+  return json({ ok: true, email }, 200, { "Set-Cookie": cookie });
+}
+
+// Decodes a JWT payload WITHOUT verifying its signature. Only handleHostLogin
+// uses this — see the security caveat there.
+function decodeJwtPayloadUnverified(token) {
+  const parts = String(token || "").split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
+    return JSON.parse(atob(padded));
+  } catch {
+    return null;
+  }
 }
 
 // KV key holding a pending password-reset code for an email (hashed, TTL'd).
@@ -2639,12 +2697,17 @@ async function getSession(request, env) {
   return { isAdmin: false, identity: value };
 }
 
+// SameSite=None (which requires Secure) so the cookie still works when this
+// app is embedded as a cross-site iframe inside the Munshot host — a
+// Strict/Lax cookie is silently dropped on requests made from a cross-site
+// iframe context, even to the iframe's own same-origin API. The Origin check
+// in the fetch handler above is the CSRF backstop this trades away.
 function sessionCookie(token) {
-  return `${COOKIE_NAME}=${token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${SESSION_TTL}`;
+  return `${COOKIE_NAME}=${token}; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=${SESSION_TTL}`;
 }
 
 function clearCookie() {
-  return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0`;
+  return `${COOKIE_NAME}=; HttpOnly; Secure; SameSite=None; Path=/; Max-Age=0`;
 }
 
 async function deriveHash(password, saltBytes) {
