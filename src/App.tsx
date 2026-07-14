@@ -1,6 +1,4 @@
-import { useEffect } from 'react'
 import { Route, Routes, Link } from 'react-router-dom'
-import { useHostContext } from './hooks/useHostContext'
 import { AuthProvider, useAuth } from './store/Auth'
 import { AppDataProvider } from './store/AppData'
 import { DateRangeProvider } from './store/DateRange'
@@ -19,18 +17,6 @@ import Search from './pages/Search'
 import Tracking from './pages/Tracking'
 
 export default function App() {
-  // Munshot host session, delivered over postMessage from the parent window.
-  // The host owns identity; this only reads the context the SDK has cached.
-  const { session } = useHostContext()
-
-  // Confirm the handshake in the deployed iframe: log the token once, the first
-  // time it becomes non-null (on host:init / login). The host pushes a new token
-  // on refresh and null on logout.
-  useEffect(() => {
-    if (!session.token) return
-    console.info('[dashboard] token:', session.token)
-  }, [session.token])
-
   return (
     <AuthProvider>
       <Gate />
