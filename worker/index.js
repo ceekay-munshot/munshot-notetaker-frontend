@@ -483,12 +483,46 @@ async function handleTranscripts(request, env) {
   }
 }
 
-// Fetches any stored titles (a real calendar name, or an AI-minted one for a
-// meeting that never had one) for the meetings in these rows, as a
-// { meeting_id: title } map, so the dashboard can show real names instead of
-// "Meeting <id>". Scoped to the caller's own (already-authorized) meetings, and
-// capped so a huge history can't blow the Worker's subrequest budget — meetings
-// past the cap keep the "Meeting <id>" fallback until they're opened.
+// The bot backend's own `meetings` table (D1) now carries a real `name` column —
+// the actual meeting name (e.g. the calendar invite title captured at join time),
+// never AI-generated. It takes priority over EVERYTHING else this Worker knows
+// about a meeting's title: a synced browser calendar name and especially any
+// AI-minted one. Best-effort and defensive: an older D1 snapshot without the
+// `meetings` table (or without a `name` column yet) must never break a caller —
+// missing names just leave the map empty and callers fall back to what they had.
+async function d1MeetingNames(env, meetingIds) {
+  const out = {};
+  if (!env.DB || !meetingIds || !meetingIds.length) return out;
+  const ids = [...new Set(meetingIds.map((v) => String(v).trim()).filter(Boolean))];
+  const CHUNK = 100; // stay under D1's bound-parameter ceiling
+  for (let i = 0; i < ids.length; i += CHUNK) {
+    const chunk = ids.slice(i, i + CHUNK);
+    const placeholders = chunk.map((_, j) => `?${j + 1}`).join(",");
+    try {
+      const res = await env.DB.prepare(
+        `SELECT id, name FROM meetings WHERE CAST(id AS TEXT) IN (${placeholders})`
+      ).bind(...chunk).all();
+      for (const row of (res && res.results) || []) {
+        const name = String((row && row.name) || "").trim();
+        if (name) out[String(row.id)] = name;
+      }
+    } catch {
+      /* `meetings`/`name` not present yet, or a transient D1 hiccup — this
+         chunk's names stay unresolved; callers use their existing fallback */
+    }
+  }
+  return out;
+}
+
+// Fetches the real title for the meetings in these rows, as a { meeting_id: title }
+// map, so the dashboard can show real names instead of "Meeting <id>". Priority:
+// the D1 `meetings.name` (real, server-side, never AI) beats whatever's already
+// cached (a synced calendar name, or a stale AI-minted title) — and a resolved D1
+// name is written back into the KV title cache so it self-heals for every other
+// reader (weekly synthesis, the cached-summary return path) without their own D1
+// round-trip. Scoped to the caller's own (already-authorized) meetings, and capped
+// so a huge history can't blow the Worker's subrequest budget — meetings past the
+// cap keep the "Meeting <id>" fallback until they're opened.
 async function loadTitlesFor(env, segments) {
   const out = {};
   if (!env.KV || !segments || !segments.length) return out;
@@ -510,6 +544,14 @@ async function loadTitlesFor(env, segments) {
   } catch {
     /* best-effort — return whatever resolved */
   }
+
+  const d1Names = await d1MeetingNames(env, pick);
+  for (const [id, name] of Object.entries(d1Names)) {
+    if (out[id] !== name) {
+      out[id] = name;
+      env.KV.put(titleCacheKey(id), name).catch(() => {});
+    }
+  }
   return out;
 }
 
@@ -522,6 +564,10 @@ async function loadTitlesFor(env, segments) {
 // entirely — would otherwise keep seeing the stale title indefinitely. Admin
 // never calls this (it has no calendar names to push). Same per-meeting ACL as
 // transcripts/summarize: a meeting_id the caller isn't an owner of is skipped.
+// The bot backend's own D1 `meetings.name` outranks a synced calendar name (see
+// d1MeetingNames) — a meeting D1 already has a real name for is left alone here
+// (and corrected to the D1 name if the cache is stale) rather than overwritten
+// with the browser's calendar_name.
 async function handleSyncMeetingTitles(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
@@ -532,11 +578,13 @@ async function handleSyncMeetingTitles(request, env) {
   if (!entries.length) return json({ ok: true, updated: 0 });
 
   const email = normalizeEmail(session.identity);
+  const d1Names = await d1MeetingNames(env, entries.map((e) => (e && e.meeting_id) || ""));
   let updated = 0;
   for (const entry of entries) {
     const meetingId = String((entry && entry.meeting_id) || "").trim();
     const calendarName = String((entry && entry.calendar_name) || "").trim();
     if (!meetingId || !calendarName) continue;
+    const authoritative = d1Names[meetingId] || calendarName;
     try {
       const owns = await env.DB.prepare(
         "SELECT 1 FROM transcriptions WHERE meeting_id = ?2 AND (" +
@@ -546,8 +594,8 @@ async function handleSyncMeetingTitles(request, env) {
       if (!owns.results || !owns.results.length) continue;
       const key = titleCacheKey(meetingId);
       const stored = await env.KV.get(key);
-      if (stored !== calendarName) {
-        await env.KV.put(key, calendarName);
+      if (stored !== authoritative) {
+        await env.KV.put(key, authoritative);
         updated++;
       }
     } catch {
@@ -854,21 +902,22 @@ async function handleAiChat(request, env) {
     const cacheKey = summaryCacheKey(meetingId);
     const titleKey = titleCacheKey(meetingId);
     const force = !!body.force;
-    // The client sends calendar_name when the meeting already carries a real name
-    // (synced from the calendar). That name is authoritative: it's persisted as
-    // the meeting's title — overwriting any AI title minted before the real name
-    // was known — and an AI title is never minted for it. Only a meeting with no
-    // calendar name gets one.
-    const calendarName = String(body.calendar_name || "").trim();
-    const hasName = !!calendarName || !!body.has_name;
+    // A real name — the bot backend's own D1 `meetings.name` (never AI-generated),
+    // else the client-sent calendar_name (synced from the browser's own calendar)
+    // — is authoritative: D1 wins when both exist. Either way it's persisted as
+    // the meeting's title, overwriting any AI title minted before it was known,
+    // and an AI title is never minted once a real one exists.
+    const d1Name = (await d1MeetingNames(env, [meetingId]))[meetingId] || "";
+    const realName = d1Name || String(body.calendar_name || "").trim();
+    const hasName = !!realName || !!body.has_name;
     if (!force && env.KV) {
       try {
         const cached = await env.KV.get(cacheKey);
         if (cached) {
-          let title = calendarName;
+          let title = realName;
           try {
-            if (calendarName) {
-              await env.KV.put(titleKey, calendarName);
+            if (realName) {
+              await env.KV.put(titleKey, realName);
             } else {
               // Summary is cached; return the stored title too. If this meeting was
               // summarized before titles existed, mint one now (once) so it still
@@ -891,10 +940,10 @@ async function handleAiChat(request, env) {
     try {
       // Summary + a short display title are minted together (title generation is
       // best-effort — a title failure must never sink the summary). A meeting
-      // with a real calendar name stores THAT instead of minting one.
+      // with a real name (D1 or calendar) stores THAT instead of minting one.
       const [reply, title] = await Promise.all([
         generateDetailedSummary(rows, apiKey, model),
-        hasName ? Promise.resolve(calendarName) : generateMeetingTitle(rows, apiKey, model).catch(() => ""),
+        hasName ? Promise.resolve(realName) : generateMeetingTitle(rows, apiKey, model).catch(() => ""),
       ]);
       if (env.KV) {
         try {
