@@ -141,7 +141,8 @@ function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onCl
  *  (standalone); or a quiet skeleton for the first moment identity resolves. */
 function IdentityBadge() {
   const { identity } = useAppData()
-  const { signOut } = useAuth()
+  const { state, signOut } = useAuth()
+  const hostManaged = state.status === 'authed' && state.hostManaged
 
   if (identity === undefined) {
     return (
@@ -211,15 +212,17 @@ function IdentityBadge() {
         <p className="truncate text-[13px] font-semibold text-on-surface">{display}</p>
         <p className="truncate text-[11.5px] text-secondary">{detail}</p>
       </div>
-      <button
-        type="button"
-        onClick={() => void signOut()}
-        aria-label="Sign out"
-        title="Sign out"
-        className="press grid h-8 w-8 shrink-0 place-items-center rounded-lg text-secondary hover:bg-surface-container hover:text-error"
-      >
-        <Icon name="logout" size={18} />
-      </button>
+      {!hostManaged && (
+        <button
+          type="button"
+          onClick={() => void signOut()}
+          aria-label="Sign out"
+          title="Sign out"
+          className="press grid h-8 w-8 shrink-0 place-items-center rounded-lg text-secondary hover:bg-surface-container hover:text-error"
+        >
+          <Icon name="logout" size={18} />
+        </button>
+      )}
     </div>
   )
 }
