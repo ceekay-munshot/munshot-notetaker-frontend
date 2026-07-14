@@ -205,7 +205,7 @@ export function SchedulesCard() {
                 // Worker (/api/calendar/connect) — never the raw backend URL.
                 setMsg({
                   kind: 'err',
-                  text: 'Your calendar isn’t connected yet. Authorize access to import your meetings.',
+                  text: 'Your calendar isn’t connected yet. Connect opens Google in a new tab; authorize there, then sync again.',
                   connect: true,
                 })
               } else {
@@ -344,6 +344,15 @@ export function SchedulesCard() {
           {msg.connect ? (
             <a
               href="/api/calendar/connect"
+              // Open in a NEW TOP-LEVEL TAB, never inside this iframe. The
+              // route redirects to Google's OAuth consent flow, and Google
+              // refuses to render its login/consent pages inside an iframe
+              // (embedded-context blocking → a "403 you don't have access"
+              // page). A first-time connector hits that interactive screen; a
+              // top-level tab lets it run normally. After authorizing, the
+              // user returns here and clicks Sync again.
+              target="_blank"
+              rel="noopener noreferrer"
               className="press inline-flex shrink-0 items-center gap-1 rounded-md border border-current px-2 py-0.5 text-[12px] font-semibold"
             >
               <Icon name="link" size={14} />
