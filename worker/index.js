@@ -484,14 +484,19 @@ async function handleTranscripts(request, env) {
   }
 }
 
-// Which `meetings` column to join transcriptions.meeting_id against. Resolved
-// once per warm isolate via PRAGMA table_info (cheap, side-effect-free) instead
-// of a hardcoded guess: `meeting_id` is documented elsewhere (meetings.ts) as a
-// "short token", which is the bot's own join code (e.g. a Google Meet code like
-// "xzk-jfnr-dhr" — exactly the `meet_code`-style column shown in the meetings
-// table), NOT the table's internal auto-increment `id`. Try any *code* column
-// first, then fall back to `id` in case a different meetings schema shows up.
-// undefined = not yet resolved this isolate; [] = table/columns not found.
+// Which `meetings` column to join transcriptions.meeting_id against. Confirmed
+// live (via GET /api/debug/meetings-schema against production): the real
+// `meetings` schema is meeting_id, user_id, platform, native_meeting_id, status,
+// bot_name, language, transcribe_enabled, recording_enabled, segment_count,
+// started_at, ended_at, created_at, updated_at, completion_reason, failure_stage,
+// name — i.e. `meetings.meeting_id` is the SAME column name (and value) as
+// `transcriptions.meeting_id`, a direct 1:1 join. There is no `id` column, and
+// `native_meeting_id` (the platform's own room code, e.g. a Google Meet code) is
+// a separate field, not the join key. Resolved once per warm isolate via PRAGMA
+// table_info (cheap, side-effect-free) rather than hardcoded, so a future schema
+// change still resolves: prefer an exact `meeting_id` match, then any *code*
+// column, then `id` as a last resort. undefined = not yet resolved this isolate;
+// [] = table/columns not found.
 let meetingsJoinColumns;
 
 async function resolveMeetingsJoinColumns(env) {
@@ -499,8 +504,12 @@ async function resolveMeetingsJoinColumns(env) {
   try {
     const res = await env.DB.prepare("PRAGMA table_info(meetings)").all();
     const cols = ((res && res.results) || []).map((r) => String((r && r.name) || "")).filter(Boolean);
-    const codeCol = cols.find((c) => /code/i.test(c));
-    meetingsJoinColumns = [codeCol, cols.includes("id") ? "id" : null].filter(Boolean);
+    const candidates = [
+      cols.includes("meeting_id") ? "meeting_id" : null,
+      cols.find((c) => /code/i.test(c)),
+      cols.includes("id") ? "id" : null,
+    ];
+    meetingsJoinColumns = [...new Set(candidates.filter(Boolean))];
   } catch {
     meetingsJoinColumns = []; // no `meetings` table (yet) — never throw for this
   }
@@ -575,7 +584,9 @@ async function handleDebugMeetingsSchema(request, env) {
       /* best-effort */
     }
     try {
-      const sample = await env.DB.prepare("SELECT * FROM meetings ORDER BY id DESC LIMIT 5").all();
+      // `rowid` always exists on an ordinary SQLite table regardless of the
+      // declared columns (unlike guessing a column name to sort by).
+      const sample = await env.DB.prepare("SELECT * FROM meetings ORDER BY rowid DESC LIMIT 5").all();
       out.sampleMeetingsRows = (sample && sample.results) || [];
     } catch {
       /* best-effort */
