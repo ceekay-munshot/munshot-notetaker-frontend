@@ -400,6 +400,11 @@ export interface Schedule {
   lastStatus: string | null
 }
 
+/** A schedule as admin sees it — every user's, each tagged with its owner. */
+export interface AdminSchedule extends Schedule {
+  owner: string
+}
+
 export interface NewSchedule {
   meeting_url: string
   /** "YYYY-MM-DDTHH:MM" wall-clock, as picked. */
@@ -409,8 +414,18 @@ export interface NewSchedule {
   time_zone: string
 }
 
+/** A signed-in user's own schedules. Admins have none of their own — use
+ *  adminListSchedules for the cross-user view. */
 export async function listSchedules(): Promise<Schedule[]> {
   const data = await request<{ ok: boolean; schedules?: Schedule[] }>('/api/schedules')
+  return data.schedules || []
+}
+
+/** Admin-only: every user's schedules (each tagged with its owner), or just one
+ *  user's when `email` is given. */
+export async function adminListSchedules(email?: string): Promise<AdminSchedule[]> {
+  const qs = email ? `?email=${encodeURIComponent(email)}` : ''
+  const data = await request<{ ok: boolean; schedules?: AdminSchedule[] }>(`/api/schedules${qs}`)
   return data.schedules || []
 }
 
@@ -422,8 +437,10 @@ export async function createSchedule(input: NewSchedule): Promise<Schedule> {
   return data.schedule
 }
 
-export function deleteSchedule(id: string): Promise<{ ok: boolean }> {
-  return request('/api/schedules/delete', { method: 'POST', body: JSON.stringify({ id }) })
+/** Cancel a schedule. Pass `owner` when acting as admin on another user's
+ *  schedule — a normal user's own session always deletes only their own. */
+export function deleteSchedule(id: string, owner?: string): Promise<{ ok: boolean }> {
+  return request('/api/schedules/delete', { method: 'POST', body: JSON.stringify({ id, owner }) })
 }
 
 // ── Calendar ────────────────────────────────────────────────────────────────────
@@ -443,24 +460,64 @@ export interface CalendarEvent {
   [k: string]: unknown
 }
 
+/** Normalizes whatever shape the upstream calendar endpoint returns (a bare
+ *  array, or one of a few wrapper keys) into a flat event list. */
+export function normalizeCalendarEvents(payload: any): CalendarEvent[] {
+  if (!payload) return []
+  const arr = Array.isArray(payload)
+    ? payload
+    : payload.calendar_events || payload.meetings || payload.events || payload.items || payload.calendar || []
+  return Array.isArray(arr) ? arr : []
+}
+
 export function calendarSync(): Promise<{ ok: boolean; status: number; result: unknown }> {
   return request('/api/calendar/sync', { method: 'POST', body: '{}' })
 }
 
 /** Returns the raw calendar payload from upstream; shape is normalized by the caller.
- *  Pass includeCancelled to also get removed (status "cancelled") meetings. */
-export async function calendarMeetings(includeCancelled = false): Promise<{ ok: boolean; status: number; calendar: any }> {
-  return request('/api/calendar/meetings' + (includeCancelled ? '?include_cancelled=true' : ''))
+ *  Pass includeCancelled to also get removed (status "cancelled") meetings. `email`
+ *  is admin-only — it names which user's calendar to read (admins have none of
+ *  their own); a normal user's session always reads their own calendar. */
+export async function calendarMeetings(
+  includeCancelled = false,
+  email?: string,
+): Promise<{ ok: boolean; status: number; calendar: any }> {
+  const params = new URLSearchParams()
+  if (includeCancelled) params.set('include_cancelled', 'true')
+  if (email) params.set('email', email)
+  const qs = params.toString()
+  return request('/api/calendar/meetings' + (qs ? `?${qs}` : ''))
 }
 
-/** Remove a scheduled/upcoming calendar meeting so the bot won't join it. */
-export function calendarRemove(eventId: number | string): Promise<{ ok: boolean; status: number; result: unknown }> {
-  return request('/api/calendar/meetings/remove', { method: 'POST', body: JSON.stringify({ event_id: eventId }) })
+/** Remove a scheduled/upcoming calendar meeting so the bot won't join it. `email`
+ *  is admin-only — the user to act as. */
+export function calendarRemove(
+  eventId: number | string,
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/remove', {
+    method: 'POST',
+    body: JSON.stringify({ event_id: eventId, email }),
+  })
 }
 
-/** Restore (unremove) a cancelled calendar meeting so the bot will join it again. */
-export function calendarRestore(eventId: number | string): Promise<{ ok: boolean; status: number; result: unknown }> {
-  return request('/api/calendar/meetings/restore', { method: 'POST', body: JSON.stringify({ event_id: eventId }) })
+/** Restore (unremove) a cancelled calendar meeting so the bot will join it again.
+ *  `email` is admin-only — the user to act as. */
+export function calendarRestore(
+  eventId: number | string,
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/restore', {
+    method: 'POST',
+    body: JSON.stringify({ event_id: eventId, email }),
+  })
+}
+
+/** Admin-only: every distinct user email that has (or has had) meetings or
+ *  schedules — feeds the "Scheduled Meetings" admin picker. */
+export async function adminListUsers(): Promise<string[]> {
+  const data = await request<{ ok: boolean; users?: string[] }>('/api/admin/users')
+  return data.users || []
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

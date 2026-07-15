@@ -17,8 +17,12 @@ const NAV: NavItem[] = [
 ]
 
 // Admin-only — appended when signed in as admin (People Tracker manages a
-// cross-meeting rollup that only admins can select/see).
-const ADMIN_NAV_ITEM: NavItem = { to: '/tracking', label: 'People Tracker', icon: 'groups' }
+// cross-meeting rollup that only admins can select/see; Scheduled Meetings
+// shows every user's upcoming calendar meetings and notetaker schedules).
+const ADMIN_NAV_ITEMS: NavItem[] = [
+  { to: '/tracking', label: 'People Tracker', icon: 'groups' },
+  { to: '/scheduled', label: 'Scheduled Meetings', icon: 'event_upcoming' },
+]
 
 /** The static sidebar — desktop/tablet only; below `md` the drawer takes over. */
 export function Sidebar() {
@@ -78,7 +82,7 @@ export function MobileSidebar({ open, onClose }: { open: boolean; onClose: () =>
 function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onClose?: () => void }) {
   const { state } = useAuth()
   const isAdmin = state.status === 'authed' && state.isAdmin
-  const nav = isAdmin ? [...NAV, ADMIN_NAV_ITEM] : NAV
+  const nav = isAdmin ? [...NAV, ...ADMIN_NAV_ITEMS] : NAV
 
   return (
     <>

@@ -68,15 +68,6 @@ interface AppData {
 
 const Ctx = createContext<AppData | null>(null)
 
-// Normalize whatever the upstream calendar endpoint returns into a flat event list.
-function normalizeCalendar(payload: any): api.CalendarEvent[] {
-  if (!payload) return []
-  const arr = Array.isArray(payload)
-    ? payload
-    : payload.calendar_events || payload.meetings || payload.events || payload.items || payload.calendar || []
-  return Array.isArray(arr) ? arr : []
-}
-
 // Best-effort human note from the upstream /calendar/sync result body. The exact
 // shape isn't guaranteed, so we look at the common places a message/error could
 // live and surface the first non-empty string we find (kept short for the UI).
@@ -165,7 +156,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       // Pull cancelled ones too, then split: active drive "Upcoming", cancelled
       // drive the "Removed" section (restore).
       const { calendar } = await api.calendarMeetings(true)
-      const all = normalizeCalendar(calendar)
+      const all = api.normalizeCalendarEvents(calendar)
       const active = all.filter((e) => String(e.status) !== 'cancelled')
       setCalendarEvents(active)
       setCancelledEvents(all.filter((e) => String(e.status) === 'cancelled'))
