@@ -59,6 +59,7 @@ export default {
       if (method === "POST" && pathname === "/api/join") return handleBot(request, env, "join");
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
       if (method === "GET" && pathname === "/api/transcripts") return handleTranscripts(request, env);
+      if (method === "GET" && pathname === "/api/admin/users") return handleAdminUsers(request, env);
       if (method === "POST" && pathname === "/api/ai") return handleAiChat(request, env);
       if (method === "POST" && pathname === "/api/meetings/sync-titles") return handleSyncMeetingTitles(request, env);
       if (method === "POST" && pathname === "/api/weekly/people") return handleWeeklyPeople(request, env);
@@ -540,6 +541,37 @@ async function handleTranscripts(request, env) {
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
   }
+}
+
+// GET /api/admin/users — admin-only. Every distinct email that could have
+// upcoming meetings: D1 meeting_owners (co-owners of recorded meetings) plus
+// legacy transcriptions.owner_email rows, unioned with the owners of any KV
+// schedule — so a user with only a pending schedule (no recordings yet) still
+// shows up. Feeds the admin "Scheduled Meetings" picker.
+async function handleAdminUsers(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  const emails = new Set();
+  if (env.DB) {
+    try {
+      const res = await env.DB.prepare(
+        "SELECT DISTINCT owner_email FROM meeting_owners WHERE owner_email IS NOT NULL AND owner_email != '' " +
+        "UNION SELECT DISTINCT owner_email FROM transcriptions WHERE owner_email IS NOT NULL AND owner_email != ''"
+      ).all();
+      for (const row of (res && res.results) || []) {
+        const email = normalizeEmail(row && row.owner_email);
+        if (email) emails.add(email);
+      }
+    } catch {
+      /* meeting_owners/transcriptions not ready yet — schedules below still work */
+    }
+  }
+  const schedules = await readSchedules(env, SCHEDULE_PREFIX);
+  for (const s of schedules) {
+    const email = normalizeEmail(s.owner);
+    if (email) emails.add(email);
+  }
+  return json({ ok: true, users: [...emails].sort() });
 }
 
 // Which `meetings` column to join transcriptions.meeting_id against. Confirmed
@@ -2193,17 +2225,30 @@ async function handleCalendarConnect(request, env) {
   return Response.redirect(target, 302);
 }
 
-// GET /calendar/meetings?email=<session email>.
+// Resolves which email a calendar call should run as. A normal user always
+// acts as themselves. An admin has no calendar of their own — they must name a
+// target user via ?email= (GET) or body.email (POST); returns null (and the
+// caller should 400) when admin passes nothing usable.
+function calendarActingEmail(request, session, body) {
+  if (!session.isAdmin) return session.identity;
+  const raw = body ? body.email : new URL(request.url).searchParams.get("email");
+  const email = normalizeEmail(raw);
+  return email || null;
+}
+
+// GET /calendar/meetings?email=<acting email>. A normal user always acts as
+// themselves; an admin must pass ?email=<user> to view that user's calendar.
 async function handleCalendarMeetings(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
+  const email = calendarActingEmail(request, session);
+  if (!email) return json({ error: session.isAdmin ? "email is required" : "Admin accounts have no calendar" }, session.isAdmin ? 400 : 403);
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   try {
     const base = calendarApiBase(env);
     const includeCancelled = new URL(request.url).searchParams.get("include_cancelled") === "true";
     const target =
-      base + "/calendar/meetings?email=" + encodeURIComponent(session.identity) +
+      base + "/calendar/meetings?email=" + encodeURIComponent(email) +
       (includeCancelled ? "&include_cancelled=true" : "");
     const upstream = await fetch(target, { headers: { "X-API-Key": env.API_KEY } });
     const calendar = await readUpstreamJson(upstream);
@@ -2215,23 +2260,25 @@ async function handleCalendarMeetings(request, env) {
 
 // POST /calendar/meetings/remove {email, event_id} — removes a scheduled/upcoming
 // calendar meeting so the bot won't (or no longer will) join it. The event_id
-// comes from the calendar_events array; email is the session's, added server-side.
+// comes from the calendar_events array; email is the acting user's — the
+// session's own for a normal user, or an admin-supplied target for admin.
 async function handleCalendarRemove(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   const body = await request.json().catch(() => ({}));
   const eventId = body.event_id;
   if (eventId === undefined || eventId === null || eventId === "") {
     return json({ error: "event_id is required" }, 400);
   }
+  const email = calendarActingEmail(request, session, body);
+  if (!email) return json({ error: session.isAdmin ? "email is required" : "Admin accounts have no calendar" }, session.isAdmin ? 400 : 403);
   try {
     const base = calendarApiBase(env);
     const upstream = await fetch(base + "/calendar/meetings/remove", {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ email: session.identity, event_id: eventId }),
+      body: JSON.stringify({ email, event_id: eventId }),
     });
     const result = await readUpstreamJson(upstream);
     return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
@@ -2246,19 +2293,20 @@ async function handleCalendarRemove(request, env) {
 async function handleCalendarRestore(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  if (session.isAdmin) return json({ error: "Admin accounts have no calendar" }, 403);
   if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
   const body = await request.json().catch(() => ({}));
   const eventId = body.event_id;
   if (eventId === undefined || eventId === null || eventId === "") {
     return json({ error: "event_id is required" }, 400);
   }
+  const email = calendarActingEmail(request, session, body);
+  if (!email) return json({ error: session.isAdmin ? "email is required" : "Admin accounts have no calendar" }, session.isAdmin ? 400 : 403);
   try {
     const base = calendarApiBase(env);
     const upstream = await fetch(base + "/calendar/meetings/restore", {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
-      body: JSON.stringify({ email: session.identity, event_id: eventId }),
+      body: JSON.stringify({ email, event_id: eventId }),
     });
     const result = await readUpstreamJson(upstream);
     return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
@@ -2441,10 +2489,25 @@ function publicSchedule(s) {
   };
 }
 
+// Same as publicSchedule, plus the owner — admin's cross-user view needs to know
+// whose schedule each row is so it can act (cancel) on the right owner's behalf.
+function publicScheduleAdmin(s) {
+  return { ...publicSchedule(s), owner: s.owner };
+}
+
+// GET /api/schedules — a normal user sees only their own. An admin sees every
+// user's schedules (across owners), each tagged with its owner, optionally
+// filtered to a single ?email= for a focused view.
 async function handleListSchedules(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  if (session.isAdmin) return json({ ok: true, schedules: [] });
+  if (session.isAdmin) {
+    const email = new URL(request.url).searchParams.get("email");
+    const schedules = email
+      ? await listSchedulesFor(env, normalizeEmail(email))
+      : await readSchedules(env, SCHEDULE_PREFIX);
+    return json({ ok: true, schedules: schedules.map(publicScheduleAdmin) });
+  }
   const schedules = await listSchedulesFor(env, session.identity);
   return json({ ok: true, schedules: schedules.map(publicSchedule) });
 }
@@ -2516,10 +2579,17 @@ async function handleCreateSchedule(request, env) {
 async function handleDeleteSchedule(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  if (session.isAdmin) return json({ error: "Admin accounts can't schedule meetings" }, 403);
   const body = await request.json().catch(() => ({}));
   const id = String(body.id || "").trim();
   if (!id) return json({ error: "Schedule id is required" }, 400);
+  if (session.isAdmin) {
+    // Admin cancels on a specific user's behalf — the owner must be supplied
+    // (the schedule list echoes it back per row), never inferred.
+    const owner = normalizeEmail(body.owner);
+    if (!owner) return json({ error: "owner is required" }, 400);
+    await env.KV.delete(scheduleKey(owner, id));
+    return json({ ok: true });
+  }
   // The key embeds the session owner, so a user can only ever delete their own.
   await env.KV.delete(scheduleKey(session.identity, id));
   return json({ ok: true });

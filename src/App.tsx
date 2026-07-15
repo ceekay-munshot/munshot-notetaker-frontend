@@ -15,6 +15,7 @@ import Weekly from './pages/Weekly'
 import WeeklyArchive from './pages/WeeklyArchive'
 import Search from './pages/Search'
 import Tracking from './pages/Tracking'
+import ScheduledMeetings from './pages/ScheduledMeetings'
 
 export default function App() {
   return (
@@ -62,6 +63,7 @@ function Dashboard() {
                 <Route path="weekly" element={<Weekly />} />
                 <Route path="weekly/archive" element={<WeeklyArchive />} />
                 <Route path="tracking" element={<Tracking />} />
+                <Route path="scheduled" element={<ScheduledMeetings />} />
                 <Route path="search" element={<Search />} />
                 <Route path="*" element={<NotFound />} />
               </Route>
