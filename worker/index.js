@@ -81,6 +81,7 @@ export default {
       if (method === "GET" && pathname === "/api/debug/meetings-schema") return handleDebugMeetingsSchema(request, env);
       if (method === "GET" && pathname === "/api/tracking") return handleGetTracking(request, env);
       if (method === "POST" && pathname === "/api/tracking") return handleSaveTracking(request, env);
+      if (method === "POST" && pathname === "/api/weekly/tracking") return handleWeeklyTracking(request, env);
       // Public, key-gated (not session-gated) so an external dashboard can call
       // it directly — see TRACKING_CORS_HEADERS / handlePublicTracking below.
       if (method === "OPTIONS" && pathname === "/api/public/tracking") return handleTrackingPreflight();
@@ -1231,9 +1232,10 @@ function buildMultiMeetingText(rows, maxChars = 42000) {
 }
 
 // Per-person weekly rollup. Loads every transcript the signed-in user can see
-// (own rows; all rows for admin), then asks OpenAI for a STRICT-JSON breakdown
-// per participant: an overall view, what they've accomplished, and their current
-// to-dos. The OpenAI key stays a server-side secret. Same ACL as /api/transcripts.
+// (own rows; all rows for admin), then reconciles each participant's
+// structured to-do items against whatever meetings haven't been processed yet
+// — see the reconcile engine above. The OpenAI key stays a server-side secret.
+// Same ACL as /api/transcripts.
 async function handleWeeklyPeople(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
@@ -1264,125 +1266,343 @@ async function handleWeeklyPeople(request, env) {
   const rows = (res && res.results) || [];
   if (!rows.length) return json({ ok: true, people: [] });
 
-  // Persist the rollup per user and only rebuild it when the underlying meetings
-  // change (fingerprint = row count + newest created_at) — so a normal revisit is
-  // instant and free, matching the weekly summary's "don't regenerate" behaviour.
-  // The page's "Regenerate" button sends force:true to rebuild on demand.
+  // Persist reconciled state per user, keyed by which meetings have already
+  // been folded in — a normal revisit with no new meetings is instant and
+  // free (aging-only, no AI call). The page's "Regenerate" button sends
+  // force:true to re-reconcile everything from scratch.
   const body = await request.json().catch(() => ({}));
   const force = !!(body && body.force);
-  let maxCreated = "";
-  for (const r of rows) {
-    const c = String(r.created_at || "");
-    if (c > maxCreated) maxCreated = c;
-  }
-  const fingerprint = `${rows.length}:${maxCreated}`;
-  const cacheKey = `weekly:people:v1:${weeklyScopeEmail(session)}`;
-  if (!force && env.KV) {
+  const cacheKey = `weekly:people:v2:${weeklyScopeEmail(session)}`;
+  let state = { peopleByKey: {}, processedMeetingIds: [] };
+  if (env.KV) {
     try {
       const cached = await env.KV.get(cacheKey);
       if (cached) {
         const parsed = JSON.parse(cached);
-        if (parsed && parsed.fingerprint === fingerprint && Array.isArray(parsed.people)) {
-          return json({ ok: true, people: parsed.people, cached: true });
+        if (parsed && typeof parsed === "object") {
+          state = { peopleByKey: parsed.peopleByKey || {}, processedMeetingIds: parsed.processedMeetingIds || [] };
         }
       }
     } catch {
-      /* fall through and regenerate */
+      state = { peopleByKey: {}, processedMeetingIds: [] };
     }
+  }
+
+  const now = Date.now();
+  const processed = new Set(force ? [] : state.processedMeetingIds);
+  const newRows = rows.filter((r) => !processed.has(String(r.meeting_id)));
+
+  if (!newRows.length) {
+    const people = Object.values(state.peopleByKey)
+      .map((p) => {
+        const items = applyAging(p.items || [], now);
+        const derived = deriveRollup(items, now);
+        return { name: p.name, overall: p.overall || "", accomplished: derived.accomplished, todo: derived.todo, items };
+      })
+      .filter((p) => p.overall || p.accomplished.length || p.todo.length);
+    return json({ ok: true, people, cached: true });
   }
 
   const model = env.OPENAI_MODEL || "gpt-4o";
   try {
-    const people = await peopleRollupFromRows(rows, apiKey, model);
+    const priorItemsByName = {};
+    for (const p of Object.values(state.peopleByKey)) {
+      priorItemsByName[p.name] = (p.items || []).filter((it) => it.status === "open");
+    }
+    const newMeetingText = buildMultiMeetingText(newRows);
+    const decisions = await reconcileItems(priorItemsByName, newMeetingText, apiKey, model);
+    const decisionByKey = new Map(decisions.map((d) => [personKey(d.name), d]));
+    const newMeetingIds = [...new Set(newRows.map((r) => String(r.meeting_id)))];
+    const repMeetingId = newMeetingIds[newMeetingIds.length - 1];
+
+    const keys = new Set([...Object.keys(state.peopleByKey), ...decisions.map((d) => personKey(d.name))]);
+    const nextPeopleByKey = {};
+    for (const key of keys) {
+      const prior = state.peopleByKey[key];
+      const priorItems = (prior && prior.items) || [];
+      const decision = decisionByKey.get(key) || {
+        name: prior && prior.name,
+        overall: prior && prior.overall,
+        reaffirm: [],
+        complete: [],
+        cancel: [],
+        new: [],
+      };
+      const displayName = decision.name || (prior && prior.name) || key;
+      const items = applyReconcile(priorItems, decision, { meetingId: repMeetingId, now, slug: slugifyName(displayName) });
+      nextPeopleByKey[key] = { name: displayName, overall: decision.overall || (prior && prior.overall) || "", items };
+    }
+
+    const nextProcessed = [...processed, ...newMeetingIds];
     if (env.KV) {
       try {
-        await env.KV.put(cacheKey, JSON.stringify({ fingerprint, people, generatedAt: Date.now() }));
+        await env.KV.put(
+          cacheKey,
+          JSON.stringify({ peopleByKey: nextPeopleByKey, processedMeetingIds: nextProcessed, generatedAt: now })
+        );
       } catch {
         /* best-effort persist */
       }
     }
+
+    const people = Object.values(nextPeopleByKey)
+      .map((p) => {
+        const derived = deriveRollup(p.items, now);
+        return { name: p.name, overall: p.overall, accomplished: derived.accomplished, todo: derived.todo, items: p.items };
+      })
+      .filter((p) => p.overall || p.accomplished.length || p.todo.length);
     return json({ ok: true, people });
   } catch (err) {
     return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
   }
 }
 
-// Shared strict-JSON "per-person status rollup" call, factored out of
-// handleWeeklyPeople so the admin people-tracker (below) can ask the same
-// question about a single person over a pre-filtered set of rows. `rows` must
-// already be scoped to what the caller may see. When `focusName` is set, the
-// model is told to report on ONLY that person (tolerating STT misspellings)
-// and to return an empty list if the rows don't actually support anything
-// concrete about them — callers should treat an empty result as "nothing
-// found yet", not an error.
-async function peopleRollupFromRows(rows, apiKey, model, focusName) {
-  if (!rows.length) return [];
-  const transcripts = buildMultiMeetingText(rows);
+/* ------------------------------ structured to-do reconcile engine ------------------------------ */
+// Replaces "regenerate the whole rollup from scratch every tick" with an
+// incremental reconcile: each tick, only the transcript text from meetings not
+// yet processed for a person is shown to the model, together with that
+// person's current OPEN items (id/text/priority/dueDate). The model returns
+// explicit decisions (reaffirm / complete / cancel / new) instead of a fresh
+// free-text list, so an item's identity survives across ticks, "done" requires
+// transcript evidence, and an item that simply isn't mentioned again is aged
+// (missCount) rather than silently vanishing. The legacy `accomplished`/`todo`
+// string arrays (the shape the UI and the public API already understand) are
+// DERIVED from these structured items — see deriveRollup — so existing
+// renderers and the external API keep working unchanged.
+
+const TODO_STALE_MISS_CAP = 6; // ticks open w/o reaffirmation before eligible for staleness auto-drop
+const TODO_STALE_MIN_AGE_MS = 90 * 24 * 60 * 60 * 1000; // ...and only once this old
+const TODO_RECENT_DONE_MS = 30 * 24 * 60 * 60 * 1000; // "accomplished" window shown in the derived view
+
+function mintTodoId(slug) {
+  return `${slug || "item"}-${crypto.randomUUID().slice(0, 8)}`;
+}
+
+function todayIso(now) {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+function personKey(name) {
+  return String(name || "").trim().toLowerCase();
+}
+
+// Pure — recomputes `overdue` and applies the long-horizon staleness drop. Runs
+// every tick (even the AI-free fast path) so overdue flags never go stale.
+function applyAging(items, now) {
+  const today = todayIso(now);
+  return items.map((it) => {
+    if (it.status !== "open") return { ...it, overdue: false };
+    const stale =
+      (it.missCount || 0) >= TODO_STALE_MISS_CAP &&
+      !it.dueDate &&
+      now - it.firstSeenAt >= TODO_STALE_MIN_AGE_MS;
+    if (stale) {
+      return {
+        ...it,
+        status: "dropped",
+        overdue: false,
+        evidence: it.evidence || "Auto-archived: not mentioned in any meeting for a long time.",
+      };
+    }
+    return { ...it, overdue: !!(it.dueDate && it.dueDate < today) };
+  });
+}
+
+// Pure — applies one reconcile decision (from reconcileItems) onto a person's
+// prior item list. Every status change carries evidence or an explicit reason;
+// an item that isn't mentioned this tick is left `open` with missCount bumped,
+// never silently dropped.
+function applyReconcile(priorItems, decision, ctx) {
+  const { meetingId, now, slug } = ctx;
+  const byId = new Map(priorItems.map((it) => [it.id, it]));
+  const touched = new Set();
+
+  for (const id of (decision && decision.reaffirm) || []) {
+    const it = byId.get(id);
+    if (!it) continue;
+    touched.add(id);
+    byId.set(id, { ...it, lastSeenAt: now, missCount: 0 });
+  }
+  for (const c of (decision && decision.complete) || []) {
+    const it = byId.get(c && c.id);
+    if (!it) continue;
+    touched.add(it.id);
+    byId.set(it.id, {
+      ...it,
+      status: "done",
+      lastSeenAt: now,
+      missCount: 0,
+      completedMeetingId: meetingId,
+      completedAt: now,
+      evidence: String((c && c.evidence) || "").trim() || it.evidence,
+    });
+  }
+  for (const c of (decision && decision.cancel) || []) {
+    const it = byId.get(c && c.id);
+    if (!it) continue;
+    touched.add(it.id);
+    byId.set(it.id, {
+      ...it,
+      status: "dropped",
+      lastSeenAt: now,
+      missCount: 0,
+      evidence: String((c && c.evidence) || "").trim() || it.evidence,
+    });
+  }
+  for (const it of priorItems) {
+    if (it.status !== "open" || touched.has(it.id)) continue;
+    byId.set(it.id, { ...it, missCount: (it.missCount || 0) + 1 });
+  }
+  for (const n of (decision && decision.new) || []) {
+    const text = String((n && n.text) || "").trim();
+    if (!text) continue;
+    const priority = ["high", "medium", "low"].includes(n && n.priority) ? n.priority : "medium";
+    const dueDate = n && n.dueDate && /^\d{4}-\d{2}-\d{2}$/.test(n.dueDate) ? n.dueDate : null;
+    const id = mintTodoId(slug);
+    byId.set(id, {
+      id,
+      text,
+      status: "open",
+      priority,
+      dueDate,
+      owner: (decision && decision.name) || "",
+      firstSeenMeetingId: meetingId,
+      firstSeenAt: now,
+      lastSeenAt: now,
+      missCount: 0,
+    });
+  }
+
+  return applyAging([...byId.values()], now);
+}
+
+// Upgrades a pre-reconcile record (plain todo/accomplished strings, no
+// structured items) into seeded TodoItems, so switching a person over to this
+// scheme loses nothing already on screen.
+function seedItemsFromLegacy(record, now) {
+  const seenAt = (record && record.updatedAt) || now;
+  const slug = (record && record.slug) || "";
+  const owner = (record && record.name) || "";
+  const open = ((record && record.todo) || []).map((text) => ({
+    id: mintTodoId(slug),
+    text: String(text),
+    status: "open",
+    priority: "medium",
+    dueDate: null,
+    owner,
+    firstSeenMeetingId: "",
+    firstSeenAt: seenAt,
+    lastSeenAt: seenAt,
+    missCount: 0,
+  }));
+  const done = ((record && record.accomplished) || []).map((text) => ({
+    id: mintTodoId(slug),
+    text: String(text),
+    status: "done",
+    priority: "medium",
+    dueDate: null,
+    owner,
+    firstSeenMeetingId: "",
+    firstSeenAt: seenAt,
+    lastSeenAt: seenAt,
+    completedAt: seenAt,
+    missCount: 0,
+  }));
+  return [...open, ...done];
+}
+
+// Derives the legacy `{ todo, accomplished }` string-array view the UI, public
+// API, and downstream weekly synthesis already understand from the structured
+// items — open items sorted overdue-first then by priority/due date;
+// "accomplished" shows recent completions so the card doesn't grow forever.
+function deriveRollup(items, now) {
+  const priorityRank = { high: 0, medium: 1, low: 2 };
+  const todo = items
+    .filter((it) => it.status === "open")
+    .sort((a, b) => {
+      if (!!a.overdue !== !!b.overdue) return a.overdue ? -1 : 1;
+      const pr = (priorityRank[a.priority] ?? 1) - (priorityRank[b.priority] ?? 1);
+      if (pr) return pr;
+      if (a.dueDate && b.dueDate) return a.dueDate < b.dueDate ? -1 : a.dueDate > b.dueDate ? 1 : 0;
+      if (a.dueDate) return -1;
+      if (b.dueDate) return 1;
+      return (b.firstSeenAt || 0) - (a.firstSeenAt || 0);
+    })
+    .map((it) => it.text);
+  const accomplished = items
+    .filter((it) => it.status === "done" && now - (it.completedAt || 0) <= TODO_RECENT_DONE_MS)
+    .sort((a, b) => (b.completedAt || 0) - (a.completedAt || 0))
+    .map((it) => it.text);
+  return { todo, accomplished };
+}
+
+// One JSON model call that reconciles NEW transcript evidence against each
+// person's current OPEN items instead of re-deriving everyone's whole list.
+// `priorItemsByName` maps a person's display name -> their open items
+// (id/text/priority/dueDate); an absent/empty entry is fine for someone with no
+// prior state. `focusName` restricts the reconcile to one person (used by the
+// tracked-people cron); omit it to reconcile everyone the new transcripts
+// actually surface (used by the weekly per-person rollup, which tracks the
+// whole team rather than a curated roster).
+async function reconcileItems(priorItemsByName, newMeetingText, apiKey, model, focusName) {
+  const priorList = Object.entries(priorItemsByName).map(([name, items]) => ({
+    name,
+    openItems: items.map((it) => ({ id: it.id, text: it.text, priority: it.priority, dueDate: it.dueDate })),
+  }));
   const focusInstruction = focusName
-    ? `Only report on "${focusName}" (match case-insensitively and tolerate speech-to-text misspellings of the ` +
-      `name) — ignore everyone else. If the transcripts below don't actually support anything concrete about ` +
-      `them, return {"people":[]}.`
-    : "For each person who actually spoke or was discussed, return an object.";
+    ? `Only report on "${focusName}" (match case-insensitively, tolerate speech-to-text misspellings) — ignore ` +
+      "everyone else, even if they have prior open items listed below."
+    : "Report on every person who actually spoke or was substantively discussed in the NEW TRANSCRIPTS below.";
   const messages = [
     {
       role: "system",
       content:
-        "You analyze a team's meeting transcripts and produce a per-person status rollup. " +
-        "Use ONLY what the transcripts support — never invent names, tasks, or outcomes. " +
-        "Respond with STRICT JSON only.",
+        "You maintain a per-person action-item tracker across a team's meetings. You are given each person's " +
+        "CURRENT OPEN ITEMS (from earlier meetings) and NEW TRANSCRIPT excerpts the tracker hasn't seen yet. " +
+        "Reconcile — do not restate. Use ONLY what the new transcripts support; never invent names, tasks, or " +
+        "outcomes. Respond with STRICT JSON only.",
     },
     {
       role: "user",
       content:
-        "From the meeting transcripts below, produce a per-person rollup across all the meetings. " +
-        `${focusInstruction}\n` +
-        'Return an object with:\n' +
-        '- "name": their name exactly as it appears in the transcript.\n' +
-        '- "overall": one or two sentences describing their role / focus across the meetings.\n' +
-        '- "accomplished": an array of concrete things they have completed or made progress on (past tense).\n' +
-        '- "todo": an array of concrete current or next tasks / action items they still need to do.\n' +
-        "Keep each list item short (a phrase, not a paragraph). Omit a person entirely if there is nothing " +
-        "concrete to say. If a list has nothing, use an empty array. " +
-        'Return JSON of the exact shape: {"people":[{"name":"","overall":"","accomplished":[],"todo":[]}]}.\n\n' +
-        "TRANSCRIPTS:\n" + transcripts,
+        "PRIOR STATE (each person's current open items, with stable ids):\n" +
+        JSON.stringify(priorList) +
+        "\n\nNEW TRANSCRIPTS (not yet reconciled):\n" + newMeetingText +
+        "\n\n" + focusInstruction + "\n" +
+        "For each relevant person, return an object with:\n" +
+        '- "name": their name exactly as it appears in the transcript (match to an existing PRIOR STATE name ' +
+        "when it's clearly the same person, even with spelling differences).\n" +
+        '- "overall": one or two sentences on their current role / focus (an updated version of any prior summary).\n' +
+        '- "reaffirm": ids from their prior open items that are still pending, unchanged by this new evidence.\n' +
+        '- "complete": [{"id","evidence"}] — prior open items the new transcripts show were FINISHED. "evidence" ' +
+        "is a short quote or paraphrase proving it, not a guess.\n" +
+        '- "cancel": [{"id","evidence"}] — prior open items explicitly dropped / no longer needed, with evidence.\n' +
+        '- "new": [{"text","priority":"high"|"medium"|"low","dueDate":"YYYY-MM-DD"|null}] — concrete NEW action ' +
+        "items for this person that do not already match a prior item (if it's the same task reworded, put its " +
+        "id in reaffirm instead of duplicating it here). Infer dueDate only when a real date or day is stated; " +
+        "otherwise null.\n" +
+        "A prior open item not mentioned in the new transcripts at all should be left out of every list — do not " +
+        "reaffirm items you have no new evidence for, and do not invent an id.\n" +
+        'Return JSON of the exact shape: {"people":[{"name":"","overall":"","reaffirm":[],"complete":[],' +
+        '"cancel":[],"new":[]}]}. Omit a person entirely if the new transcripts say nothing about them.',
     },
   ];
-
-  let upstream;
-  try {
-    upstream = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        messages,
-        temperature: 0.2,
-        max_tokens: 1500,
-        response_format: { type: "json_object" },
-      }),
-    });
-  } catch (err) {
-    throw new Error(`Failed to reach the AI service: ${String((err && err.message) || err)}`);
-  }
-  const data = await upstream.json().catch(() => ({}));
-  if (!upstream.ok) {
-    throw new Error((data && data.error && data.error.message) || `HTTP ${upstream.status}`);
-  }
-  const content =
-    (data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "{}";
-  let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    parsed = { people: [] };
-  }
-  return Array.isArray(parsed.people)
+  const parsed = await openaiJson(apiKey, model, messages, 1800);
+  return Array.isArray(parsed && parsed.people)
     ? parsed.people
         .map((p) => ({
           name: String((p && p.name) || "").trim(),
           overall: String((p && p.overall) || "").trim(),
-          accomplished: Array.isArray(p && p.accomplished) ? p.accomplished.map((x) => String(x).trim()).filter(Boolean) : [],
-          todo: Array.isArray(p && p.todo) ? p.todo.map((x) => String(x).trim()).filter(Boolean) : [],
+          reaffirm: Array.isArray(p && p.reaffirm) ? p.reaffirm.map((x) => String(x)) : [],
+          complete: Array.isArray(p && p.complete)
+            ? p.complete.map((c) => ({ id: String((c && c.id) || ""), evidence: String((c && c.evidence) || "").trim() }))
+            : [],
+          cancel: Array.isArray(p && p.cancel)
+            ? p.cancel.map((c) => ({ id: String((c && c.id) || ""), evidence: String((c && c.evidence) || "").trim() }))
+            : [],
+          new: Array.isArray(p && p.new)
+            ? p.new.map((n) => ({ text: String((n && n.text) || "").trim(), priority: n && n.priority, dueDate: n && n.dueDate }))
+            : [],
         }))
         .filter((p) => p.name)
     : [];
@@ -1919,31 +2139,130 @@ async function handleSaveTracking(request, env) {
   return json({ ok: true, selection: names });
 }
 
-// Builds one person's durable rollup from every row where they're the speaker
-// OR are mentioned by name in someone else's line — this is how a meeting
-// that only *discusses* a tracked person (never has them speak) still updates
-// their list. `speaker = ?1` is the precise, primary signal; the LIKE mention
-// is secondary and deliberately permissive (the rollup prompt is instructed to
-// use only what the filtered transcript actually supports, so a meeting that
-// merely name-drops the person yields nothing rather than a hallucinated item).
-async function rollupForPerson(env, name, apiKey, model) {
+// Admin-only "Tracked People" weekly section: buckets each tracked person's
+// already-reconciled structured items (see the reconcile engine above) into a
+// week's completed / newly-opened / carried-over-and-overdue view. Pure
+// bucketing over state the cron already computed — no OpenAI call, so it's
+// instant and free every time the Weekly page is opened. Body:
+// { weekStartMs, weekEndMs }.
+async function handleWeeklyTracking(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  if (!env.KV) return json({ error: "Storage isn't connected yet" }, 503);
+  const body = await request.json().catch(() => ({}));
+  const weekStart = Number(body && body.weekStartMs) || 0;
+  const weekEnd = Number(body && body.weekEndMs) || Date.now();
+
+  const selection = await readTrackingSelection(env);
+  const people = await Promise.all(
+    selection.names.map(async (name) => {
+      const slug = slugifyName(name);
+      let stored = null;
+      try {
+        const raw = slug ? await env.KV.get(trackingPersonKey(slug)) : null;
+        stored = raw ? JSON.parse(raw) : null;
+      } catch {
+        stored = null;
+      }
+      const items = stored && Array.isArray(stored.items) ? stored.items : [];
+      const completedThisWeek = items
+        .filter((it) => it.status === "done" && it.completedAt >= weekStart && it.completedAt <= weekEnd)
+        .map((it) => it.text);
+      const openedThisWeek = items
+        .filter((it) => it.status === "open" && it.firstSeenAt >= weekStart && it.firstSeenAt <= weekEnd)
+        .map((it) => it.text);
+      const carriedOverdue = items.filter((it) => it.status === "open" && it.overdue).map((it) => it.text);
+      return { name, slug, completedThisWeek, openedThisWeek, carriedOverdue };
+    })
+  );
+  return json({
+    ok: true,
+    weekStart,
+    weekEnd,
+    people: people.filter((p) => p.completedThisWeek.length || p.openedThisWeek.length || p.carriedOverdue.length),
+  });
+}
+
+// Every row where a person is the speaker OR is mentioned by name in someone
+// else's line — this is how a meeting that only *discusses* a tracked person
+// (never has them speak) still surfaces evidence about them. `speaker = ?1` is
+// the precise, primary signal; the LIKE mention is secondary and deliberately
+// permissive (the reconcile prompt is told to use only what the transcript
+// actually supports, so a meeting that merely name-drops the person yields no
+// new items rather than a hallucinated one).
+async function personTranscriptRows(env, name) {
   const like = escapeLike(name);
-  let res;
+  const res = await env.DB.prepare(
+    "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions " +
+    "WHERE speaker = ?1 OR text LIKE '%' || ?2 || '%' ESCAPE '\\' " +
+    "ORDER BY meeting_id, start_time"
+  ).bind(name, like).all();
+  return (res && res.results) || [];
+}
+
+// Cheap check for whether a person has any transcript evidence not yet folded
+// into their stored rollup — lets the cron skip the AI reconcile call (and its
+// budget cost) for people with nothing new to report this tick.
+async function personHasNewEvidence(env, name, prior) {
+  let rows;
   try {
-    res = await env.DB.prepare(
-      "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions " +
-      "WHERE speaker = ?1 OR text LIKE '%' || ?2 || '%' ESCAPE '\\' " +
-      "ORDER BY meeting_id, start_time"
-    ).bind(name, like).all();
+    rows = await personTranscriptRows(env, name);
+  } catch {
+    return true; // fail open — let the full reconcile path raise/handle the error
+  }
+  if (!rows.length) return false;
+  const processed = new Set((prior && prior.processedMeetingIds) || []);
+  return rows.some((r) => !processed.has(String(r.meeting_id)));
+}
+
+// Incrementally updates one tracked person's rollup: only the transcript rows
+// from meetings not yet in `prior.processedMeetingIds` are shown to the model,
+// reconciled against their current open items (see reconcileItems above). A
+// legacy record (pre-upgrade, plain todo/accomplished strings) is seeded into
+// structured items first so nothing already on screen is lost.
+async function rollupForPerson(env, name, prior, apiKey, model, now) {
+  let rows;
+  try {
+    rows = await personTranscriptRows(env, name);
   } catch (err) {
     throw new Error(`Failed to load transcripts for ${name}: ${String((err && err.message) || err)}`);
   }
-  const rows = (res && res.results) || [];
-  if (!rows.length) return { overall: "", accomplished: [], todo: [], meetingCount: 0 };
+  const slug = (prior && prior.slug) || slugifyName(name);
+  const priorItems =
+    prior && Array.isArray(prior.items) && prior.items.length ? prior.items : seedItemsFromLegacy(prior, now);
+  const processed = new Set((prior && prior.processedMeetingIds) || []);
   const meetingCount = new Set(rows.map((r) => String(r.meeting_id))).size;
-  const people = await peopleRollupFromRows(rows, apiKey, model, name);
-  const match = people[0] || { overall: "", accomplished: [], todo: [] };
-  return { overall: match.overall, accomplished: match.accomplished, todo: match.todo, meetingCount };
+  const newRows = rows.filter((r) => !processed.has(String(r.meeting_id)));
+
+  if (!newRows.length) {
+    return {
+      overall: (prior && prior.overall) || "",
+      items: applyAging(priorItems, now),
+      meetingCount,
+      processedMeetingIds: [...processed],
+    };
+  }
+
+  const newMeetingText = buildMultiMeetingText(newRows);
+  const openByName = { [name]: priorItems.filter((it) => it.status === "open") };
+  const decisions = await reconcileItems(openByName, newMeetingText, apiKey, model, name);
+  const decision = decisions[0] || {
+    name,
+    overall: (prior && prior.overall) || "",
+    reaffirm: [],
+    complete: [],
+    cancel: [],
+    new: [],
+  };
+  const newMeetingIds = [...new Set(newRows.map((r) => String(r.meeting_id)))];
+  const nextProcessed = new Set([...processed, ...newMeetingIds]);
+  const items = applyReconcile(priorItems, decision, { meetingId: newMeetingIds[newMeetingIds.length - 1], now, slug });
+  return {
+    overall: decision.overall || (prior && prior.overall) || "",
+    items,
+    meetingCount,
+    processedMeetingIds: [...nextProcessed],
+  };
 }
 
 // Cron pass 1: gradually summarizes the whole meeting history AND every new
@@ -2021,12 +2340,15 @@ async function runAutoSummaries(env) {
   }
 }
 
-// Cron pass 2: regenerates every tracked person's rollup, throttled so it only
-// does AI work when the transcript table has actually grown (a cheap
+// Cron pass 2: updates every tracked person's rollup, throttled so it only
+// does per-person work when the transcript table has actually grown (a cheap
 // COUNT(*) probe) or the throttle interval has elapsed (periodic refresh even
-// if the count-based signal was missed). Rebuilds the public blob afterward
-// from each person's latest stored record — including ones skipped this tick
-// by the budget cap — so the external API never regresses to older data.
+// if the count-based signal was missed). Within that window, a person only
+// costs an AI call (and daily budget) when they actually have new transcript
+// evidence to reconcile — everyone else just gets a free aging pass (overdue
+// flags recomputed, no AI). Rebuilds the public blob afterward from each
+// person's latest stored record — including ones skipped this tick by the
+// budget cap — so the external API never regresses to older data.
 async function runTrackingRollups(env) {
   const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey || !env.DB || !env.KV) return;
@@ -2057,20 +2379,59 @@ async function runTrackingRollups(env) {
 
     const model = env.OPENAI_MODEL || "gpt-4o";
     for (const name of selection.names) {
-      if (!(await withinDailyBudget(env, 1))) break;
       const slug = slugifyName(name);
       if (!slug) continue;
+      let prior = null;
       try {
-        const rollup = await rollupForPerson(env, name, apiKey, model);
+        const raw = await env.KV.get(trackingPersonKey(slug));
+        prior = raw ? JSON.parse(raw) : null;
+      } catch {
+        prior = null;
+      }
+
+      let hasNewEvidence = true;
+      try {
+        hasNewEvidence = await personHasNewEvidence(env, name, prior);
+      } catch {
+        hasNewEvidence = true;
+      }
+      if (!hasNewEvidence) {
+        if (prior && Array.isArray(prior.items) && prior.items.length) {
+          const items = applyAging(prior.items, now);
+          const derived = deriveRollup(items, now);
+          await env.KV.put(
+            trackingPersonKey(slug),
+            JSON.stringify({
+              name,
+              slug,
+              overall: prior.overall || "",
+              accomplished: derived.accomplished,
+              todo: derived.todo,
+              items,
+              processedMeetingIds: prior.processedMeetingIds || [],
+              meetingCount: prior.meetingCount || 0,
+              updatedAt: prior.updatedAt || now,
+            })
+          );
+        }
+        continue;
+      }
+
+      if (!(await withinDailyBudget(env, 1))) break;
+      try {
+        const result = await rollupForPerson(env, name, prior, apiKey, model, now);
+        const derived = deriveRollup(result.items, now);
         await env.KV.put(
           trackingPersonKey(slug),
           JSON.stringify({
             name,
             slug,
-            overall: rollup.overall,
-            accomplished: rollup.accomplished,
-            todo: rollup.todo,
-            meetingCount: rollup.meetingCount,
+            overall: result.overall,
+            accomplished: derived.accomplished,
+            todo: derived.todo,
+            items: result.items,
+            processedMeetingIds: result.processedMeetingIds,
+            meetingCount: result.meetingCount,
             updatedAt: now,
           })
         );

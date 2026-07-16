@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { useAppData } from '../store/AppData'
+import { useAuth } from '../store/Auth'
 import { useSentiment } from '../store/Sentiment'
 import { downloadWeekly } from '../lib/exportWeekly'
 import { downloadWeeklyPdf } from '../lib/pdfRender'
@@ -18,6 +19,7 @@ import { EditionSwitcher } from '../components/EditionSwitcher'
 import { RichText, entityTerms } from '../components/RichText'
 import { ToneMeter } from '../components/ToneMeter'
 import { WeeklyPeople } from '../components/WeeklyPeople'
+import { WeeklyTracking } from '../components/WeeklyTracking'
 import { WeeklyChat } from '../components/WeeklyChat'
 
 const THEME_STYLES = [
@@ -30,6 +32,8 @@ const THEME_STYLES = [
 
 export default function Weekly() {
   const { episodes, podcasts, episodeById, podcastById, loading, identity, needsApiKey, weekProcessing, weekProgress, processWeek, cancelProcessWeek, hydrateCachedSummaries } = useAppData()
+  const { state: authState } = useAuth()
+  const isAdmin = authState.status === 'authed' && authState.isAdmin
   const { on: sentimentOn } = useSentiment()
   const [params, setParams] = useSearchParams()
   const [weekly, setWeekly] = useState<WeeklySummary | null | undefined>(undefined) // undefined = generating
@@ -80,6 +84,10 @@ export default function Weekly() {
       ? requested
       : editions[0]?.weekKey ?? 'all'
   const selected = currentKey === 'all' ? null : editions.find((e) => e.weekKey === currentKey)
+  // Week boundaries for the Tracked People section's completed/opened/overdue
+  // bucketing — 'all' has no single week, so it spans everything.
+  const weekStartMs = currentKey === 'all' ? 0 : selected?.startMs ?? 0
+  const weekEndMs = currentKey === 'all' ? Date.now() : selected?.endMs ?? Date.now()
 
   // The episodes feeding the selected edition (a single week, or everything).
   const editionEpisodes = useMemo(() => {
@@ -345,6 +353,9 @@ export default function Weekly() {
           ready={editionEpisodes}
           trackedCount={podcasts.filter((p) => p.tracked).length}
           episodeById={episodeById}
+          isAdmin={isAdmin}
+          weekStartMs={weekStartMs}
+          weekEndMs={weekEndMs}
         />
       )}
 
@@ -361,11 +372,17 @@ function WeeklyDoc({
   ready,
   trackedCount,
   episodeById,
+  isAdmin,
+  weekStartMs,
+  weekEndMs,
 }: {
   weekly: WeeklySummary
   ready: ReturnType<typeof useAppData>['episodes']
   trackedCount: number
   episodeById: ReturnType<typeof useAppData>['episodeById']
+  isAdmin: boolean
+  weekStartMs: number
+  weekEndMs: number
 }) {
   const [active, setActive] = useState('overview')
   const terms = entityTerms(weekly.mentions)
@@ -392,6 +409,7 @@ function WeeklyDoc({
   const nav = [
     { id: 'overview', label: 'Overview', icon: 'play_circle', show: weekly.overview.length > 0 },
     { id: 'people', label: 'Per Person', icon: 'groups', show: true },
+    { id: 'tracking', label: 'Tracked People', icon: 'visibility', show: isAdmin },
     { id: 'key-points', label: 'Key Points', icon: 'format_list_bulleted', show: synthesised },
   ].filter((n) => n.show)
 
@@ -452,6 +470,9 @@ function WeeklyDoc({
 
           {/* Per-person rollup — overall / accomplished / to-do for each participant */}
           <WeeklyPeople />
+
+          {/* Tracked People — completed / newly opened / overdue, admin-only */}
+          {isAdmin && <WeeklyTracking weekStartMs={weekStartMs} weekEndMs={weekEndMs} />}
 
           {/* Key Points — synthesised, claim-first, cross-episode (the primary body) */}
           {synthesised && (

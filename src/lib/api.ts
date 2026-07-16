@@ -204,11 +204,38 @@ export async function chatMeeting(
 
 // ── Weekly per-person rollup ────────────────────────────────────────────────────
 
+/** A single structured action item within a person's rollup. Identity (`id`)
+ *  is stable across cron ticks: the Worker reconciles new transcript evidence
+ *  against existing items (reaffirm / complete / cancel / new) instead of
+ *  re-deriving the whole list, so a task's status here reflects real evidence,
+ *  not just whether the model happened to mention it again this pass. */
+export interface TodoItem {
+  id: string
+  text: string
+  status: 'open' | 'done' | 'dropped'
+  priority: 'high' | 'medium' | 'low'
+  dueDate: string | null
+  overdue?: boolean
+  owner: string
+  firstSeenMeetingId: string
+  firstSeenAt: number
+  lastSeenAt: number
+  completedMeetingId?: string
+  completedAt?: number
+  evidence?: string
+  missCount: number
+}
+
 export interface PersonRollup {
   name: string
   overall: string
   accomplished: string[]
   todo: string[]
+  /** Structured items backing `accomplished`/`todo`, when the Worker has
+   *  reconciled this person under the structured scheme. Absent (or empty) on
+   *  a not-yet-upgraded record — renderers should fall back to the plain
+   *  string lists in that case. */
+  items?: TodoItem[]
 }
 
 /** A per-person status rollup across all the signed-in user's meetings: overall
@@ -377,6 +404,25 @@ export async function saveTrackingSelection(names: string[]): Promise<string[]> 
     body: JSON.stringify({ names }),
   })
   return data.selection || []
+}
+
+/** How each tracked person's week went — completed / newly opened / carried
+ *  over and overdue — bucketed server-side from the already-reconciled
+ *  structured items (no AI call, instant). Admin-only. */
+export interface WeeklyTrackingPerson {
+  name: string
+  slug: string
+  completedThisWeek: string[]
+  openedThisWeek: string[]
+  carriedOverdue: string[]
+}
+
+export async function fetchWeeklyTracking(range: { weekStartMs: number; weekEndMs: number }): Promise<WeeklyTrackingPerson[]> {
+  const data = await request<{ ok: boolean; people?: WeeklyTrackingPerson[] }>('/api/weekly/tracking', {
+    method: 'POST',
+    body: JSON.stringify({ weekStartMs: range.weekStartMs, weekEndMs: range.weekEndMs }),
+  })
+  return data.people || []
 }
 
 // ── The notetaker bot ───────────────────────────────────────────────────────────
