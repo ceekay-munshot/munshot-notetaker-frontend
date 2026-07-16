@@ -38,6 +38,13 @@ LEAVE_ENDPOINT = "http://65.1.101.15.nip.io:8080/public/leave"
 # :8080 API base). The "Connect calendar" button redirects here via the Worker,
 # which appends the signed-in user's email.
 CALENDAR_CONNECT_ENDPOINT = "https://65.1.101.15.nip.io/calendar/connect/start"
+# Where scheduled meetings are stored & fired. "kv" (default) keeps them in this
+# Worker's KV and lets the per-minute cron dispatch them. Switch to "d1" once the
+# EC2 backend's scheduler is live: the dashboard then reads/writes the shared D1
+# `schedules` table (env.DB → vexa-transcript) and this Worker's cron stands down
+# so the bot isn't double-sent. Flipping this var is the whole cutover; setting
+# it back to "kv" is the whole rollback. See docs/schedules-d1-migration.md.
+SCHEDULES_BACKEND = "kv"
 
 # KV namespace for users + sessions (namespace: meetbot-users).
 [[kv_namespaces]]

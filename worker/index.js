@@ -69,6 +69,7 @@ export default {
       if (method === "GET" && pathname === "/api/schedules") return handleListSchedules(request, env);
       if (method === "POST" && pathname === "/api/schedules") return handleCreateSchedule(request, env);
       if (method === "POST" && pathname === "/api/schedules/delete") return handleDeleteSchedule(request, env);
+      if (method === "POST" && pathname === "/api/schedules/migrate-kv-to-d1") return handleMigrateSchedulesToD1(request, env);
       if (method === "POST" && pathname === "/api/calendar/sync") return handleCalendarSync(request, env);
       if (method === "GET" && pathname === "/api/calendar/connect") return handleCalendarConnect(request, env);
       if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
@@ -566,7 +567,9 @@ async function handleAdminUsers(request, env) {
       /* meeting_owners/transcriptions not ready yet — schedules below still work */
     }
   }
-  const schedules = await readSchedules(env, SCHEDULE_PREFIX);
+  const schedules = schedulesOnD1(env)
+    ? await d1ListSchedules(env, null)
+    : await readSchedules(env, SCHEDULE_PREFIX);
   for (const s of schedules) {
     const email = normalizeEmail(s.owner);
     if (email) emails.add(email);
@@ -2495,12 +2498,109 @@ function publicScheduleAdmin(s) {
   return { ...publicSchedule(s), owner: s.owner };
 }
 
+/* --------------------- schedules: D1 backend (opt-in) --------------------- */
+
+// Schedules live in Cloudflare KV by default. Once the EC2 backend is ready to
+// own scheduling — its own loop reads the shared D1 `schedules` table (in the
+// same `vexa-transcript` DB this Worker already binds as env.DB) and dispatches
+// the bot — set the SCHEDULES_BACKEND="d1" var. Then every dashboard
+// create/list/cancel writes straight to D1, and this Worker's per-minute cron
+// stops firing schedules so the bot is never double-sent. Default (unset/"kv")
+// keeps the original KV behaviour, so flipping the var is the whole cutover and
+// clearing it is the whole rollback. See docs/schedules-d1-migration.md for the
+// table schema and the EC2 scheduler contract.
+function schedulesOnD1(env) {
+  return String(env.SCHEDULES_BACKEND || "").trim().toLowerCase() === "d1" && !!env.DB;
+}
+
+// Lazily create the schedules table (+ its lookup indexes) once per warm
+// isolate. IF NOT EXISTS makes this idempotent and cheap to call on every write,
+// so neither this Worker nor the EC2 side needs a hand-run migration.
+let schedulesTableReady;
+async function ensureSchedulesTable(env) {
+  if (schedulesTableReady) return;
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS schedules (" +
+      "id TEXT PRIMARY KEY, owner TEXT NOT NULL, meeting_url TEXT NOT NULL, " +
+      "recurrence TEXT NOT NULL, time_zone TEXT NOT NULL, hour INTEGER NOT NULL, " +
+      "minute INTEGER NOT NULL, weekday INTEGER, next_run INTEGER NOT NULL, " +
+      "created_at INTEGER NOT NULL, last_run INTEGER, last_status TEXT, " +
+      "attempts INTEGER NOT NULL DEFAULT 0)"
+  ).run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_schedules_owner ON schedules(owner)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS idx_schedules_next_run ON schedules(next_run)").run();
+  schedulesTableReady = true;
+}
+
+// A D1 row → the same internal shape the KV path produces, so publicSchedule /
+// publicScheduleAdmin serialize it identically (the frontend can't tell which
+// backend served it). next_run / created_at / last_run are epoch MILLISECONDS,
+// matching Date.now() — the EC2 scheduler must use the same unit.
+function scheduleFromRow(r) {
+  return {
+    id: r.id,
+    owner: r.owner,
+    meetingUrl: r.meeting_url,
+    recurrence: r.recurrence,
+    timeZone: r.time_zone,
+    hour: r.hour,
+    minute: r.minute,
+    weekday: r.weekday,
+    nextRun: r.next_run,
+    createdAt: r.created_at,
+    lastRun: r.last_run ?? null,
+    lastStatus: r.last_status ?? null,
+    attempts: r.attempts ?? 0,
+  };
+}
+
+// Read schedules from D1, soonest first. No owner → every user's (admin view).
+async function d1ListSchedules(env, owner) {
+  await ensureSchedulesTable(env);
+  const res = owner
+    ? await env.DB.prepare("SELECT * FROM schedules WHERE owner = ?1 ORDER BY next_run ASC").bind(owner).all()
+    : await env.DB.prepare("SELECT * FROM schedules ORDER BY next_run ASC").all();
+  return ((res && res.results) || []).map(scheduleFromRow);
+}
+
+async function d1CountSchedulesFor(env, owner) {
+  await ensureSchedulesTable(env);
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM schedules WHERE owner = ?1").bind(owner).first();
+  return (row && row.n) || 0;
+}
+
+async function d1InsertSchedule(env, s, { orIgnore = false } = {}) {
+  await ensureSchedulesTable(env);
+  await env.DB.prepare(
+    "INSERT " + (orIgnore ? "OR IGNORE " : "") +
+      "INTO schedules (id, owner, meeting_url, recurrence, time_zone, hour, minute, weekday, next_run, created_at, last_run, last_status, attempts) " +
+      "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+  ).bind(
+    s.id, s.owner, s.meetingUrl, s.recurrence, s.timeZone, s.hour, s.minute, s.weekday,
+    s.nextRun, s.createdAt, s.lastRun ?? null, s.lastStatus ?? null, s.attempts ?? 0
+  ).run();
+}
+
+// Owner-scoped delete: a normal user can only pass their own owner (enforced by
+// the caller) and admin must name the owner — so the WHERE clause always pins
+// both, never letting one user cancel another's by id alone.
+async function d1DeleteSchedule(env, owner, id) {
+  await ensureSchedulesTable(env);
+  await env.DB.prepare("DELETE FROM schedules WHERE id = ?1 AND owner = ?2").bind(id, owner).run();
+}
+
 // GET /api/schedules — a normal user sees only their own. An admin sees every
 // user's schedules (across owners), each tagged with its owner, optionally
 // filtered to a single ?email= for a focused view.
 async function handleListSchedules(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
+  if (schedulesOnD1(env)) {
+    const raw = session.isAdmin ? new URL(request.url).searchParams.get("email") : session.identity;
+    const owner = raw ? normalizeEmail(raw) : null;
+    const schedules = await d1ListSchedules(env, owner);
+    return json({ ok: true, schedules: schedules.map(session.isAdmin ? publicScheduleAdmin : publicSchedule) });
+  }
   if (session.isAdmin) {
     const email = new URL(request.url).searchParams.get("email");
     const schedules = email
@@ -2551,8 +2651,10 @@ async function handleCreateSchedule(request, env) {
     if (!nextRun) return json({ error: "Could not compute the next run time" }, 400);
   }
 
-  const existing = await listSchedulesFor(env, owner);
-  if (existing.length >= MAX_SCHEDULES_PER_USER) {
+  const count = schedulesOnD1(env)
+    ? await d1CountSchedulesFor(env, owner)
+    : (await listSchedulesFor(env, owner)).length;
+  if (count >= MAX_SCHEDULES_PER_USER) {
     return json({ error: `You can have at most ${MAX_SCHEDULES_PER_USER} schedules` }, 409);
   }
 
@@ -2572,7 +2674,11 @@ async function handleCreateSchedule(request, env) {
     lastStatus: null,
     attempts: 0,
   };
-  await env.KV.put(scheduleKey(owner, id), JSON.stringify(schedule));
+  if (schedulesOnD1(env)) {
+    await d1InsertSchedule(env, schedule);
+  } else {
+    await env.KV.put(scheduleKey(owner, id), JSON.stringify(schedule));
+  }
   return json({ ok: true, schedule: publicSchedule(schedule) }, 201);
 }
 
@@ -2582,17 +2688,45 @@ async function handleDeleteSchedule(request, env) {
   const body = await request.json().catch(() => ({}));
   const id = String(body.id || "").trim();
   if (!id) return json({ error: "Schedule id is required" }, 400);
+  let owner;
   if (session.isAdmin) {
     // Admin cancels on a specific user's behalf — the owner must be supplied
     // (the schedule list echoes it back per row), never inferred.
-    const owner = normalizeEmail(body.owner);
+    owner = normalizeEmail(body.owner);
     if (!owner) return json({ error: "owner is required" }, 400);
-    await env.KV.delete(scheduleKey(owner, id));
-    return json({ ok: true });
+  } else {
+    // Scoping to the session owner means a user can only ever delete their own.
+    owner = session.identity;
   }
-  // The key embeds the session owner, so a user can only ever delete their own.
-  await env.KV.delete(scheduleKey(session.identity, id));
+  if (schedulesOnD1(env)) {
+    await d1DeleteSchedule(env, owner, id);
+  } else {
+    await env.KV.delete(scheduleKey(owner, id));
+  }
   return json({ ok: true });
+}
+
+// POST /api/schedules/migrate-kv-to-d1 — admin-only, idempotent backfill. Copies
+// every existing KV schedule into the D1 `schedules` table (INSERT OR IGNORE, so
+// re-running is safe and never clobbers a row the EC2 scheduler has since
+// advanced). KV is left intact, so the cutover stays reversible: run this, flip
+// SCHEDULES_BACKEND to "d1", verify, and only then clear KV if you want. Requires
+// env.DB regardless of the current flag, so it can be run before the flip.
+async function handleMigrateSchedulesToD1(request, env) {
+  const session = await getSession(request, env);
+  if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
+  if (!env.DB) return json({ error: "D1 (env.DB) is not bound" }, 500);
+  const kv = await readSchedules(env, SCHEDULE_PREFIX);
+  let migrated = 0;
+  for (const s of kv) {
+    try {
+      await d1InsertSchedule(env, stripMeta(s), { orIgnore: true });
+      migrated++;
+    } catch {
+      /* skip a malformed KV row — the rest still migrate */
+    }
+  }
+  return json({ ok: true, found: kv.length, migrated });
 }
 
 // Parses a browser <input type="datetime-local"> value ("YYYY-MM-DDTHH:MM")
@@ -2684,6 +2818,11 @@ function stripMeta(s) {
 // (recurring) or removes it (one-time). Server-side, so it works whether or not
 // the user has the dashboard open.
 async function runDueSchedules(env) {
+  // When schedules live on D1, the EC2 backend runs its own scheduler against
+  // that table — this Worker cron must stand down, or every due meeting would
+  // get a second bot. (The cron trigger still fires runAutoSummaries /
+  // runTrackingRollups, which are unaffected.)
+  if (schedulesOnD1(env)) return;
   const now = Date.now();
   const due = (await readSchedules(env, SCHEDULE_PREFIX)).filter((s) => (s.nextRun || 0) <= now);
   for (const s of due) {
