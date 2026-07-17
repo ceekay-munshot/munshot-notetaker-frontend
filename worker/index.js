@@ -1200,6 +1200,34 @@ async function handleAiChat(request, env) {
   return json({ ok: true, reply: String(reply || "").trim() });
 }
 
+// Best-effort epoch-ms parse of a created_at value, which may be an ISO string
+// (with or without a trailing Z/offset), a SQLite datetime ("YYYY-MM-DD
+// HH:MM:SS", always UTC — this backend never stores a zone on it), or epoch ms
+// already. Returns 0 (never NaN, never throws) when unparseable, so callers can
+// use it directly in a max()/comparison without a separate guard.
+//
+// A bare `new Date(raw)` is NOT safe for the zone-less formats: V8 parses a
+// SQLite-style "YYYY-MM-DD HH:MM:SS" (space, no "Z") as LOCAL time rather than
+// UTC, so on any host whose local zone isn't UTC (local `wrangler dev`, a test
+// runner, or a future non-Workers host) that parse would silently produce the
+// WRONG instant — production Workers happen to run in UTC, which is the only
+// reason a naive parse could look fine there. Every zone-less input is
+// normalized to an explicit "...Z" before parsing so the result never depends
+// on the host's local timezone.
+function parseCreatedAt(createdAt) {
+  const raw = String(createdAt || "").trim();
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (/Z$|[+-]\d{2}:?\d{2}$/.test(raw)) {
+    const d = new Date(raw);
+    return Number.isNaN(d.getTime()) ? 0 : d.getTime();
+  }
+  const normalized = raw.includes(" ") ? raw.replace(" ", "T") : raw;
+  const withTime = /T\d{2}:\d{2}/.test(normalized) ? normalized : `${normalized}T00:00:00`;
+  const d = new Date(`${withTime}Z`);
+  return Number.isNaN(d.getTime()) ? 0 : d.getTime();
+}
+
 // Builds a combined, length-bounded transcript across MANY meetings, each under
 // a "Meeting <id>" header, newest meetings first. Used by the weekly per-person
 // rollup so the model can reason across the whole week.
@@ -1210,11 +1238,17 @@ function buildMultiMeetingText(rows, maxChars = 42000) {
     if (!byMeeting.has(id)) byMeeting.set(id, []);
     byMeeting.get(id).push(r);
   }
-  // created_at desc per meeting → newest meetings first.
+  // created_at desc per meeting → newest meetings first. Compared as parsed
+  // epoch values, not raw strings: created_at can be an ISO string, a SQLite
+  // datetime ("YYYY-MM-DD HH:MM:SS"), or epoch ms depending on which insert
+  // path wrote the row, and a lexical string compare across mixed formats can
+  // put a genuinely later meeting before an earlier one (e.g. the "T" in an
+  // ISO string sorts differently than the space in a SQLite datetime at the
+  // same position) — comparing real epoch values is format-agnostic.
   const order = [...byMeeting.entries()].sort((a, b) => {
-    const la = a[1].reduce((m, r) => (r.created_at > m ? r.created_at : m), "");
-    const lb = b[1].reduce((m, r) => (r.created_at > m ? r.created_at : m), "");
-    return la < lb ? 1 : la > lb ? -1 : 0;
+    const la = a[1].reduce((m, r) => Math.max(m, parseCreatedAt(r.created_at) || 0), 0);
+    const lb = b[1].reduce((m, r) => Math.max(m, parseCreatedAt(r.created_at) || 0), 0);
+    return lb - la;
   });
   let out = "";
   for (const [id, segs] of order) {
@@ -2185,16 +2219,21 @@ async function handleWeeklyTracking(request, env) {
 
 // Every row where a person is the speaker OR is mentioned by name in someone
 // else's line — this is how a meeting that only *discusses* a tracked person
-// (never has them speak) still surfaces evidence about them. `speaker = ?1` is
-// the precise, primary signal; the LIKE mention is secondary and deliberately
-// permissive (the reconcile prompt is told to use only what the transcript
-// actually supports, so a meeting that merely name-drops the person yields no
-// new items rather than a hallucinated one).
+// (never has them speak) still surfaces evidence about them. The speaker match
+// is the precise, primary signal — compared case/whitespace-insensitively
+// (LOWER+TRIM on both sides) so diarization drift ("John Smith" vs
+// "john smith " across meetings) doesn't silently drop a person's own
+// meetings. (D1's SQLite has no ICU extension, so LOWER() only folds ASCII —
+// a name with accented characters diarized with different casing, e.g. "José"
+// vs "JOSÉ", still won't match; that's unfixed here.) The LIKE mention is
+// secondary and deliberately permissive (the reconcile prompt is told to use
+// only what the transcript actually supports, so a meeting that merely
+// name-drops the person yields no new items rather than a hallucinated one).
 async function personTranscriptRows(env, name) {
   const like = escapeLike(name);
   const res = await env.DB.prepare(
     "SELECT meeting_id, start_time, text, speaker, created_at FROM transcriptions " +
-    "WHERE speaker = ?1 OR text LIKE '%' || ?2 || '%' ESCAPE '\\' " +
+    "WHERE LOWER(TRIM(speaker)) = LOWER(TRIM(?1)) OR text LIKE '%' || ?2 || '%' ESCAPE '\\' " +
     "ORDER BY meeting_id, start_time"
   ).bind(name, like).all();
   return (res && res.results) || [];
