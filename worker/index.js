@@ -3112,21 +3112,40 @@ async function handleDeleteSchedule(request, env) {
 // advanced). KV is left intact, so the cutover stays reversible: run this, flip
 // SCHEDULES_BACKEND to "d1", verify, and only then clear KV if you want. Requires
 // env.DB regardless of the current flag, so it can be run before the flip.
+//
+// Lists+parses KV directly here (its own paginated env.KV.list loop) instead of
+// the shared readSchedules() — that helper silently drops a corrupt entry with
+// no record of which key it was, which is fine for the live read paths that
+// call it but defeats a backfill's whole point: `failed` below names every raw
+// KV key that didn't make it across (unparseable JSON or a D1 insert error),
+// so a human can go fix it by hand.
 async function handleMigrateSchedulesToD1(request, env) {
   const session = await getSession(request, env);
   if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
   if (!env.DB) return json({ error: "D1 (env.DB) is not bound" }, 500);
-  const kv = await readSchedules(env, SCHEDULE_PREFIX);
+
+  let found = 0;
   let migrated = 0;
-  for (const s of kv) {
-    try {
-      await d1InsertSchedule(env, stripMeta(s), { orIgnore: true });
-      migrated++;
-    } catch {
-      /* skip a malformed KV row — the rest still migrate */
+  const failed = [];
+  let cursor;
+  do {
+    const page = await env.KV.list({ prefix: SCHEDULE_PREFIX, cursor });
+    for (const k of page.keys) {
+      found++;
+      try {
+        const raw = await env.KV.get(k.name);
+        if (!raw) throw new Error("empty value");
+        const s = JSON.parse(raw);
+        await d1InsertSchedule(env, s, { orIgnore: true });
+        migrated++;
+      } catch (err) {
+        failed.push({ key: k.name, error: String((err && err.message) || err) });
+      }
     }
-  }
-  return json({ ok: true, found: kv.length, migrated });
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  return json({ ok: true, found, migrated, failed });
 }
 
 // Parses a browser <input type="datetime-local"> value ("YYYY-MM-DDTHH:MM")
