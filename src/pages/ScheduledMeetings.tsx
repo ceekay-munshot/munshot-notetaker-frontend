@@ -13,7 +13,7 @@ import {
   type CalendarEvent,
 } from '../lib/api'
 import { Icon } from '../components/Icon'
-import { groupEvents, MeetingGroupRow, RemovedGroupRow, ScheduleRow } from '../components/scheduleRows'
+import { groupEvents, MeetingGroupRow, RemovedGroupRow, ScheduleRow, UnsyncCalendarButton } from '../components/scheduleRows'
 
 // Admin-only: every user's upcoming calendar meetings and manually-scheduled
 // notetaker runs, in one place. Admin has no calendar of their own, so each
@@ -127,6 +127,17 @@ function ScheduledMeetingsAdmin() {
     await Promise.all(ids.map((id) => calendarRestore(id, email)))
     await loadCalendarFor(email)
   }
+  // Unsync: cancel every currently-loaded pending meeting for this user in one
+  // shot (acting as them, same as removeOne/removeAll) — each remove already
+  // tells the bot to leave if that meeting is live right now.
+  async function unsyncAll(email: string) {
+    const cal = calendars[email]
+    if (cal?.status !== 'ready') return
+    const ids = cal.events.map((e) => e.id).filter((id): id is number | string => id != null)
+    if (!ids.length) return
+    await Promise.all(ids.map((id) => calendarRemove(id, email)))
+    await loadCalendarFor(email)
+  }
   async function cancelSchedule(email: string, id: string) {
     setSchedulesByUser((prev) => {
       const next = new Map(prev)
@@ -186,6 +197,7 @@ function ScheduledMeetingsAdmin() {
               onRestoreOne={(id) => restoreOne(email, id)}
               onRestoreAll={(ids) => restoreAll(email, ids)}
               onCancelSchedule={(id) => cancelSchedule(email, id)}
+              onUnsyncAll={() => unsyncAll(email)}
             />
           ))}
         </ul>
@@ -205,6 +217,7 @@ function UserSection({
   onRestoreOne,
   onRestoreAll,
   onCancelSchedule,
+  onUnsyncAll,
 }: {
   email: string
   schedules: AdminSchedule[]
@@ -216,6 +229,7 @@ function UserSection({
   onRestoreOne: (id: number | string) => Promise<void>
   onRestoreAll: (ids: (number | string)[]) => Promise<void>
   onCancelSchedule: (id: string) => Promise<void>
+  onUnsyncAll: () => Promise<void>
 }) {
   const groups = useMemo(() => (calendar.status === 'ready' ? groupEvents(calendar.events) : []), [calendar])
   const removedGroups = useMemo(() => (calendar.status === 'ready' ? groupEvents(calendar.cancelled) : []), [calendar])
@@ -261,6 +275,12 @@ function UserSection({
               <Icon name="error" size={16} className="mt-0.5 shrink-0" />
               <span className="min-w-0 break-words">{calendar.message}</span>
             </p>
+          )}
+
+          {calendar.status === 'ready' && calendar.events.length > 0 && (
+            <div className="mb-2 flex justify-end">
+              <UnsyncCalendarButton count={calendar.events.length} onConfirm={onUnsyncAll} />
+            </div>
           )}
 
           {(groups.length > 0 || upcoming.length > 0) && (

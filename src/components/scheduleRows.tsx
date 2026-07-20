@@ -26,6 +26,65 @@ export const RECUR_LABEL: Record<string, string> = {
   weekly: 'Weekly',
 }
 
+/** A two-step "Unsync calendar" action: the first click reveals a confirmation
+ *  naming exactly how many meetings will be cancelled, the second click runs
+ *  it. Cancels every currently-synced (pending) calendar meeting — each
+ *  remove already tells the bot to leave if that meeting is live right now
+ *  (see the Worker's calendarRemove doc comment) — but does not touch the
+ *  underlying Google Calendar connection itself; syncing again re-imports
+ *  whatever's still on the calendar. Renders nothing when there's nothing to
+ *  unsync. */
+export function UnsyncCalendarButton({ count, onConfirm }: { count: number; onConfirm: () => Promise<void> }) {
+  const [confirming, setConfirming] = useState(false)
+  const [busy, setBusy] = useState(false)
+
+  if (count === 0) return null
+
+  if (!confirming) {
+    return (
+      <button
+        type="button"
+        onClick={() => setConfirming(true)}
+        className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-semibold text-secondary hover:bg-surface-container-low hover:text-error"
+      >
+        Unsync calendar
+      </button>
+    )
+  }
+
+  return (
+    <span className="inline-flex shrink-0 flex-wrap items-center gap-1.5">
+      <span className="text-[12px] text-secondary">
+        Cancel all {count} meeting{count === 1 ? '' : 's'}?
+      </span>
+      <button
+        type="button"
+        disabled={busy}
+        onClick={async () => {
+          setBusy(true)
+          try {
+            await onConfirm()
+          } finally {
+            setBusy(false)
+            setConfirming(false)
+          }
+        }}
+        className="press rounded-lg bg-error-container/70 px-2.5 py-1.5 text-metadata font-semibold text-error hover:bg-error-container disabled:opacity-50"
+      >
+        {busy ? 'Unsyncing…' : 'Confirm'}
+      </button>
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => setConfirming(false)}
+        className="press rounded-lg border border-outline-variant px-2 py-1.5 text-metadata font-medium text-secondary hover:bg-surface-container-low disabled:opacity-50"
+      >
+        Cancel
+      </button>
+    </span>
+  )
+}
+
 export function ScheduleRow({ schedule, onCancel }: { schedule: Schedule; onCancel: () => Promise<void> | void }) {
   const [busy, setBusy] = useState(false)
   return (

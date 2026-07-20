@@ -3,7 +3,7 @@ import { useAppData } from '../store/AppData'
 import type { NewSchedule } from '../lib/api'
 import { ApiError } from '../lib/api'
 import { Icon } from '../components/Icon'
-import { groupEvents, MeetingGroupRow, RemovedGroupRow, ScheduleRow } from './scheduleRows'
+import { groupEvents, MeetingGroupRow, RemovedGroupRow, ScheduleRow, UnsyncCalendarButton } from './scheduleRows'
 
 // The notetaker action surface for the Home page: send the bot to a meeting now
 // or on a schedule, see upcoming schedules, and sync the calendar. All wired to
@@ -153,6 +153,7 @@ export function SchedulesCard() {
     sendBot,
     removeCalendarEvent,
     removeCalendarEvents,
+    unsyncCalendar,
     cancelledEvents,
     restoreCalendarEvent,
     restoreCalendarEvents,
@@ -167,51 +168,65 @@ export function SchedulesCard() {
 
   return (
     <Card>
-      <div className="mb-3 flex items-center justify-between gap-2">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h3 className="flex items-center gap-2 text-[17px] font-semibold text-on-surface">
           <Icon name="event" size={20} className="text-primary" /> Upcoming schedules
         </h3>
-        <button
-          type="button"
-          disabled={calendarLoading}
-          onClick={async () => {
-            setMsg(null)
-            try {
-              const { count, note, needsConnect } = await syncCalendar()
-              if (count > 0) {
-                setMsg({ kind: 'ok', text: `Calendar synced — ${count} upcoming meeting${count === 1 ? '' : 's'}.` })
-              } else if (needsConnect) {
-                // Not connected yet. Offer a Connect button that goes through the
-                // Worker (/api/calendar/connect) — never the raw backend URL.
-                setMsg({
-                  kind: 'err',
-                  text: 'Your calendar isn’t connected yet. Connect opens Google in a new tab; authorize there, then sync again.',
-                  connect: true,
-                })
-              } else {
-                // The request succeeded but nothing came back. Say so honestly
-                // (and pass along any note the server sent) instead of a
-                // misleading "synced" with an empty list.
-                setMsg({
-                  kind: 'err',
-                  text: note
-                    ? `Synced, but no upcoming meetings found: ${note}`
-                    : 'Synced, but no upcoming meetings were found. Make sure your calendar is connected.',
-                })
+        <div className="flex flex-wrap items-center gap-2">
+          <UnsyncCalendarButton
+            count={calendarEvents.length}
+            onConfirm={async () => {
+              setMsg(null)
+              try {
+                await unsyncCalendar()
+                setMsg({ kind: 'ok', text: 'Calendar unsynced — every pending meeting was cancelled.' })
+              } catch {
+                setMsg({ kind: 'err', text: 'Could not unsync the calendar.' })
               }
-            } catch {
-              setMsg({ kind: 'err', text: 'Could not sync the calendar.' })
-            }
-          }}
-          className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-semibold text-primary hover:bg-surface-container-low disabled:opacity-50"
-        >
-          {calendarLoading ? (
-            <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
-          ) : (
-            <Icon name="sync" size={16} />
-          )}
-          Sync calendar
-        </button>
+            }}
+          />
+          <button
+            type="button"
+            disabled={calendarLoading}
+            onClick={async () => {
+              setMsg(null)
+              try {
+                const { count, note, needsConnect } = await syncCalendar()
+                if (count > 0) {
+                  setMsg({ kind: 'ok', text: `Calendar synced — ${count} upcoming meeting${count === 1 ? '' : 's'}.` })
+                } else if (needsConnect) {
+                  // Not connected yet. Offer a Connect button that goes through the
+                  // Worker (/api/calendar/connect) — never the raw backend URL.
+                  setMsg({
+                    kind: 'err',
+                    text: 'Your calendar isn’t connected yet. Connect opens Google in a new tab; authorize there, then sync again.',
+                    connect: true,
+                  })
+                } else {
+                  // The request succeeded but nothing came back. Say so honestly
+                  // (and pass along any note the server sent) instead of a
+                  // misleading "synced" with an empty list.
+                  setMsg({
+                    kind: 'err',
+                    text: note
+                      ? `Synced, but no upcoming meetings found: ${note}`
+                      : 'Synced, but no upcoming meetings were found. Make sure your calendar is connected.',
+                  })
+                }
+              } catch {
+                setMsg({ kind: 'err', text: 'Could not sync the calendar.' })
+              }
+            }}
+            className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-outline-variant px-2.5 py-1.5 text-metadata font-semibold text-primary hover:bg-surface-container-low disabled:opacity-50"
+          >
+            {calendarLoading ? (
+              <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-primary/30 border-t-primary" />
+            ) : (
+              <Icon name="sync" size={16} />
+            )}
+            Sync calendar
+          </button>
+        </div>
       </div>
       {empty ? (
         <p className="py-4 text-center text-metadata text-secondary">
