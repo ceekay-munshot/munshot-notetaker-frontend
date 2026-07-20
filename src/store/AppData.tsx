@@ -53,6 +53,9 @@ interface AppData {
   refreshCalendar: () => Promise<api.CalendarEvent[]>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
   removeCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
+  /** Cancels every currently-synced (pending) calendar meeting in one shot —
+   *  the "Unsync calendar" action. A no-op when there's nothing pending. */
+  unsyncCalendar: () => Promise<void>
   cancelledEvents: api.CalendarEvent[]
   restoreCalendarEvent: (eventId: number | string) => Promise<void>
   restoreCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
@@ -393,6 +396,12 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [refreshCalendar],
   )
 
+  const unsyncCalendar = useCallback(async () => {
+    const ids = calendarEvents.map((e) => e.id).filter((id): id is number | string => id != null)
+    if (!ids.length) return
+    await removeCalendarEvents(ids)
+  }, [calendarEvents, removeCalendarEvents])
+
   const restoreCalendarEvent = useCallback(
     async (eventId: number | string) => {
       setCancelledEvents((prev) => prev.filter((e) => String(e.id) !== String(eventId))) // optimistic
@@ -477,6 +486,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       refreshCalendar,
       removeCalendarEvent,
       removeCalendarEvents,
+      unsyncCalendar,
       cancelledEvents,
       restoreCalendarEvent,
       restoreCalendarEvents,
@@ -513,6 +523,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       refreshCalendar,
       removeCalendarEvent,
       removeCalendarEvents,
+      unsyncCalendar,
       cancelledEvents,
       restoreCalendarEvent,
       restoreCalendarEvents,
