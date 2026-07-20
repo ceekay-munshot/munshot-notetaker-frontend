@@ -7,6 +7,7 @@ import {
   calendarMeetings,
   calendarRemove,
   calendarRestore,
+  calendarUnsubscribe,
   deleteSchedule,
   normalizeCalendarEvents,
   type AdminSchedule,
@@ -127,15 +128,11 @@ function ScheduledMeetingsAdmin() {
     await Promise.all(ids.map((id) => calendarRestore(id, email)))
     await loadCalendarFor(email)
   }
-  // Unsync: cancel every currently-loaded pending meeting for this user in one
-  // shot (acting as them, same as removeOne/removeAll) — each remove already
-  // tells the bot to leave if that meeting is live right now.
+  // Unsync: fully disconnect this user's calendar in one upstream call (acting
+  // as them) — cancels every pending meeting, stops any live bot, and drops
+  // their Google OAuth connection. Replaces the old per-event remove loop.
   async function unsyncAll(email: string) {
-    const cal = calendars[email]
-    if (cal?.status !== 'ready') return
-    const ids = cal.events.map((e) => e.id).filter((id): id is number | string => id != null)
-    if (!ids.length) return
-    await Promise.all(ids.map((id) => calendarRemove(id, email)))
+    await calendarUnsubscribe(email)
     await loadCalendarFor(email)
   }
   async function cancelSchedule(email: string, id: string) {

@@ -75,6 +75,7 @@ export default {
       if (method === "GET" && pathname === "/api/calendar/meetings") return handleCalendarMeetings(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/remove") return handleCalendarRemove(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/restore") return handleCalendarRestore(request, env);
+      if (method === "POST" && pathname === "/api/calendar/unsubscribe") return handleCalendarUnsubscribe(request, env);
       if (method === "GET" && pathname === "/api/config") return handleGetConfig(request, env);
       if (method === "POST" && pathname === "/api/config") return handleSetConfig(request, env);
       if (method === "GET" && pathname === "/api/tracking/directory") return handleTrackingDirectory(request, env);
@@ -2710,6 +2711,39 @@ async function handleCalendarRestore(request, env) {
       method: "POST",
       headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
       body: JSON.stringify({ email, event_id: eventId }),
+    });
+    const result = await readUpstreamJson(upstream);
+    return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
+  } catch (err) {
+    return json({ error: "Failed to reach the calendar service", detail: String((err && err.message) || err) }, 502);
+  }
+}
+
+// POST /calendar/unsubscribe {email} — the one-shot "unsync calendar". In a
+// SINGLE upstream call it cancels every pending calendar meeting, stops any
+// bot that's currently live for one, and drops the stored Google OAuth
+// connection — so a later /calendar/sync reports connected:false until the
+// user re-authorizes. This replaces looping /calendar/meetings/remove per
+// event (no pagination gap, and it actually clears the connection, which the
+// per-event path never did). It lives on the bot/vexa API host
+// (resolveApiBase, honoring any admin /api/config override) — NOT the
+// calendar HTTPS host the read/remove/restore calls use — because that's
+// where the upstream exposes this combined stop-everything operation. email
+// is the acting user's: the session's own for a normal user, or an
+// admin-supplied target for admin (same rule as remove/restore).
+async function handleCalendarUnsubscribe(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
+  const body = await request.json().catch(() => ({}));
+  const email = calendarActingEmail(request, session, body);
+  if (!email) return json({ error: session.isAdmin ? "email is required" : "Admin accounts have no calendar" }, session.isAdmin ? 400 : 403);
+  try {
+    const base = await resolveApiBase(env);
+    const upstream = await fetch(base + "/calendar/unsubscribe", {
+      method: "POST",
+      headers: { "X-API-Key": env.API_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
     });
     const result = await readUpstreamJson(upstream);
     return json({ ok: upstream.ok, status: upstream.status, result }, upstream.ok ? 200 : 502);
