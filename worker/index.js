@@ -3112,21 +3112,66 @@ async function handleDeleteSchedule(request, env) {
 // advanced). KV is left intact, so the cutover stays reversible: run this, flip
 // SCHEDULES_BACKEND to "d1", verify, and only then clear KV if you want. Requires
 // env.DB regardless of the current flag, so it can be run before the flip.
+//
+// Lists+parses KV directly here (its own paginated env.KV.list loop) instead of
+// the shared readSchedules() — that helper silently drops a corrupt entry with
+// no record of which key it was, which is fine for the live read paths that
+// call it but defeats a backfill's whole point: `failed` below names every raw
+// KV key that didn't make it across (unparseable JSON, a missing required
+// field, or a D1 insert error), so a human can go fix it by hand.
+//
+// Required fields are checked here, in JS, BEFORE the insert — not left to D1
+// to enforce. `d1InsertSchedule` always inserts with OR IGNORE (so a re-run
+// doesn't clobber a row the EC2 scheduler has since advanced), and under OR
+// IGNORE a NOT NULL violation is not an error: SQLite completes the statement
+// successfully with zero rows changed. A bare try/catch around the insert
+// can't tell that apart from the (desired, silent) case of the row already
+// existing from a prior run — so a schedule missing a required field would
+// count as "migrated" while never actually landing in D1, with nothing in
+// `failed` to say so.
+function missingScheduleField(s) {
+  if (!s || typeof s !== "object") return "not an object";
+  if (!s.id) return "missing id";
+  if (!s.owner) return "missing owner";
+  if (!s.meetingUrl) return "missing meetingUrl";
+  if (!s.recurrence) return "missing recurrence";
+  if (!s.timeZone) return "missing timeZone";
+  if (!Number.isFinite(s.hour)) return "missing/invalid hour";
+  if (!Number.isFinite(s.minute)) return "missing/invalid minute";
+  if (!Number.isFinite(s.nextRun)) return "missing/invalid nextRun";
+  if (!Number.isFinite(s.createdAt)) return "missing/invalid createdAt";
+  return null;
+}
+
 async function handleMigrateSchedulesToD1(request, env) {
   const session = await getSession(request, env);
   if (!session || !session.isAdmin) return json({ error: "Forbidden" }, 403);
   if (!env.DB) return json({ error: "D1 (env.DB) is not bound" }, 500);
-  const kv = await readSchedules(env, SCHEDULE_PREFIX);
+
+  let found = 0;
   let migrated = 0;
-  for (const s of kv) {
-    try {
-      await d1InsertSchedule(env, stripMeta(s), { orIgnore: true });
-      migrated++;
-    } catch {
-      /* skip a malformed KV row — the rest still migrate */
+  const failed = [];
+  let cursor;
+  do {
+    const page = await env.KV.list({ prefix: SCHEDULE_PREFIX, cursor });
+    for (const k of page.keys) {
+      found++;
+      try {
+        const raw = await env.KV.get(k.name);
+        if (!raw) throw new Error("empty value");
+        const s = JSON.parse(raw);
+        const problem = missingScheduleField(s);
+        if (problem) throw new Error(problem);
+        await d1InsertSchedule(env, s, { orIgnore: true });
+        migrated++;
+      } catch (err) {
+        failed.push({ key: k.name, error: String((err && err.message) || err) });
+      }
     }
-  }
-  return json({ ok: true, found: kv.length, migrated });
+    cursor = page.list_complete ? undefined : page.cursor;
+  } while (cursor);
+
+  return json({ ok: true, found, migrated, failed });
 }
 
 // Parses a browser <input type="datetime-local"> value ("YYYY-MM-DDTHH:MM")
