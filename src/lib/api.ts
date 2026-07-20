@@ -559,6 +559,19 @@ export function calendarRestore(
   })
 }
 
+/** One-shot "unsync calendar": in a single upstream call, cancel every pending
+ *  meeting, stop any live bots, and drop the stored Google OAuth connection (so
+ *  a later sync reports connected:false until the calendar is re-authorized).
+ *  `email` is admin-only — the user to act as. */
+export function calendarUnsubscribe(
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/unsubscribe', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  })
+}
+
 /** Admin-only: every distinct user email that has (or has had) meetings or
  *  schedules — feeds the "Scheduled Meetings" admin picker. */
 export async function adminListUsers(): Promise<string[]> {

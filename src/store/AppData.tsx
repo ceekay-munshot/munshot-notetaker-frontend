@@ -396,11 +396,19 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [refreshCalendar],
   )
 
+  // Fully disconnect the calendar in one upstream call: cancels every pending
+  // meeting, stops any live bots, and drops the Google OAuth connection (so a
+  // later sync reports "not connected" until re-authorized). Unlike the old
+  // per-event remove loop, this has no pagination gap and actually clears the
+  // connection.
   const unsyncCalendar = useCallback(async () => {
-    const ids = calendarEvents.map((e) => e.id).filter((id): id is number | string => id != null)
-    if (!ids.length) return
-    await removeCalendarEvents(ids)
-  }, [calendarEvents, removeCalendarEvents])
+    setCalendarEvents([]) // optimistic — the whole calendar is being disconnected
+    try {
+      await api.calendarUnsubscribe()
+    } finally {
+      await refreshCalendar()
+    }
+  }, [refreshCalendar])
 
   const restoreCalendarEvent = useCallback(
     async (eventId: number | string) => {
