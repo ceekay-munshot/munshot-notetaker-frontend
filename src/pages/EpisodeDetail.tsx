@@ -5,7 +5,7 @@ import { useAppData } from '../store/AppData'
 import { useSentiment } from '../store/Sentiment'
 import { downloadSummary } from '../lib/exportSummary'
 import { downloadSummaryPdf } from '../lib/pdfRender'
-import { ApiError, chatMeeting, emailEpisodeSummary, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
+import { ApiError, chatMeeting, emailEpisodeSummary, fetchMeetingRecording, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
 import { addRecipient, loadRecipients, removeRecipient } from '../lib/recipientsStore'
 import { formatDuration, longDate, statusMeta } from '../lib/format'
 import type { Episode, EpisodeInsight, ProcessingStatus, QuantPoint, Takeaway, TranscriptSegment } from '../lib/types'
@@ -999,13 +999,16 @@ function TranscriptTab({
 
   if (!segments.length) {
     return (
-      <div className="grid place-items-center gap-sm rounded-2xl border border-dashed border-outline-variant bg-surface-container-low py-xl text-center">
-        <Icon name="graphic_eq" size={32} className="text-outline" />
-        <h3 className="text-[19px] font-semibold text-on-surface-variant">No transcript yet</h3>
-        <p className="max-w-md text-body-md text-secondary">
-          Once the notetaker finishes this meeting, the full transcript appears here with the summary's highlights
-          linked inline.
-        </p>
+      <div className="flex flex-col gap-gutter">
+        <RecordingBar episode={episode} />
+        <div className="grid place-items-center gap-sm rounded-2xl border border-dashed border-outline-variant bg-surface-container-low py-xl text-center">
+          <Icon name="graphic_eq" size={32} className="text-outline" />
+          <h3 className="text-[19px] font-semibold text-on-surface-variant">No transcript yet</h3>
+          <p className="max-w-md text-body-md text-secondary">
+            Once the notetaker finishes this meeting, the full transcript appears here with the summary's highlights
+            linked inline.
+          </p>
+        </div>
       </div>
     )
   }
@@ -1020,7 +1023,9 @@ function TranscriptTab({
   }
 
   return (
-    <div className="grid grid-cols-12 gap-gutter">
+    <div className="flex flex-col gap-gutter">
+      <RecordingBar episode={episode} />
+      <div className="grid grid-cols-12 gap-gutter">
       {/* Highlights */}
       <aside className="col-span-12 md:col-span-4">
         <div className="mb-2 flex items-center gap-2">
@@ -1079,6 +1084,113 @@ function TranscriptTab({
           {visible.length === 0 && <p className="py-md text-center text-metadata text-secondary">No lines match “{q}”.</p>}
         </div>
       </article>
+      </div>
+    </div>
+  )
+}
+
+// One-shot fetch of the meeting's recorded audio (mirrors the transcript's own
+// fetch — same session-scoped Worker route, same ACL), cached after the first
+// successful load so Play and Download share one blob instead of refetching.
+// A failed fetch leaves the blob unset, so either button retries on the next click.
+function RecordingBar({ episode }: { episode: Episode }) {
+  const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [error, setError] = useState<string | null>(null)
+  const [audioUrl, setAudioUrl] = useState<string | null>(null)
+  const [pending, setPending] = useState<'play' | 'download' | null>(null)
+  const blobRef = useRef<Blob | null>(null)
+
+  useEffect(() => {
+    // Reset for a freshly opened meeting — a stale blob/URL from the previous
+    // episode must never bleed into this one.
+    blobRef.current = null
+    setStatus('idle')
+    setError(null)
+    setAudioUrl(null)
+  }, [episode.id])
+
+  useEffect(() => {
+    return () => {
+      if (audioUrl) URL.revokeObjectURL(audioUrl)
+    }
+  }, [audioUrl])
+
+  async function ensureBlob(): Promise<Blob | null> {
+    if (blobRef.current) return blobRef.current
+    setStatus('loading')
+    setError(null)
+    try {
+      const blob = await fetchMeetingRecording(episode)
+      blobRef.current = blob
+      setAudioUrl(URL.createObjectURL(blob))
+      setStatus('ready')
+      return blob
+    } catch (err) {
+      setError((err as Error)?.message || 'Could not load the recording. Please try again.')
+      setStatus('error')
+      return null
+    }
+  }
+
+  async function handlePlay() {
+    setPending('play')
+    await ensureBlob()
+    setPending(null)
+  }
+
+  async function handleDownload() {
+    setPending('download')
+    const blob = await ensureBlob()
+    if (blob) {
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${(episode.title || 'meeting-recording').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.webm`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    }
+    setPending(null)
+  }
+
+  return (
+    <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-outline-variant bg-surface-container-lowest p-md shadow-card">
+      <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg chip-signal">
+        <Icon name="graphic_eq" size={20} className="text-primary" fill />
+      </span>
+      <div className="min-w-0 flex-1">
+        <h3 className="text-[15px] font-semibold text-on-surface">Meeting recording</h3>
+        {status === 'error' ? (
+          <p className="text-metadata text-error">{error}</p>
+        ) : status === 'ready' && audioUrl ? (
+          <audio controls src={audioUrl} className="mt-1.5 h-9 w-full max-w-md" />
+        ) : (
+          <p className="text-metadata text-secondary">
+            {status === 'loading' ? 'Loading the recorded audio…' : 'Play or download the audio recorded for this meeting.'}
+          </p>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        {status !== 'ready' && (
+          <button
+            onClick={() => void handlePlay()}
+            disabled={status === 'loading'}
+            className="press inline-flex items-center gap-1.5 rounded-lg border border-outline-variant bg-surface px-3 py-2 text-metadata font-semibold text-on-surface hover:bg-surface-container-low disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Icon name={pending === 'play' ? 'progress_activity' : 'play_arrow'} size={16} className={pending === 'play' ? 'animate-spin' : ''} />
+            Play
+          </button>
+        )}
+        <button
+          onClick={() => void handleDownload()}
+          disabled={status === 'loading'}
+          className="press inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          <Icon name={pending === 'download' ? 'progress_activity' : 'download'} size={16} className={pending === 'download' ? 'animate-spin' : ''} />
+          Download
+        </button>
+      </div>
     </div>
   )
 }

@@ -59,6 +59,7 @@ export default {
       if (method === "POST" && pathname === "/api/join") return handleBot(request, env, "join");
       if (method === "POST" && pathname === "/api/leave") return handleBot(request, env, "leave");
       if (method === "GET" && pathname === "/api/transcripts") return handleTranscripts(request, env);
+      if (method === "GET" && pathname === "/api/recording") return handleRecording(request, env);
       if (method === "GET" && pathname === "/api/admin/users") return handleAdminUsers(request, env);
       if (method === "POST" && pathname === "/api/ai") return handleAiChat(request, env);
       if (method === "POST" && pathname === "/api/meetings/sync-titles") return handleSyncMeetingTitles(request, env);
@@ -544,6 +545,98 @@ async function handleTranscripts(request, env) {
   } catch (err) {
     return json({ error: "Failed to load transcripts", detail: String((err && err.message) || err) }, 500);
   }
+}
+
+// GET /api/recording?meeting_id=...&owner=... — proxies a meeting's recorded
+// audio from the bot backend. Same per-meeting ACL as /api/ai (a normal user
+// must own the meeting via meeting_owners or legacy owner_email; admin passes
+// ?owner= to pick whose meeting, since meeting_id alone isn't unique across
+// owners). `platform` + `native_meeting_id` are read from the D1 `meetings`
+// table (see resolveMeetingsJoinColumns) and used to build the upstream call —
+// GET {apiBase}/audio/{platform}/{native_meeting_id} with the server-held
+// X-API-Key, the same header dispatchBot already sends for join/leave, just a
+// GET with no body. The audio bytes are streamed straight back to the browser;
+// the API key never reaches the client.
+async function handleRecording(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+  if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
+
+  const url = new URL(request.url);
+  const meetingId = String(url.searchParams.get("meeting_id") || "").trim();
+  if (!meetingId) return json({ error: "Pick a meeting first" }, 400);
+  const ownerScope = session.isAdmin ? String(url.searchParams.get("owner") || "").trim() : session.identity;
+
+  try {
+    let owns;
+    if (session.isAdmin && !ownerScope) {
+      owns = await env.DB.prepare("SELECT 1 FROM transcriptions WHERE meeting_id = ?1 LIMIT 1").bind(meetingId).all();
+    } else {
+      const email = normalizeEmail(ownerScope);
+      owns = await env.DB.prepare(
+        "SELECT 1 FROM transcriptions WHERE meeting_id = ?2 AND (" +
+        "EXISTS (SELECT 1 FROM meeting_owners WHERE meeting_id = ?2 AND owner_email = ?1) " +
+        "OR owner_email = ?1) LIMIT 1"
+      ).bind(email, meetingId).all();
+    }
+    if (!owns.results || !owns.results.length) return json({ error: "Not found" }, 404);
+  } catch (err) {
+    return json({ error: "Failed to authorize that meeting", detail: String((err && err.message) || err) }, 500);
+  }
+
+  const source = await d1MeetingRecordingSource(env, meetingId);
+  if (!source) return json({ error: "No recording available for this meeting yet" }, 404);
+
+  const base = await resolveApiBase(env);
+  const endpoint = `${base}/audio/${encodeURIComponent(source.platform)}/${encodeURIComponent(source.nativeMeetingId)}`;
+  let upstream;
+  try {
+    upstream = await fetch(endpoint, { headers: { "X-API-Key": env.API_KEY } });
+  } catch (err) {
+    return json({ error: "Failed to reach the notetaker service", detail: String((err && err.message) || err) }, 502);
+  }
+  if (upstream.status === 404) {
+    // The upstream distinguishes "aged out of retention" from "never recorded"
+    // in its error body; surface whichever applies instead of a flat 404.
+    const detail = await upstream.text().catch(() => "");
+    const expired = /retention/i.test(detail);
+    return json({ error: expired ? "This recording has been deleted per the retention policy" : "No recorded audio found for this meeting" }, 404);
+  }
+  if (!upstream.ok) {
+    return json({ error: "Failed to fetch the recording", detail: `Upstream returned ${upstream.status}` }, 502);
+  }
+
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      "Content-Type": upstream.headers.get("Content-Type") || "audio/webm",
+      "Cache-Control": "private, no-store",
+    },
+  });
+}
+
+// Resolves { platform, nativeMeetingId } for one meeting_id from the D1
+// `meetings` table, trying each candidate join column in turn (see
+// resolveMeetingsJoinColumns). Returns null if the table isn't present or no
+// row for this meeting carries a native_meeting_id yet.
+async function d1MeetingRecordingSource(env, meetingId) {
+  const columns = await resolveMeetingsJoinColumns(env);
+  const id = String(meetingId).trim();
+  for (const col of columns) {
+    try {
+      const res = await env.DB.prepare(
+        `SELECT platform, native_meeting_id FROM meetings WHERE CAST(${col} AS TEXT) = ?1 LIMIT 1`
+      ).bind(id).all();
+      const row = res && res.results && res.results[0];
+      if (row && row.native_meeting_id) {
+        return { platform: String(row.platform || "").trim(), nativeMeetingId: String(row.native_meeting_id).trim() };
+      }
+    } catch {
+      /* this column didn't resolve — the next candidate, if any, still gets a chance */
+    }
+  }
+  return null;
 }
 
 // GET /api/admin/users — admin-only. Every distinct email that could have
