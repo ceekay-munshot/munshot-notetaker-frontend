@@ -188,6 +188,31 @@ export async function summarizeMeeting(
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
+/** Fetches a meeting's recorded audio. The Worker resolves the meeting's
+ *  platform + native_meeting_id from D1 and proxies the bot backend's
+ *  /audio/{platform}/{native_meeting_id} with the server-held API key — same
+ *  ACL as summarizeMeeting/chatMeeting, just returning an audio blob instead of
+ *  transcript text. Throws ApiError(404) when there's no recording yet
+ *  (deleted per retention policy, or the meeting was never recorded). */
+export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const params = new URLSearchParams({ meeting_id: meetingId })
+  if (owner) params.set('owner', owner)
+  const res = await fetch(`/api/recording?${params.toString()}`, { credentials: 'same-origin' })
+  if (res.status === 401) throw new NotAuthedError()
+  if (!res.ok) {
+    let message = `Request failed (${res.status})`
+    try {
+      const data = await res.json()
+      message = (data && (data.error || data.detail)) || message
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new ApiError(message, res.status)
+  }
+  return res.blob()
+}
+
 /** Free-form chat over a single meeting's transcript. `messages` is the running
  *  conversation ([{role:'user'|'assistant', content}]). Returns the reply text. */
 export async function chatMeeting(
