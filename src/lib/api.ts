@@ -188,28 +188,57 @@ export async function summarizeMeeting(
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
+const RECORDING_FETCH_ATTEMPTS = 3
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
 /** Fetches a meeting's recorded audio. The Worker proxies the bot backend's
  *  /audio/{meeting_id} with the server-held API key — same ACL as
  *  summarizeMeeting/chatMeeting, just returning an audio blob instead of
  *  transcript text. Throws ApiError(404) when there's no recording yet
- *  (deleted per retention policy, or the meeting was never recorded). */
+ *  (deleted per retention policy, or the meeting was never recorded).
+ *
+ *  Recordings can run tens of MB; the connection to the Worker (or the
+ *  Worker's own connection upstream) occasionally drops mid-stream, which
+ *  surfaces as a plain network error from res.blob() even after a 200
+ *  response. That's transient, so it's retried a few times — a real 404/401
+ *  or any other definitive server answer is not. */
 export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
   const { owner, meetingId } = decodeMeetingId(episode.id)
   const params = new URLSearchParams({ meeting_id: meetingId })
   if (owner) params.set('owner', owner)
-  const res = await fetch(`/api/recording?${params.toString()}`, { credentials: 'same-origin' })
-  if (res.status === 401) throw new NotAuthedError()
-  if (!res.ok) {
-    let message = `Request failed (${res.status})`
+  const url = `/api/recording?${params.toString()}`
+
+  let lastErr: unknown
+  for (let attempt = 1; attempt <= RECORDING_FETCH_ATTEMPTS; attempt++) {
     try {
-      const data = await res.json()
-      message = (data && (data.error || data.detail)) || message
-    } catch {
-      /* non-JSON error body */
+      const res = await fetch(url, { credentials: 'same-origin' })
+      if (res.status === 401) throw new NotAuthedError()
+      if (!res.ok) {
+        let message = `Request failed (${res.status})`
+        try {
+          const data = await res.json()
+          message = (data && (data.error || data.detail)) || message
+        } catch {
+          /* non-JSON error body */
+        }
+        // 502 means the Worker itself couldn't reach/finish talking to the
+        // notetaker backend — worth a retry. Everything else (404, etc.) is
+        // a definitive answer that a retry won't change.
+        if (res.status !== 502) throw new ApiError(message, res.status)
+        lastErr = new ApiError(message, res.status)
+      } else {
+        return await res.blob()
+      }
+    } catch (err) {
+      if (err instanceof NotAuthedError || err instanceof ApiError) throw err
+      lastErr = err // dropped connection mid-stream — retry
     }
-    throw new ApiError(message, res.status)
+    if (attempt < RECORDING_FETCH_ATTEMPTS) await sleep(500 * attempt)
   }
-  return res.blob()
+  throw lastErr instanceof Error ? lastErr : new Error('Could not load the recording. Please try again.')
 }
 
 /** Free-form chat over a single meeting's transcript. `messages` is the running
