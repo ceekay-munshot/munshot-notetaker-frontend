@@ -19,10 +19,11 @@ const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
   "https://65.1.101.15.nip.io/calendar/connect/start";
 // The recording-audio host — GET {audioApiBase}/{meeting_id} with the
 // server-held X-API-Key returns the recorded webm. Runs on its own port
-// (:8056), a different origin from the join/leave bot API (:8080). Override
-// with the AUDIO_ENDPOINT var if the tunnel changes.
+// (:8056), a different origin from the join/leave bot API (:8080), under the
+// same /public prefix as /public/join and /public/leave. Override with the
+// AUDIO_ENDPOINT var if the tunnel changes.
 const DEFAULT_AUDIO_ENDPOINT =
-  "http://65.1.101.15.nip.io:8056/audio";
+  "http://65.1.101.15.nip.io:8056/public/audio";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
@@ -602,11 +603,22 @@ async function handleRecording(request, env) {
     return json({ error: "Failed to reach the notetaker service", detail: String((err && err.message) || err) }, 502);
   }
   if (upstream.status === 404) {
-    // The upstream distinguishes "aged out of retention" from "never recorded"
-    // in its error body; surface whichever applies instead of a flat 404.
-    const detail = await upstream.text().catch(() => "");
-    const expired = /retention/i.test(detail);
-    return json({ error: expired ? "This recording has been deleted per the retention policy" : "No recorded audio found for this meeting" }, 404);
+    // The upstream's {"detail": "..."} distinguishes a bad/wrong-owner id (we
+    // already checked ownership above, so this shouldn't happen), an aged-out-
+    // of-retention recording, and a meeting that was simply never recorded.
+    let detail = "";
+    try {
+      const body = await upstream.json();
+      detail = String((body && body.detail) || "");
+    } catch {
+      detail = await upstream.text().catch(() => "");
+    }
+    const message = /retention/i.test(detail)
+      ? "This recording has been deleted per the retention policy"
+      : /meeting not found/i.test(detail)
+      ? "Not found"
+      : "No recorded audio found for this meeting";
+    return json({ error: message }, 404);
   }
   if (!upstream.ok) {
     return json({ error: "Failed to fetch the recording", detail: `Upstream returned ${upstream.status}` }, 502);
