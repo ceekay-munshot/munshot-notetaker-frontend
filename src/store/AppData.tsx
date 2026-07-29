@@ -30,6 +30,11 @@ interface AppData {
   // meetings
   refresh: () => Promise<void>
   summarizeEpisode: (episode: Episode, podcast?: Podcast, opts?: { force?: boolean }) => Promise<void>
+  /** Pull server-cached meeting summaries (from the auto-summary cron / prior
+   *  opens) into the episode model, so the Weekly page populates without opening
+   *  each meeting. Best-effort; idempotent; only fetches meetings not already
+   *  summarized or requested this session. */
+  hydrateCachedSummaries: () => Promise<void>
   // notetaker bot
   sendBot: (meetingUrl: string, action?: 'join' | 'leave') => Promise<void>
   // schedules
@@ -48,6 +53,9 @@ interface AppData {
   refreshCalendar: () => Promise<api.CalendarEvent[]>
   removeCalendarEvent: (eventId: number | string) => Promise<void>
   removeCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
+  /** Cancels every currently-synced (pending) calendar meeting in one shot —
+   *  the "Unsync calendar" action. A no-op when there's nothing pending. */
+  unsyncCalendar: () => Promise<void>
   cancelledEvents: api.CalendarEvent[]
   restoreCalendarEvent: (eventId: number | string) => Promise<void>
   restoreCalendarEvents: (eventIds: (number | string)[]) => Promise<void>
@@ -62,15 +70,6 @@ interface AppData {
 }
 
 const Ctx = createContext<AppData | null>(null)
-
-// Normalize whatever the upstream calendar endpoint returns into a flat event list.
-function normalizeCalendar(payload: any): api.CalendarEvent[] {
-  if (!payload) return []
-  const arr = Array.isArray(payload)
-    ? payload
-    : payload.calendar_events || payload.meetings || payload.events || payload.items || payload.calendar || []
-  return Array.isArray(arr) ? arr : []
-}
 
 // Best-effort human note from the upstream /calendar/sync result body. The exact
 // shape isn't guaranteed, so we look at the common places a message/error could
@@ -160,7 +159,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       // Pull cancelled ones too, then split: active drive "Upcoming", cancelled
       // drive the "Removed" section (restore).
       const { calendar } = await api.calendarMeetings(true)
-      const all = normalizeCalendar(calendar)
+      const all = api.normalizeCalendarEvents(calendar)
       const active = all.filter((e) => String(e.status) !== 'cancelled')
       setCalendarEvents(active)
       setCancelledEvents(all.filter((e) => String(e.status) === 'cancelled'))
@@ -215,6 +214,37 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const displayEpisodes = useMemo(() => episodes.map(applyCalendarName), [episodes, applyCalendarName])
   const displayPodcasts = useMemo(() => podcasts.map(applyCalendarName), [podcasts, applyCalendarName])
 
+  // Every meeting with a known real calendar name, deduped by meeting_id.
+  const calendarNameEntries = useMemo(() => {
+    const seen = new Set<string>()
+    const out: { meetingId: string; calendarName: string }[] = []
+    for (const e of episodes) {
+      const meetingId = decodeMeetingId(e.id).meetingId
+      const calendarName = calendarTitleById.get(meetingId)
+      if (calendarName && !seen.has(meetingId)) {
+        seen.add(meetingId)
+        out.push({ meetingId, calendarName })
+      }
+    }
+    return out
+  }, [episodes, calendarTitleById])
+  // A stable fingerprint of the above, so the sync effect below only refires
+  // when the known names actually change — not on every unrelated episode
+  // status tweak (summarizing → ready, etc).
+  const calendarNameFingerprint = calendarNameEntries.map((e) => `${e.meetingId}:${e.calendarName}`).sort().join('|')
+
+  // Push every known real calendar name to the Worker once calendar data has
+  // settled. Without this, a meeting only self-heals from a stale/AI title
+  // when its owner happens to individually reopen it (see summarizeEpisode) —
+  // a viewer with no calendar of their own (chiefly admin, who the Worker
+  // denies calendar access entirely) would otherwise keep seeing a stale
+  // title indefinitely, however long ago it was minted.
+  useEffect(() => {
+    if (isAdmin || !calendarReady || !calendarNameEntries.length) return
+    void api.syncMeetingTitles(calendarNameEntries).catch(() => {})
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAdmin, calendarReady, calendarNameFingerprint])
+
   const podcastById = useCallback((id: string) => displayPodcasts.find((p) => p.id === id), [displayPodcasts])
   const episodeById = useCallback((id: string) => displayEpisodes.find((e) => e.id === id), [displayEpisodes])
   const episodesByPodcast = useCallback(
@@ -252,6 +282,40 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       summarizing.current.delete(episode.id)
     }
   }, [calendarTitleById])
+
+  // Meetings whose cached summary we've already asked the Worker for this session,
+  // so a re-run (episodes changing) never re-fetches the same set or loops.
+  const hydrateRequested = useRef<Set<string>>(new Set())
+  const hydrateCachedSummaries = useCallback(async () => {
+    const targets = episodes.filter(
+      (e) => e.status === 'ready' && !e.summary && !hydrateRequested.current.has(e.id),
+    )
+    if (!targets.length) return
+    const pick = targets.slice(0, 60)
+    pick.forEach((e) => hydrateRequested.current.add(e.id))
+    const refs = pick.map((e) => {
+      const { owner, meetingId } = decodeMeetingId(e.id)
+      return { meeting_id: meetingId, owner }
+    })
+    try {
+      const summaries = await api.fetchCachedMeetingSummaries(refs)
+      if (!summaries.length) return
+      const byMeetingId = new Map(summaries.map((s) => [s.meetingId, s.summary]))
+      setEpisodes((prev) => {
+        let changed = false
+        const next = prev.map((e) => {
+          if (e.summary) return e
+          const summary = byMeetingId.get(decodeMeetingId(e.id).meetingId)
+          if (!summary) return e
+          changed = true
+          return { ...e, status: 'ready' as const, summary }
+        })
+        return changed ? next : prev
+      })
+    } catch {
+      /* best-effort — the deterministic/empty edition still renders */
+    }
+  }, [episodes])
 
   const sendBot = useCallback(async (meetingUrl: string, action: 'join' | 'leave' = 'join') => {
     await api.sendBot(meetingUrl, action)
@@ -332,6 +396,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
     [refreshCalendar],
   )
 
+  // Fully disconnect the calendar in one upstream call: cancels every pending
+  // meeting, stops any live bots, and drops the Google OAuth connection (so a
+  // later sync reports "not connected" until re-authorized). Unlike the old
+  // per-event remove loop, this has no pagination gap and actually clears the
+  // connection.
+  const unsyncCalendar = useCallback(async () => {
+    setCalendarEvents([]) // optimistic — the whole calendar is being disconnected
+    try {
+      await api.calendarUnsubscribe()
+    } finally {
+      await refreshCalendar()
+    }
+  }, [refreshCalendar])
+
   const restoreCalendarEvent = useCallback(
     async (eventId: number | string) => {
       setCancelledEvents((prev) => prev.filter((e) => String(e.id) !== String(eventId))) // optimistic
@@ -403,6 +481,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       episodesByPodcast,
       refresh,
       summarizeEpisode,
+      hydrateCachedSummaries,
       sendBot,
       schedules,
       refreshSchedules,
@@ -415,6 +494,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       refreshCalendar,
       removeCalendarEvent,
       removeCalendarEvents,
+      unsyncCalendar,
       cancelledEvents,
       restoreCalendarEvent,
       restoreCalendarEvents,
@@ -438,6 +518,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       episodesByPodcast,
       refresh,
       summarizeEpisode,
+      hydrateCachedSummaries,
       sendBot,
       schedules,
       refreshSchedules,
@@ -450,6 +531,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       refreshCalendar,
       removeCalendarEvent,
       removeCalendarEvents,
+      unsyncCalendar,
       cancelledEvents,
       restoreCalendarEvent,
       restoreCalendarEvents,

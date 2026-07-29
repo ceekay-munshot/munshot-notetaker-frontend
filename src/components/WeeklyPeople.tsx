@@ -19,7 +19,9 @@ export function WeeklyPeople() {
   useEffect(() => {
     let alive = true
     setState({ status: 'loading' })
-    fetchWeeklyPeople()
+    // First load uses the saved rollup (instant, free); the Regenerate button
+    // (reloadKey > 0) forces a fresh rebuild.
+    fetchWeeklyPeople({ force: reloadKey > 0 })
       .then((people) => {
         if (alive) setState({ status: 'ready', people })
       })

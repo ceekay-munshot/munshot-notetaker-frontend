@@ -12,7 +12,7 @@
 // compiling; they are hidden in the meetings UI.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import type { Episode, Podcast, Summary, WeeklySchedule, WeeklySummary } from './types'
+import type { Episode, Podcast, Summary, WeeklyAi, WeeklySchedule, WeeklySummary } from './types'
 import type { EmailResult } from './email'
 import { normalizeRecipients } from './recipientsStore'
 import { meetingsFromSegments, decodeMeetingId, type RawSegment } from './meetings'
@@ -85,6 +85,14 @@ export function logout(): Promise<{ ok: boolean }> {
   return request('/api/logout', { method: 'POST' })
 }
 
+/** Exchanges a Munshot host JWT for a real Worker session cookie, so /api/*
+ *  calls made from inside the host iframe are authenticated. See the security
+ *  caveat on the Worker's handleHostLogin — the token's signature isn't
+ *  verified server-side. */
+export function hostLogin(token: string): Promise<{ ok: boolean; email?: string }> {
+  return request('/api/host-login', { method: 'POST', body: JSON.stringify({ token }) })
+}
+
 /** Step 1 of a password reset: the server emails a single-use, 15-minute 5-digit
  *  code to the address (if an account exists) — the account's password is left
  *  unchanged until step 2. Always resolves the same way regardless of whether the
@@ -122,6 +130,21 @@ export async function fetchMeetings(): Promise<MeetingData> {
     podcasts: meetings.map((m) => m.podcast),
     admin: !!data.admin,
   }
+}
+
+/** Pushes real calendar names (from this browser's own calendar sync) for
+ *  meetings the signed-in user owns into the Worker's shared title cache, so a
+ *  viewer without their own calendar view of a meeting (chiefly admin) sees
+ *  the real name too — instead of a stale/AI title lingering until the
+ *  meeting is individually reopened. Best-effort; failures are non-fatal. */
+export async function syncMeetingTitles(
+  names: { meetingId: string; calendarName: string }[],
+): Promise<void> {
+  if (!names.length) return
+  await request('/api/meetings/sync-titles', {
+    method: 'POST',
+    body: JSON.stringify({ names: names.map((n) => ({ meeting_id: n.meetingId, calendar_name: n.calendarName })) }),
+  })
 }
 
 // Turn the assistant's markdown reply into the Summary shape the UI renders.
@@ -165,6 +188,31 @@ export async function summarizeMeeting(
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
+/** Fetches a meeting's recorded audio. The Worker resolves the meeting's
+ *  platform + native_meeting_id from D1 and proxies the bot backend's
+ *  /audio/{platform}/{native_meeting_id} with the server-held API key — same
+ *  ACL as summarizeMeeting/chatMeeting, just returning an audio blob instead of
+ *  transcript text. Throws ApiError(404) when there's no recording yet
+ *  (deleted per retention policy, or the meeting was never recorded). */
+export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const params = new URLSearchParams({ meeting_id: meetingId })
+  if (owner) params.set('owner', owner)
+  const res = await fetch(`/api/recording?${params.toString()}`, { credentials: 'same-origin' })
+  if (res.status === 401) throw new NotAuthedError()
+  if (!res.ok) {
+    let message = `Request failed (${res.status})`
+    try {
+      const data = await res.json()
+      message = (data && (data.error || data.detail)) || message
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new ApiError(message, res.status)
+  }
+  return res.blob()
+}
+
 /** Free-form chat over a single meeting's transcript. `messages` is the running
  *  conversation ([{role:'user'|'assistant', content}]). Returns the reply text. */
 export async function chatMeeting(
@@ -181,21 +229,153 @@ export async function chatMeeting(
 
 // ── Weekly per-person rollup ────────────────────────────────────────────────────
 
+/** A single structured action item within a person's rollup. Identity (`id`)
+ *  is stable across cron ticks: the Worker reconciles new transcript evidence
+ *  against existing items (reaffirm / complete / cancel / new) instead of
+ *  re-deriving the whole list, so a task's status here reflects real evidence,
+ *  not just whether the model happened to mention it again this pass. */
+export interface TodoItem {
+  id: string
+  text: string
+  status: 'open' | 'done' | 'dropped'
+  priority: 'high' | 'medium' | 'low'
+  dueDate: string | null
+  overdue?: boolean
+  owner: string
+  firstSeenMeetingId: string
+  firstSeenAt: number
+  lastSeenAt: number
+  completedMeetingId?: string
+  completedAt?: number
+  evidence?: string
+  missCount: number
+}
+
 export interface PersonRollup {
   name: string
   overall: string
   accomplished: string[]
   todo: string[]
+  /** Structured items backing `accomplished`/`todo`, when the Worker has
+   *  reconciled this person under the structured scheme. Absent (or empty) on
+   *  a not-yet-upgraded record — renderers should fall back to the plain
+   *  string lists in that case. */
+  items?: TodoItem[]
 }
 
 /** A per-person status rollup across all the signed-in user's meetings: overall
- *  view, what each participant has accomplished, and their current to-dos. */
-export async function fetchWeeklyPeople(): Promise<PersonRollup[]> {
+ *  view, what each participant has accomplished, and their current to-dos. The
+ *  Worker persists this per user and only rebuilds it when the meetings change;
+ *  pass { force } (the "Regenerate" button) to rebuild it on demand. */
+export async function fetchWeeklyPeople(opts?: { force?: boolean }): Promise<PersonRollup[]> {
   const data = await request<{ ok: boolean; people?: PersonRollup[] }>('/api/weekly/people', {
     method: 'POST',
-    body: '{}',
+    body: JSON.stringify({ force: !!opts?.force }),
   })
   return data.people || []
+}
+
+// ── Weekly master summary ("summary of summaries") ───────────────────────────────
+// The cross-meeting synthesis is built server-side from each meeting's cached
+// detailed summary and persisted per user + week, so once a week's summary exists
+// it is returned as-is and never regenerated on a normal visit (only Refresh /
+// force rebuilds it). Each meeting carries its 1-based `index` so the model's
+// `[n]` citations line up with the client's deterministic source order.
+
+/** A meeting reference the weekly endpoints authorize + read the summary for. */
+export interface WeeklyMeetingRef {
+  meeting_id: string
+  owner: string
+  /** 1-based citation index in the client's source order (for [n] alignment). */
+  index?: number
+}
+
+export interface WeeklyAiResult {
+  /** The synthesised narrative, or null when no meeting in the week is summarized yet. */
+  ai: WeeklyAi | null
+  /** True when the saved edition was returned (not freshly generated). */
+  cached: boolean
+  generatedAt: number | null
+  /** How many of the requested meetings actually had a summary to synthesise from. */
+  usedCount: number
+  skipped: number
+}
+
+/** Turn a set of episodes into the meeting refs the weekly endpoints expect,
+ *  numbered 1-based in the given (source) order for citation alignment. */
+export function meetingRefs(episodes: Episode[]): WeeklyMeetingRef[] {
+  return episodes.map((e, i) => {
+    const { owner, meetingId } = decodeMeetingId(e.id)
+    return { meeting_id: meetingId, owner, index: i + 1 }
+  })
+}
+
+/** Build (or fetch the saved) weekly master summary for a week bucket. Returns
+ *  `ai: null` when none of the week's meetings are summarized yet. */
+export async function fetchWeeklyAiSummary(
+  week: string,
+  meetings: WeeklyMeetingRef[],
+  opts: { range?: string; force?: boolean } = {},
+): Promise<WeeklyAiResult> {
+  const data = await request<{
+    ok: boolean
+    ai?: WeeklyAi | null
+    cached?: boolean
+    generatedAt?: number | null
+    usedCount?: number
+    skipped?: number
+  }>('/api/weekly/summary', {
+    method: 'POST',
+    body: JSON.stringify({ week, range: opts.range || '', force: !!opts.force, meetings }),
+  })
+  return {
+    ai: data.ai ?? null,
+    cached: !!data.cached,
+    generatedAt: data.generatedAt ?? null,
+    usedCount: data.usedCount ?? 0,
+    skipped: data.skipped ?? 0,
+  }
+}
+
+/** A meeting's server-cached detailed summary, mapped onto the UI Summary shape. */
+export interface CachedMeetingSummary {
+  meetingId: string
+  title: string
+  summary: Summary
+}
+
+/** Peek the already-cached detailed summary for each requested meeting (no
+ *  generation). Lets the Weekly page hydrate its episode model from summaries the
+ *  auto-summary cron / prior opens already produced, so the weekly populates
+ *  without opening every meeting. Meetings without a cached summary are omitted. */
+export async function fetchCachedMeetingSummaries(meetings: WeeklyMeetingRef[]): Promise<CachedMeetingSummary[]> {
+  if (!meetings.length) return []
+  const data = await request<{
+    ok: boolean
+    summaries?: { meeting_id: string; title: string; summary: string }[]
+  }>('/api/weekly/meetings', {
+    method: 'POST',
+    body: JSON.stringify({ meetings }),
+  })
+  return (data.summaries || []).map((s) => ({
+    meetingId: String(s.meeting_id),
+    title: String(s.title || ''),
+    summary: summaryFromReply(String(s.summary || '')),
+  }))
+}
+
+/** Free-form chat over a week's meeting summaries + the saved master summary.
+ *  `messages` is the running conversation; returns the assistant's reply. */
+export async function chatWeekly(
+  week: string,
+  meetings: WeeklyMeetingRef[],
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<string> {
+  const data = await request<{ ok: boolean; reply?: string }>('/api/weekly/chat', {
+    method: 'POST',
+    body: JSON.stringify({ week, meetings, messages }),
+  })
+  return String(data.reply || '')
 }
 
 // ── Admin people tracker ─────────────────────────────────────────────────────
@@ -251,6 +431,25 @@ export async function saveTrackingSelection(names: string[]): Promise<string[]> 
   return data.selection || []
 }
 
+/** How each tracked person's week went — completed / newly opened / carried
+ *  over and overdue — bucketed server-side from the already-reconciled
+ *  structured items (no AI call, instant). Admin-only. */
+export interface WeeklyTrackingPerson {
+  name: string
+  slug: string
+  completedThisWeek: string[]
+  openedThisWeek: string[]
+  carriedOverdue: string[]
+}
+
+export async function fetchWeeklyTracking(range: { weekStartMs: number; weekEndMs: number }): Promise<WeeklyTrackingPerson[]> {
+  const data = await request<{ ok: boolean; people?: WeeklyTrackingPerson[] }>('/api/weekly/tracking', {
+    method: 'POST',
+    body: JSON.stringify({ weekStartMs: range.weekStartMs, weekEndMs: range.weekEndMs }),
+  })
+  return data.people || []
+}
+
 // ── The notetaker bot ───────────────────────────────────────────────────────────
 
 export function sendBot(
@@ -272,6 +471,11 @@ export interface Schedule {
   lastStatus: string | null
 }
 
+/** A schedule as admin sees it — every user's, each tagged with its owner. */
+export interface AdminSchedule extends Schedule {
+  owner: string
+}
+
 export interface NewSchedule {
   meeting_url: string
   /** "YYYY-MM-DDTHH:MM" wall-clock, as picked. */
@@ -281,8 +485,18 @@ export interface NewSchedule {
   time_zone: string
 }
 
+/** A signed-in user's own schedules. Admins have none of their own — use
+ *  adminListSchedules for the cross-user view. */
 export async function listSchedules(): Promise<Schedule[]> {
   const data = await request<{ ok: boolean; schedules?: Schedule[] }>('/api/schedules')
+  return data.schedules || []
+}
+
+/** Admin-only: every user's schedules (each tagged with its owner), or just one
+ *  user's when `email` is given. */
+export async function adminListSchedules(email?: string): Promise<AdminSchedule[]> {
+  const qs = email ? `?email=${encodeURIComponent(email)}` : ''
+  const data = await request<{ ok: boolean; schedules?: AdminSchedule[] }>(`/api/schedules${qs}`)
   return data.schedules || []
 }
 
@@ -294,8 +508,10 @@ export async function createSchedule(input: NewSchedule): Promise<Schedule> {
   return data.schedule
 }
 
-export function deleteSchedule(id: string): Promise<{ ok: boolean }> {
-  return request('/api/schedules/delete', { method: 'POST', body: JSON.stringify({ id }) })
+/** Cancel a schedule. Pass `owner` when acting as admin on another user's
+ *  schedule — a normal user's own session always deletes only their own. */
+export function deleteSchedule(id: string, owner?: string): Promise<{ ok: boolean }> {
+  return request('/api/schedules/delete', { method: 'POST', body: JSON.stringify({ id, owner }) })
 }
 
 // ── Calendar ────────────────────────────────────────────────────────────────────
@@ -315,24 +531,77 @@ export interface CalendarEvent {
   [k: string]: unknown
 }
 
+/** Normalizes whatever shape the upstream calendar endpoint returns (a bare
+ *  array, or one of a few wrapper keys) into a flat event list. */
+export function normalizeCalendarEvents(payload: any): CalendarEvent[] {
+  if (!payload) return []
+  const arr = Array.isArray(payload)
+    ? payload
+    : payload.calendar_events || payload.meetings || payload.events || payload.items || payload.calendar || []
+  return Array.isArray(arr) ? arr : []
+}
+
 export function calendarSync(): Promise<{ ok: boolean; status: number; result: unknown }> {
   return request('/api/calendar/sync', { method: 'POST', body: '{}' })
 }
 
 /** Returns the raw calendar payload from upstream; shape is normalized by the caller.
- *  Pass includeCancelled to also get removed (status "cancelled") meetings. */
-export async function calendarMeetings(includeCancelled = false): Promise<{ ok: boolean; status: number; calendar: any }> {
-  return request('/api/calendar/meetings' + (includeCancelled ? '?include_cancelled=true' : ''))
+ *  Pass includeCancelled to also get removed (status "cancelled") meetings. `email`
+ *  is admin-only — it names which user's calendar to read (admins have none of
+ *  their own); a normal user's session always reads their own calendar. */
+export async function calendarMeetings(
+  includeCancelled = false,
+  email?: string,
+): Promise<{ ok: boolean; status: number; calendar: any }> {
+  const params = new URLSearchParams()
+  if (includeCancelled) params.set('include_cancelled', 'true')
+  if (email) params.set('email', email)
+  const qs = params.toString()
+  return request('/api/calendar/meetings' + (qs ? `?${qs}` : ''))
 }
 
-/** Remove a scheduled/upcoming calendar meeting so the bot won't join it. */
-export function calendarRemove(eventId: number | string): Promise<{ ok: boolean; status: number; result: unknown }> {
-  return request('/api/calendar/meetings/remove', { method: 'POST', body: JSON.stringify({ event_id: eventId }) })
+/** Remove a scheduled/upcoming calendar meeting so the bot won't join it. `email`
+ *  is admin-only — the user to act as. */
+export function calendarRemove(
+  eventId: number | string,
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/remove', {
+    method: 'POST',
+    body: JSON.stringify({ event_id: eventId, email }),
+  })
 }
 
-/** Restore (unremove) a cancelled calendar meeting so the bot will join it again. */
-export function calendarRestore(eventId: number | string): Promise<{ ok: boolean; status: number; result: unknown }> {
-  return request('/api/calendar/meetings/restore', { method: 'POST', body: JSON.stringify({ event_id: eventId }) })
+/** Restore (unremove) a cancelled calendar meeting so the bot will join it again.
+ *  `email` is admin-only — the user to act as. */
+export function calendarRestore(
+  eventId: number | string,
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/meetings/restore', {
+    method: 'POST',
+    body: JSON.stringify({ event_id: eventId, email }),
+  })
+}
+
+/** One-shot "unsync calendar": in a single upstream call, cancel every pending
+ *  meeting, stop any live bots, and drop the stored Google OAuth connection (so
+ *  a later sync reports connected:false until the calendar is re-authorized).
+ *  `email` is admin-only — the user to act as. */
+export function calendarUnsubscribe(
+  email?: string,
+): Promise<{ ok: boolean; status: number; result: unknown }> {
+  return request('/api/calendar/unsubscribe', {
+    method: 'POST',
+    body: JSON.stringify({ email }),
+  })
+}
+
+/** Admin-only: every distinct user email that has (or has had) meetings or
+ *  schedules — feeds the "Scheduled Meetings" admin picker. */
+export async function adminListUsers(): Promise<string[]> {
+  const data = await request<{ ok: boolean; users?: string[] }>('/api/admin/users')
+  return data.users || []
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

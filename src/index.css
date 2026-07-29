@@ -320,6 +320,28 @@
   }
 }
 
+/* Right-edge slide-over (the weekly chat panel) — glides in from the side it
+   docks to, on the iOS-like drawer curve. */
+.slide-over {
+  transform: translateX(0);
+  transition: transform 240ms var(--ease-drawer);
+}
+@starting-style {
+  .slide-over {
+    transform: translateX(100%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .slide-over {
+    transition: none;
+  }
+  @starting-style {
+    .slide-over {
+      transform: translateX(0);
+    }
+  }
+}
+
 /* Origin-aware popover/menu entrance. Pair with a Tailwind `origin-*` so the
    menu grows from its trigger, never from center. */
 .pop {

@@ -19,6 +19,9 @@ export interface WeeklyEditionMeta {
   weekKey: string
   /** Canonical Mon–Sun label, e.g. "Jun 1 – 7, 2026". */
   rangeLabel: string
+  /** UTC start (Monday 00:00:00.000) / end (Sunday 23:59:59.999) of the week, ms. */
+  startMs: number
+  endMs: number
   episodeIds: string[]
   episodeCount: number
   /** Total concrete ideas pitched across the week (for the card stat). */
@@ -52,6 +55,8 @@ export function listEditions(episodes: Episode[], podcastById: ById): WeeklyEdit
     editions.push({
       weekKey,
       rangeLabel: weekRangeLabel(start, end),
+      startMs: start.getTime(),
+      endMs: end.getTime() + 24 * 60 * 60 * 1000 - 1, // through end-of-day Sunday
       episodeIds: sorted.map((e) => e.id),
       episodeCount: sorted.length,
       ideaCount: sorted.reduce((n, e) => n + (e.summary?.ideas?.length ?? 0), 0),

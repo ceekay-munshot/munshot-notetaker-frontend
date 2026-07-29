@@ -17,8 +17,12 @@ const NAV: NavItem[] = [
 ]
 
 // Admin-only — appended when signed in as admin (People Tracker manages a
-// cross-meeting rollup that only admins can select/see).
-const ADMIN_NAV_ITEM: NavItem = { to: '/tracking', label: 'People Tracker', icon: 'groups' }
+// cross-meeting rollup that only admins can select/see; Scheduled Meetings
+// shows every user's upcoming calendar meetings and notetaker schedules).
+const ADMIN_NAV_ITEMS: NavItem[] = [
+  { to: '/tracking', label: 'People Tracker', icon: 'groups' },
+  { to: '/scheduled', label: 'Scheduled Meetings', icon: 'event_upcoming' },
+]
 
 /** The static sidebar — desktop/tablet only; below `md` the drawer takes over. */
 export function Sidebar() {
@@ -78,7 +82,7 @@ export function MobileSidebar({ open, onClose }: { open: boolean; onClose: () =>
 function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onClose?: () => void }) {
   const { state } = useAuth()
   const isAdmin = state.status === 'authed' && state.isAdmin
-  const nav = isAdmin ? [...NAV, ADMIN_NAV_ITEM] : NAV
+  const nav = isAdmin ? [...NAV, ...ADMIN_NAV_ITEMS] : NAV
 
   return (
     <>
@@ -141,7 +145,8 @@ function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onCl
  *  (standalone); or a quiet skeleton for the first moment identity resolves. */
 function IdentityBadge() {
   const { identity } = useAppData()
-  const { signOut } = useAuth()
+  const { state, signOut } = useAuth()
+  const hostManaged = state.status === 'authed' && state.hostManaged
 
   if (identity === undefined) {
     return (
@@ -211,15 +216,17 @@ function IdentityBadge() {
         <p className="truncate text-[13px] font-semibold text-on-surface">{display}</p>
         <p className="truncate text-[11.5px] text-secondary">{detail}</p>
       </div>
-      <button
-        type="button"
-        onClick={() => void signOut()}
-        aria-label="Sign out"
-        title="Sign out"
-        className="press grid h-8 w-8 shrink-0 place-items-center rounded-lg text-secondary hover:bg-surface-container hover:text-error"
-      >
-        <Icon name="logout" size={18} />
-      </button>
+      {!hostManaged && (
+        <button
+          type="button"
+          onClick={() => void signOut()}
+          aria-label="Sign out"
+          title="Sign out"
+          className="press grid h-8 w-8 shrink-0 place-items-center rounded-lg text-secondary hover:bg-surface-container hover:text-error"
+        >
+          <Icon name="logout" size={18} />
+        </button>
+      )}
     </div>
   )
 }
