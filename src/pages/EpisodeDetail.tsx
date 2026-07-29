@@ -1099,11 +1099,13 @@ function RecordingBar({ episode }: { episode: Episode }) {
   const [audioUrl, setAudioUrl] = useState<string | null>(null)
   const [pending, setPending] = useState<'play' | 'download' | null>(null)
   const blobRef = useRef<Blob | null>(null)
+  const fetchRef = useRef<Promise<Blob | null> | null>(null)
 
   useEffect(() => {
     // Reset for a freshly opened meeting — a stale blob/URL from the previous
     // episode must never bleed into this one.
     blobRef.current = null
+    fetchRef.current = null
     setStatus('idle')
     setError(null)
     setAudioUrl(null)
@@ -1115,21 +1117,32 @@ function RecordingBar({ episode }: { episode: Episode }) {
     }
   }, [audioUrl])
 
-  async function ensureBlob(): Promise<Blob | null> {
-    if (blobRef.current) return blobRef.current
+  // Play and Download both call this; clicking both before the first fetch
+  // resolves must not fire two parallel multi-MB downloads whose results
+  // race — the loser (even a stale failure) would otherwise clobber the
+  // winner's state. Share one in-flight fetch across concurrent callers.
+  function ensureBlob(): Promise<Blob | null> {
+    if (blobRef.current) return Promise.resolve(blobRef.current)
+    if (fetchRef.current) return fetchRef.current
     setStatus('loading')
     setError(null)
-    try {
-      const blob = await fetchMeetingRecording(episode)
-      blobRef.current = blob
-      setAudioUrl(URL.createObjectURL(blob))
-      setStatus('ready')
-      return blob
-    } catch (err) {
-      setError((err as Error)?.message || 'Could not load the recording. Please try again.')
-      setStatus('error')
-      return null
-    }
+    const promise = fetchMeetingRecording(episode)
+      .then((blob) => {
+        blobRef.current = blob
+        setAudioUrl(URL.createObjectURL(blob))
+        setStatus('ready')
+        return blob
+      })
+      .catch((err) => {
+        setError((err as Error)?.message || 'Could not load the recording. Please try again.')
+        setStatus('error')
+        return null
+      })
+      .finally(() => {
+        fetchRef.current = null
+      })
+    fetchRef.current = promise
+    return promise
   }
 
   async function handlePlay() {
