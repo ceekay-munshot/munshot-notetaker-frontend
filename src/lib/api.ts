@@ -188,10 +188,22 @@ export async function summarizeMeeting(
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
-const RECORDING_FETCH_ATTEMPTS = 3
+const RECORDING_FETCH_ATTEMPTS = 5
+/** Per-attempt ceiling. The path between Cloudflare and the recording backend is
+ *  intermittently congested: a healthy connection delivers the whole file at
+ *  ~4 MB/s (a 30 MB recording lands in seconds), while a degraded one crawls at
+ *  ~11 KB/s — which would take ~45 minutes and never fails on its own, it just
+ *  hangs. Both were observed on back-to-back requests for the same meeting. So
+ *  cap each attempt: a stalled transfer is abandoned fast and retried on a
+ *  fresh connection instead of hanging the UI indefinitely. */
+const RECORDING_ATTEMPT_TIMEOUT_MS = 40_000
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function isAbortError(err: unknown): boolean {
+  return (err as Error | undefined)?.name === 'AbortError'
 }
 
 /** Fetches a meeting's recorded audio. The Worker proxies the bot backend's
@@ -200,12 +212,15 @@ function sleep(ms: number): Promise<void> {
  *  transcript text. Throws ApiError(404) when there's no recording yet
  *  (deleted per retention policy, or the meeting was never recorded).
  *
- *  Recordings can run tens of MB; the connection to the Worker (or the
- *  Worker's own connection upstream) occasionally drops mid-stream, which
- *  surfaces as a plain network error from res.blob() even after a 200
- *  response. That's transient, so it's retried a few times — a real 404/401
- *  or any other definitive server answer is not. */
-export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
+ *  Recordings run tens of MB over a flaky path, so a transfer can either drop
+ *  mid-stream (a network error out of res.blob(), even after a 200) or stall to
+ *  a crawl and never finish. Both are transient and per-connection, so each
+ *  attempt is time-boxed and retried; a real 404/401 is not. `onAttempt` fires
+ *  before each try so the UI can show which retry is running. */
+export async function fetchMeetingRecording(
+  episode: Episode,
+  onAttempt?: (attempt: number, total: number) => void,
+): Promise<Blob> {
   const { owner, meetingId } = decodeMeetingId(episode.id)
   const params = new URLSearchParams({ meeting_id: meetingId })
   if (owner) params.set('owner', owner)
@@ -213,8 +228,11 @@ export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
 
   let lastErr: unknown
   for (let attempt = 1; attempt <= RECORDING_FETCH_ATTEMPTS; attempt++) {
+    onAttempt?.(attempt, RECORDING_FETCH_ATTEMPTS)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), RECORDING_ATTEMPT_TIMEOUT_MS)
     try {
-      const res = await fetch(url, { credentials: 'same-origin' })
+      const res = await fetch(url, { credentials: 'same-origin', signal: controller.signal })
       if (res.status === 401) throw new NotAuthedError()
       if (!res.ok) {
         let message = `Request failed (${res.status})`
@@ -230,13 +248,20 @@ export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
         if (res.status !== 502) throw new ApiError(message, res.status)
         lastErr = new ApiError(message, res.status)
       } else {
+        // The body is still streaming at this point — a 200 only means headers
+        // arrived. A drop throws here; a stall trips the abort above.
         return await res.blob()
       }
     } catch (err) {
       if (err instanceof NotAuthedError || err instanceof ApiError) throw err
-      lastErr = err // dropped connection mid-stream — retry
+      lastErr = err // dropped or stalled mid-stream — retry on a new connection
+    } finally {
+      clearTimeout(timer)
     }
     if (attempt < RECORDING_FETCH_ATTEMPTS) await sleep(500 * attempt)
+  }
+  if (isAbortError(lastErr)) {
+    throw new Error('The recording kept downloading too slowly to finish. Please try again.')
   }
   throw lastErr instanceof Error ? lastErr : new Error('Could not load the recording. Please try again.')
 }

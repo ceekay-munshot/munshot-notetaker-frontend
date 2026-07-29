@@ -1098,6 +1098,7 @@ function RecordingBar({ episode }: { episode: Episode }) {
   const [error, setError] = useState<string | null>(null)
   const [audioUrl, setAudioUrl] = useState<string | null>(null)
   const [pending, setPending] = useState<'play' | 'download' | null>(null)
+  const [attempt, setAttempt] = useState<{ n: number; of: number } | null>(null)
   const blobRef = useRef<Blob | null>(null)
   const fetchRef = useRef<Promise<Blob | null> | null>(null)
 
@@ -1109,6 +1110,7 @@ function RecordingBar({ episode }: { episode: Episode }) {
     setStatus('idle')
     setError(null)
     setAudioUrl(null)
+    setAttempt(null)
   }, [episode.id])
 
   useEffect(() => {
@@ -1126,7 +1128,8 @@ function RecordingBar({ episode }: { episode: Episode }) {
     if (fetchRef.current) return fetchRef.current
     setStatus('loading')
     setError(null)
-    const promise = fetchMeetingRecording(episode)
+    setAttempt(null)
+    const promise = fetchMeetingRecording(episode, (n, of) => setAttempt({ n, of }))
       .then((blob) => {
         blobRef.current = blob
         setAudioUrl(URL.createObjectURL(blob))
@@ -1140,6 +1143,7 @@ function RecordingBar({ episode }: { episode: Episode }) {
       })
       .finally(() => {
         fetchRef.current = null
+        setAttempt(null)
       })
     fetchRef.current = promise
     return promise
@@ -1180,7 +1184,11 @@ function RecordingBar({ episode }: { episode: Episode }) {
           <audio controls src={audioUrl} className="mt-1.5 h-9 w-full max-w-md" />
         ) : (
           <p className="text-metadata text-secondary">
-            {status === 'loading' ? 'Loading the recorded audio…' : 'Play or download the audio recorded for this meeting.'}
+            {status === 'loading'
+              ? attempt && attempt.n > 1
+                ? `Connection stalled — retrying (${attempt.n}/${attempt.of})…`
+                : 'Loading the recorded audio…'
+              : 'Play or download the audio recorded for this meeting.'}
           </p>
         )}
       </div>
