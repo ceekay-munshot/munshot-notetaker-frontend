@@ -5,7 +5,7 @@ import { useAppData } from '../store/AppData'
 import { useSentiment } from '../store/Sentiment'
 import { downloadSummary } from '../lib/exportSummary'
 import { downloadSummaryPdf } from '../lib/pdfRender'
-import { ApiError, chatMeeting, emailEpisodeSummary, fetchMeetingRecording, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
+import { ApiError, chatMeeting, checkMeetingRecording, emailEpisodeSummary, meetingRecordingUrl, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
 import { addRecipient, loadRecipients, removeRecipient } from '../lib/recipientsStore'
 import { formatDuration, longDate, statusMeta } from '../lib/format'
 import type { Episode, EpisodeInsight, ProcessingStatus, QuantPoint, Takeaway, TranscriptSegment } from '../lib/types'
@@ -1093,83 +1093,45 @@ function TranscriptTab({
 // fetch — same session-scoped Worker route, same ACL), cached after the first
 // successful load so Play and Download share one blob instead of refetching.
 // A failed fetch leaves the blob unset, so either button retries on the next click.
+// The recording is served straight from /api/recording — never pulled into a
+// Blob first. These files run tens of MB over a path whose throughput swings
+// wildly (~11 KB/s to ~4 MB/s on back-to-back requests for the same meeting),
+// and buffering the whole thing in JS meant a single unlucky connection lost
+// everything and showed "Failed to fetch". Handing the URL to <audio> and to a
+// download link lets the browser's own media/download stacks do the transfer:
+// they issue range requests, start playback on the first chunk, and survive
+// interruptions that would kill a one-shot fetch.
 function RecordingBar({ episode }: { episode: Episode }) {
-  const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [status, setStatus] = useState<'idle' | 'checking' | 'ready' | 'error'>('idle')
   const [error, setError] = useState<string | null>(null)
-  const [audioUrl, setAudioUrl] = useState<string | null>(null)
-  const [pending, setPending] = useState<'play' | 'download' | null>(null)
-  const [attempt, setAttempt] = useState<{ n: number; of: number } | null>(null)
-  const blobRef = useRef<Blob | null>(null)
-  const fetchRef = useRef<Promise<Blob | null> | null>(null)
+  const src = meetingRecordingUrl(episode)
+  const fileName = `${(episode.title || 'meeting-recording').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.webm`
 
   useEffect(() => {
-    // Reset for a freshly opened meeting — a stale blob/URL from the previous
-    // episode must never bleed into this one.
-    blobRef.current = null
-    fetchRef.current = null
+    // Reset for a freshly opened meeting — a previous episode's state must
+    // never bleed into this one.
     setStatus('idle')
     setError(null)
-    setAudioUrl(null)
-    setAttempt(null)
   }, [episode.id])
 
+  // Confirms the recording exists (and surfaces the Worker's specific reason if
+  // not) before swapping in the player, which could otherwise only report a
+  // generic media error. Aborts on unmount so navigating away mid-check leaves
+  // nothing running.
   useEffect(() => {
-    return () => {
-      if (audioUrl) URL.revokeObjectURL(audioUrl)
-    }
-  }, [audioUrl])
-
-  // Play and Download both call this; clicking both before the first fetch
-  // resolves must not fire two parallel multi-MB downloads whose results
-  // race — the loser (even a stale failure) would otherwise clobber the
-  // winner's state. Share one in-flight fetch across concurrent callers.
-  function ensureBlob(): Promise<Blob | null> {
-    if (blobRef.current) return Promise.resolve(blobRef.current)
-    if (fetchRef.current) return fetchRef.current
-    setStatus('loading')
-    setError(null)
-    setAttempt(null)
-    const promise = fetchMeetingRecording(episode, (n, of) => setAttempt({ n, of }))
-      .then((blob) => {
-        blobRef.current = blob
-        setAudioUrl(URL.createObjectURL(blob))
-        setStatus('ready')
-        return blob
+    if (status !== 'checking') return
+    const controller = new AbortController()
+    checkMeetingRecording(episode, controller.signal)
+      .then(() => {
+        if (!controller.signal.aborted) setStatus('ready')
       })
       .catch((err) => {
+        if (controller.signal.aborted || (err as Error)?.name === 'AbortError') return
         setError((err as Error)?.message || 'Could not load the recording. Please try again.')
         setStatus('error')
-        return null
       })
-      .finally(() => {
-        fetchRef.current = null
-        setAttempt(null)
-      })
-    fetchRef.current = promise
-    return promise
-  }
-
-  async function handlePlay() {
-    setPending('play')
-    await ensureBlob()
-    setPending(null)
-  }
-
-  async function handleDownload() {
-    setPending('download')
-    const blob = await ensureBlob()
-    if (blob) {
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `${(episode.title || 'meeting-recording').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.webm`
-      document.body.appendChild(a)
-      a.click()
-      a.remove()
-      setTimeout(() => URL.revokeObjectURL(url), 10_000)
-    }
-    setPending(null)
-  }
+    return () => controller.abort()
+  }, [status, episode])
 
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-outline-variant bg-surface-container-lowest p-md shadow-card">
@@ -1180,14 +1142,22 @@ function RecordingBar({ episode }: { episode: Episode }) {
         <h3 className="text-[15px] font-semibold text-on-surface">Meeting recording</h3>
         {status === 'error' ? (
           <p className="text-metadata text-error">{error}</p>
-        ) : status === 'ready' && audioUrl ? (
-          <audio controls src={audioUrl} className="mt-1.5 h-9 w-full max-w-md" />
+        ) : status === 'ready' ? (
+          <audio
+            controls
+            autoPlay
+            preload="metadata"
+            src={src}
+            onError={() => {
+              setError('The recording stopped loading. Please try again.')
+              setStatus('error')
+            }}
+            className="mt-1.5 h-9 w-full max-w-md"
+          />
         ) : (
           <p className="text-metadata text-secondary">
-            {status === 'loading'
-              ? attempt && attempt.n > 1
-                ? `Connection stalled — retrying (${attempt.n}/${attempt.of})…`
-                : 'Loading the recorded audio…'
+            {status === 'checking'
+              ? 'Loading the recorded audio…'
               : 'Play or download the audio recorded for this meeting.'}
           </p>
         )}
@@ -1195,22 +1165,28 @@ function RecordingBar({ episode }: { episode: Episode }) {
       <div className="flex shrink-0 items-center gap-2">
         {status !== 'ready' && (
           <button
-            onClick={() => void handlePlay()}
-            disabled={status === 'loading'}
+            onClick={() => setStatus('checking')}
+            disabled={status === 'checking'}
             className="press inline-flex items-center gap-1.5 rounded-lg border border-outline-variant bg-surface px-3 py-2 text-metadata font-semibold text-on-surface hover:bg-surface-container-low disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <Icon name={pending === 'play' ? 'progress_activity' : 'play_arrow'} size={16} className={pending === 'play' ? 'animate-spin' : ''} />
+            <Icon
+              name={status === 'checking' ? 'progress_activity' : 'play_arrow'}
+              size={16}
+              className={status === 'checking' ? 'animate-spin' : ''}
+            />
             Play
           </button>
         )}
-        <button
-          onClick={() => void handleDownload()}
-          disabled={status === 'loading'}
-          className="press inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container disabled:cursor-not-allowed disabled:opacity-50"
+        {/* A real link, not a fetch: the browser downloads it with its own
+            download manager — progress, resume, and no 30MB held in memory. */}
+        <a
+          href={src}
+          download={fileName}
+          className="press inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container"
         >
-          <Icon name={pending === 'download' ? 'progress_activity' : 'download'} size={16} className={pending === 'download' ? 'animate-spin' : ''} />
+          <Icon name="download" size={16} />
           Download
-        </button>
+        </a>
       </div>
     </div>
   )
