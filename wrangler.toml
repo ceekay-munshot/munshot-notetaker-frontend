@@ -34,6 +34,9 @@ crons = ["* * * * *"]
 [vars]
 JOIN_ENDPOINT = "http://65.1.101.15.nip.io:8080/public/join"
 LEAVE_ENDPOINT = "http://65.1.101.15.nip.io:8080/public/leave"
+# Recording-audio host — GET {AUDIO_ENDPOINT}/{meeting_id} — its own port
+# (:8056), a different origin from the join/leave API above (:8080).
+AUDIO_ENDPOINT = "http://65.1.101.15.nip.io:8056/audio"
 # Browser-facing calendar Google-auth entry point (HTTPS, default port — not the
 # :8080 API base). The "Connect calendar" button redirects here via the Worker,
 # which appends the signed-in user's email.
