@@ -188,10 +188,9 @@ export async function summarizeMeeting(
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
-/** Fetches a meeting's recorded audio. The Worker resolves the meeting's
- *  platform + native_meeting_id from D1 and proxies the bot backend's
- *  /audio/{platform}/{native_meeting_id} with the server-held API key — same
- *  ACL as summarizeMeeting/chatMeeting, just returning an audio blob instead of
+/** Fetches a meeting's recorded audio. The Worker proxies the bot backend's
+ *  /audio/{meeting_id} with the server-held API key — same ACL as
+ *  summarizeMeeting/chatMeeting, just returning an audio blob instead of
  *  transcript text. Throws ApiError(404) when there's no recording yet
  *  (deleted per retention policy, or the meeting was never recorded). */
 export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
