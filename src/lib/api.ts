@@ -188,28 +188,62 @@ export async function summarizeMeeting(
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
-/** Fetches a meeting's recorded audio. The Worker proxies the bot backend's
- *  /audio/{meeting_id} with the server-held API key — same ACL as
- *  summarizeMeeting/chatMeeting, just returning an audio blob instead of
- *  transcript text. Throws ApiError(404) when there's no recording yet
- *  (deleted per retention policy, or the meeting was never recorded). */
-export async function fetchMeetingRecording(episode: Episode): Promise<Blob> {
+/** The Worker route serving a meeting's recorded audio. Safe to hand straight to
+ *  an <audio src> or a download link: it's same-origin, so the session cookie
+ *  rides along, and the Worker forwards Range requests to the backend — so the
+ *  browser streams and seeks natively instead of buffering the whole file.
+ *
+ *  Recordings run tens of MB over an intermittently congested path (observed
+ *  anywhere from ~11 KB/s to ~4 MB/s on back-to-back requests for the same
+ *  meeting). Pulling that into a JS Blob before playing meant one unlucky
+ *  connection lost the entire transfer; the browser's own media and download
+ *  stacks handle ranges, partial reads, and interruptions far better, so the
+ *  bytes never pass through application code. */
+export function meetingRecordingUrl(episode: Episode): string {
   const { owner, meetingId } = decodeMeetingId(episode.id)
   const params = new URLSearchParams({ meeting_id: meetingId })
   if (owner) params.set('owner', owner)
-  const res = await fetch(`/api/recording?${params.toString()}`, { credentials: 'same-origin' })
-  if (res.status === 401) throw new NotAuthedError()
-  if (!res.ok) {
-    let message = `Request failed (${res.status})`
-    try {
-      const data = await res.json()
-      message = (data && (data.error || data.detail)) || message
-    } catch {
-      /* non-JSON error body */
+  return `/api/recording?${params.toString()}`
+}
+
+/** Checks whether a meeting's recording exists, without downloading it. Reads
+ *  only the response headers and then aborts, so this costs a round trip rather
+ *  than tens of MB — the point is to surface the Worker's specific message
+ *  ("deleted per the retention policy", "never recorded", …) before handing the
+ *  URL to a native player, which can only report a generic failure.
+ *
+ *  Throws NotAuthedError on 401 and ApiError otherwise; resolves when the
+ *  recording is available. */
+export async function checkMeetingRecording(episode: Episode, signal?: AbortSignal): Promise<void> {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  signal?.addEventListener('abort', abort, { once: true })
+  try {
+    const res = await fetch(meetingRecordingUrl(episode), {
+      credentials: 'same-origin',
+      // Ask for a single byte: enough to confirm the backend can serve this
+      // recording, cheap enough that a congested path can't turn the check
+      // itself into the multi-megabyte transfer we're trying to avoid.
+      headers: { Range: 'bytes=0-0' },
+      signal: controller.signal,
+    })
+    if (res.status === 401) throw new NotAuthedError()
+    if (!res.ok && res.status !== 206) {
+      let message = `Request failed (${res.status})`
+      try {
+        const data = await res.json()
+        message = (data && (data.error || data.detail)) || message
+      } catch {
+        /* non-JSON error body */
+      }
+      throw new ApiError(message, res.status)
     }
-    throw new ApiError(message, res.status)
+    // Headers are all we needed — drop the connection so a server that ignored
+    // the Range header doesn't keep streaming the whole file at us.
+    controller.abort()
+  } finally {
+    signal?.removeEventListener('abort', abort)
   }
-  return res.blob()
 }
 
 /** Free-form chat over a single meeting's transcript. `messages` is the running

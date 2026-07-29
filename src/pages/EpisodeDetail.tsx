@@ -5,7 +5,7 @@ import { useAppData } from '../store/AppData'
 import { useSentiment } from '../store/Sentiment'
 import { downloadSummary } from '../lib/exportSummary'
 import { downloadSummaryPdf } from '../lib/pdfRender'
-import { ApiError, chatMeeting, emailEpisodeSummary, fetchMeetingRecording, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
+import { ApiError, chatMeeting, checkMeetingRecording, emailEpisodeSummary, meetingRecordingUrl, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
 import { addRecipient, loadRecipients, removeRecipient } from '../lib/recipientsStore'
 import { formatDuration, longDate, statusMeta } from '../lib/format'
 import type { Episode, EpisodeInsight, ProcessingStatus, QuantPoint, Takeaway, TranscriptSegment } from '../lib/types'
@@ -1000,7 +1000,7 @@ function TranscriptTab({
   if (!segments.length) {
     return (
       <div className="flex flex-col gap-gutter">
-        <RecordingBar episode={episode} />
+        <RecordingBar key={episode.id} episode={episode} />
         <div className="grid place-items-center gap-sm rounded-2xl border border-dashed border-outline-variant bg-surface-container-low py-xl text-center">
           <Icon name="graphic_eq" size={32} className="text-outline" />
           <h3 className="text-[19px] font-semibold text-on-surface-variant">No transcript yet</h3>
@@ -1024,7 +1024,7 @@ function TranscriptTab({
 
   return (
     <div className="flex flex-col gap-gutter">
-      <RecordingBar episode={episode} />
+      <RecordingBar key={episode.id} episode={episode} />
       <div className="grid grid-cols-12 gap-gutter">
       {/* Highlights */}
       <aside className="col-span-12 md:col-span-4">
@@ -1093,78 +1093,66 @@ function TranscriptTab({
 // fetch — same session-scoped Worker route, same ACL), cached after the first
 // successful load so Play and Download share one blob instead of refetching.
 // A failed fetch leaves the blob unset, so either button retries on the next click.
+// The recording is served straight from /api/recording — never pulled into a
+// Blob first. These files run tens of MB over a path whose throughput swings
+// wildly (~11 KB/s to ~4 MB/s on back-to-back requests for the same meeting),
+// and buffering the whole thing in JS meant a single unlucky connection lost
+// everything and showed "Failed to fetch". Handing the URL to <audio> and to a
+// download link lets the browser's own media/download stacks do the transfer:
+// they issue range requests, start playback on the first chunk, and survive
+// interruptions that would kill a one-shot fetch.
 function RecordingBar({ episode }: { episode: Episode }) {
-  const [status, setStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle')
+  const [status, setStatus] = useState<'idle' | 'ready' | 'error'>('idle')
   const [error, setError] = useState<string | null>(null)
-  const [audioUrl, setAudioUrl] = useState<string | null>(null)
-  const [pending, setPending] = useState<'play' | 'download' | null>(null)
-  const blobRef = useRef<Blob | null>(null)
-  const fetchRef = useRef<Promise<Blob | null> | null>(null)
+  const [downloading, setDownloading] = useState(false)
+  const src = meetingRecordingUrl(episode)
+  const fileName = `${(episode.title || 'meeting-recording').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.webm`
 
-  useEffect(() => {
-    // Reset for a freshly opened meeting — a stale blob/URL from the previous
-    // episode must never bleed into this one.
-    blobRef.current = null
-    fetchRef.current = null
-    setStatus('idle')
+  // Mounts the player synchronously inside the click, so playback begins under
+  // the user activation that triggered it — browsers that require audible media
+  // to start within that activation (iOS Safari) would otherwise refuse, and
+  // "Play" would just reveal a player the user has to press again. The
+  // availability check runs alongside rather than in front of it: it exists to
+  // replace a generic media error with the Worker's specific reason ("deleted
+  // per the retention policy", …), not to gate playback.
+  function handlePlay() {
     setError(null)
-    setAudioUrl(null)
-  }, [episode.id])
-
-  useEffect(() => {
-    return () => {
-      if (audioUrl) URL.revokeObjectURL(audioUrl)
-    }
-  }, [audioUrl])
-
-  // Play and Download both call this; clicking both before the first fetch
-  // resolves must not fire two parallel multi-MB downloads whose results
-  // race — the loser (even a stale failure) would otherwise clobber the
-  // winner's state. Share one in-flight fetch across concurrent callers.
-  function ensureBlob(): Promise<Blob | null> {
-    if (blobRef.current) return Promise.resolve(blobRef.current)
-    if (fetchRef.current) return fetchRef.current
-    setStatus('loading')
-    setError(null)
-    const promise = fetchMeetingRecording(episode)
-      .then((blob) => {
-        blobRef.current = blob
-        setAudioUrl(URL.createObjectURL(blob))
-        setStatus('ready')
-        return blob
-      })
-      .catch((err) => {
-        setError((err as Error)?.message || 'Could not load the recording. Please try again.')
-        setStatus('error')
-        return null
-      })
-      .finally(() => {
-        fetchRef.current = null
-      })
-    fetchRef.current = promise
-    return promise
+    setStatus('ready')
   }
 
-  async function handlePlay() {
-    setPending('play')
-    await ensureBlob()
-    setPending(null)
-  }
+  useEffect(() => {
+    if (status !== 'ready') return
+    const controller = new AbortController()
+    checkMeetingRecording(episode, controller.signal).catch((err) => {
+      if (controller.signal.aborted || (err as Error)?.name === 'AbortError') return
+      setError((err as Error)?.message || 'Could not load the recording. Please try again.')
+      setStatus('error')
+    })
+    return () => controller.abort()
+  }, [status, episode])
 
+  // Verify before handing the URL to the browser's downloader: on an
+  // unavailable recording the endpoint answers with a JSON error, which would
+  // otherwise be saved to disk as a .webm file. Downloads aren't bound by the
+  // media-activation rule above, so the check can precede the click.
   async function handleDownload() {
-    setPending('download')
-    const blob = await ensureBlob()
-    if (blob) {
-      const url = URL.createObjectURL(blob)
+    setDownloading(true)
+    setError(null)
+    try {
+      await checkMeetingRecording(episode)
       const a = document.createElement('a')
-      a.href = url
-      a.download = `${(episode.title || 'meeting-recording').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.webm`
+      a.href = src
+      a.download = fileName
       document.body.appendChild(a)
       a.click()
       a.remove()
-      setTimeout(() => URL.revokeObjectURL(url), 10_000)
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') return
+      setError((err as Error)?.message || 'Could not download the recording. Please try again.')
+      setStatus('error')
+    } finally {
+      setDownloading(false)
     }
-    setPending(null)
   }
 
   return (
@@ -1176,33 +1164,175 @@ function RecordingBar({ episode }: { episode: Episode }) {
         <h3 className="text-[15px] font-semibold text-on-surface">Meeting recording</h3>
         {status === 'error' ? (
           <p className="text-metadata text-error">{error}</p>
-        ) : status === 'ready' && audioUrl ? (
-          <audio controls src={audioUrl} className="mt-1.5 h-9 w-full max-w-md" />
+        ) : status === 'ready' ? (
+          <RecordingPlayer
+            src={src}
+            fallbackDurationSec={episode.durationSec}
+            onError={() => {
+              setError('The recording stopped loading. Please try again.')
+              setStatus('error')
+            }}
+          />
         ) : (
           <p className="text-metadata text-secondary">
-            {status === 'loading' ? 'Loading the recorded audio…' : 'Play or download the audio recorded for this meeting.'}
+            Play or download the audio recorded for this meeting.
           </p>
         )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {status !== 'ready' && (
           <button
-            onClick={() => void handlePlay()}
-            disabled={status === 'loading'}
-            className="press inline-flex items-center gap-1.5 rounded-lg border border-outline-variant bg-surface px-3 py-2 text-metadata font-semibold text-on-surface hover:bg-surface-container-low disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={handlePlay}
+            className="press inline-flex items-center gap-1.5 rounded-lg border border-outline-variant bg-surface px-3 py-2 text-metadata font-semibold text-on-surface hover:bg-surface-container-low"
           >
-            <Icon name={pending === 'play' ? 'progress_activity' : 'play_arrow'} size={16} className={pending === 'play' ? 'animate-spin' : ''} />
+            <Icon name="play_arrow" size={16} />
             Play
           </button>
         )}
+        {/* Handed to the browser's own download manager — progress, resume, and
+            nothing buffered in memory. */}
         <button
           onClick={() => void handleDownload()}
-          disabled={status === 'loading'}
+          disabled={downloading}
           className="press inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container disabled:cursor-not-allowed disabled:opacity-50"
         >
-          <Icon name={pending === 'download' ? 'progress_activity' : 'download'} size={16} className={pending === 'download' ? 'animate-spin' : ''} />
+          <Icon
+            name={downloading ? 'progress_activity' : 'download'}
+            size={16}
+            className={downloading ? 'animate-spin' : ''}
+          />
           Download
         </button>
+      </div>
+    </div>
+  )
+}
+
+function formatClock(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return '0:00'
+  const total = Math.floor(sec)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`
+}
+
+/** Scrubbable player for a meeting recording. Seeking works because the Worker
+ *  forwards Range headers to the backend, so the browser can jump to any offset
+ *  without having downloaded what came before.
+ *
+ *  `fallbackDurationSec` matters: these recordings are WebM written by a live
+ *  capture, and such files routinely carry no duration in their header — the
+ *  element reports Infinity until the whole thing has been read. The meeting's
+ *  own known length stands in so the scrubber is usable from the first second. */
+function RecordingPlayer({
+  src,
+  fallbackDurationSec,
+  onError,
+}: {
+  src: string
+  fallbackDurationSec?: number
+  onError: () => void
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const [playing, setPlaying] = useState(false)
+  const [current, setCurrent] = useState(0)
+  const [reported, setReported] = useState(0)
+  const [buffered, setBuffered] = useState(0)
+  const [scrubbing, setScrubbing] = useState(false)
+
+  const duration =
+    Number.isFinite(reported) && reported > 0
+      ? reported
+      : fallbackDurationSec && fallbackDurationSec > 0
+      ? fallbackDurationSec
+      : 0
+  const pct = duration > 0 ? Math.min(100, (current / duration) * 100) : 0
+  const bufferedPct = duration > 0 ? Math.min(100, (buffered / duration) * 100) : 0
+
+  function toggle() {
+    const el = audioRef.current
+    if (!el) return
+    if (el.paused) void el.play()
+    else el.pause()
+  }
+
+  function seekTo(value: number) {
+    const el = audioRef.current
+    if (!el || duration <= 0) return
+    // Show the new position immediately; the element catches up once the range
+    // request for that offset lands.
+    setCurrent(value)
+    el.currentTime = value
+  }
+
+  return (
+    <div className="mt-1.5 w-full max-w-md">
+      <audio
+        ref={audioRef}
+        autoPlay
+        preload="metadata"
+        src={src}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+        onDurationChange={(e) => setReported(e.currentTarget.duration)}
+        onLoadedMetadata={(e) => setReported(e.currentTarget.duration)}
+        onTimeUpdate={(e) => {
+          if (!scrubbing) setCurrent(e.currentTarget.currentTime)
+        }}
+        onProgress={(e) => {
+          const el = e.currentTarget
+          if (el.buffered.length) setBuffered(el.buffered.end(el.buffered.length - 1))
+        }}
+        onError={onError}
+        className="hidden"
+      />
+      <div className="flex items-center gap-2.5">
+        <button
+          onClick={toggle}
+          aria-label={playing ? 'Pause recording' : 'Play recording'}
+          className="press grid h-8 w-8 shrink-0 place-items-center rounded-full bg-primary text-on-primary hover:bg-primary-container"
+        >
+          <Icon name={playing ? 'pause' : 'play_arrow'} size={18} fill />
+        </button>
+        <span className="shrink-0 tabular-nums text-metadata text-secondary">{formatClock(current)}</span>
+        <div className="relative flex min-w-0 flex-1 items-center">
+          {/* Track + buffered fill sit behind the range input, which stays
+              transparent so it keeps native keyboard and drag behaviour. */}
+          <div className="pointer-events-none absolute inset-x-0 h-1.5 overflow-hidden rounded-full bg-surface-container-high">
+            <div className="h-full bg-outline-variant" style={{ width: `${bufferedPct}%` }} />
+          </div>
+          <div
+            className="pointer-events-none absolute h-1.5 rounded-full bg-primary"
+            style={{ width: `${pct}%` }}
+          />
+          <input
+            type="range"
+            min={0}
+            max={duration || 0}
+            step={0.1}
+            value={current}
+            disabled={duration <= 0}
+            onMouseDown={() => setScrubbing(true)}
+            onTouchStart={() => setScrubbing(true)}
+            onChange={(e) => setCurrent(Number(e.target.value))}
+            onMouseUp={(e) => {
+              setScrubbing(false)
+              seekTo(Number((e.target as HTMLInputElement).value))
+            }}
+            onTouchEnd={(e) => {
+              setScrubbing(false)
+              seekTo(Number((e.target as HTMLInputElement).value))
+            }}
+            onKeyUp={(e) => seekTo(Number((e.target as HTMLInputElement).value))}
+            aria-label="Seek"
+            className="recording-range relative z-10 h-1.5 w-full cursor-pointer appearance-none bg-transparent disabled:cursor-not-allowed"
+          />
+        </div>
+        <span className="shrink-0 tabular-nums text-metadata text-secondary">{formatClock(duration)}</span>
       </div>
     </div>
   )

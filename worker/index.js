@@ -17,13 +17,6 @@ const DEFAULT_LEAVE_ENDPOINT =
 // URL the user is sent to. Override with the CALENDAR_CONNECT_ENDPOINT var.
 const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
   "https://65.1.101.15.nip.io/calendar/connect/start";
-// The recording-audio host — GET {audioApiBase}/{meeting_id} with the
-// server-held X-API-Key returns the recorded webm. Runs on its own port
-// (:8056), a different origin from the join/leave bot API (:8080), under the
-// same /public prefix as /public/join and /public/leave. Override with the
-// AUDIO_ENDPOINT var if the tunnel changes.
-const DEFAULT_AUDIO_ENDPOINT =
-  "http://65.1.101.15.nip.io:8056/public/audio";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
@@ -455,11 +448,6 @@ function calendarApiBase(env) {
   }
 }
 
-// The recording-audio API base (see DEFAULT_AUDIO_ENDPOINT above).
-function audioApiBase(env) {
-  return (env.AUDIO_ENDPOINT || DEFAULT_AUDIO_ENDPOINT).replace(/\/+$/, "");
-}
-
 async function resolveApiBase(env) {
   try {
     const override = await env.KV.get(API_BASE_KEY);
@@ -563,10 +551,12 @@ async function handleTranscripts(request, env) {
 // audio from the bot backend. Same per-meeting ACL as /api/ai (a normal user
 // must own the meeting via meeting_owners or legacy owner_email; admin passes
 // ?owner= to pick whose meeting, since meeting_id alone isn't unique across
-// owners). Fetches GET {audioApiBase}/{meeting_id} with the server-held
-// X-API-Key, the same header dispatchBot already sends for join/leave, just a
-// GET with no body. The audio bytes are streamed straight back to the browser;
-// the API key never reaches the client.
+// owners). Fetches GET {apiBase}/public/audio/{meeting_id} — same origin and
+// same server-held X-API-Key as dispatchBot's /public/join and /public/leave
+// (port 8056 hosted its own copy of this route but wasn't reliably reachable
+// from Cloudflare's network; 8080 is proven to work), just a GET with no
+// body. The audio bytes are streamed straight back to the browser; the API
+// key never reaches the client.
 async function handleRecording(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
@@ -595,10 +585,15 @@ async function handleRecording(request, env) {
     return json({ error: "Failed to authorize that meeting", detail: String((err && err.message) || err) }, 500);
   }
 
-  const endpoint = `${audioApiBase(env)}/${encodeURIComponent(meetingId)}`;
+  const endpoint = `${await resolveApiBase(env)}/public/audio/${encodeURIComponent(meetingId)}`;
+  // Forward the browser's Range header so <audio> can stream and seek natively
+  // instead of buffering the whole file before playback starts.
+  const upstreamHeaders = { "X-API-Key": env.API_KEY };
+  const range = request.headers.get("Range");
+  if (range) upstreamHeaders["Range"] = range;
   let upstream;
   try {
-    upstream = await fetch(endpoint, { headers: { "X-API-Key": env.API_KEY } });
+    upstream = await fetch(endpoint, { headers: upstreamHeaders });
   } catch (err) {
     return json({ error: "Failed to reach the notetaker service", detail: String((err && err.message) || err) }, 502);
   }
@@ -621,16 +616,35 @@ async function handleRecording(request, env) {
     return json({ error: message }, 404);
   }
   if (!upstream.ok) {
+    // Don't flatten everything to 502: a 401/403 from upstream is a permanent
+    // configuration failure (e.g. an expired server-held API key). Report it as
+    // 503 so the client shows it immediately instead of retrying a request that
+    // can never succeed. (Never surface upstream's own 401 verbatim — that
+    // would read as "your session expired" and sign the user out.)
+    if (upstream.status === 401 || upstream.status === 403) {
+      return json(
+        {
+          error: "The notetaker service rejected this request — the server's API key may need renewing",
+          detail: `Upstream returned ${upstream.status}`,
+        },
+        503
+      );
+    }
     return json({ error: "Failed to fetch the recording", detail: `Upstream returned ${upstream.status}` }, 502);
   }
 
-  return new Response(upstream.body, {
-    status: 200,
-    headers: {
-      "Content-Type": upstream.headers.get("Content-Type") || "audio/webm",
-      "Cache-Control": "private, no-store",
-    },
-  });
+  // Pass the upstream status through: 206 (partial) keeps range/seek working in
+  // the browser's native player; anything else stays 200.
+  const headers = {
+    "Content-Type": upstream.headers.get("Content-Type") || "audio/webm",
+    "Cache-Control": "private, no-store",
+    "Accept-Ranges": upstream.headers.get("Accept-Ranges") || "bytes",
+  };
+  for (const h of ["Content-Length", "Content-Range", "Content-Disposition"]) {
+    const v = upstream.headers.get(h);
+    if (v) headers[h] = v;
+  }
+  return new Response(upstream.body, { status: upstream.status === 206 ? 206 : 200, headers });
 }
 
 // GET /api/admin/users — admin-only. Every distinct email that could have
