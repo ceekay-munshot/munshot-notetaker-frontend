@@ -195,7 +195,7 @@ function sleep(ms: number): Promise<void> {
 }
 
 /** Fetches a meeting's recorded audio. The Worker proxies the bot backend's
- *  /audio/{meeting_id} with the server-held API key — same ACL as
+ *  /public/audio/{meeting_id} with the server-held API key — same ACL as
  *  summarizeMeeting/chatMeeting, just returning an audio blob instead of
  *  transcript text. Throws ApiError(404) when there's no recording yet
  *  (deleted per retention policy, or the meeting was never recorded).

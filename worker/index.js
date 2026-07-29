@@ -17,13 +17,6 @@ const DEFAULT_LEAVE_ENDPOINT =
 // URL the user is sent to. Override with the CALENDAR_CONNECT_ENDPOINT var.
 const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
   "https://65.1.101.15.nip.io/calendar/connect/start";
-// The recording-audio host — GET {audioApiBase}/{meeting_id} with the
-// server-held X-API-Key returns the recorded webm. Runs on its own port
-// (:8056), a different origin from the join/leave bot API (:8080), under the
-// same /public prefix as /public/join and /public/leave. Override with the
-// AUDIO_ENDPOINT var if the tunnel changes.
-const DEFAULT_AUDIO_ENDPOINT =
-  "http://65.1.101.15.nip.io:8056/public/audio";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
@@ -455,11 +448,6 @@ function calendarApiBase(env) {
   }
 }
 
-// The recording-audio API base (see DEFAULT_AUDIO_ENDPOINT above).
-function audioApiBase(env) {
-  return (env.AUDIO_ENDPOINT || DEFAULT_AUDIO_ENDPOINT).replace(/\/+$/, "");
-}
-
 async function resolveApiBase(env) {
   try {
     const override = await env.KV.get(API_BASE_KEY);
@@ -563,10 +551,12 @@ async function handleTranscripts(request, env) {
 // audio from the bot backend. Same per-meeting ACL as /api/ai (a normal user
 // must own the meeting via meeting_owners or legacy owner_email; admin passes
 // ?owner= to pick whose meeting, since meeting_id alone isn't unique across
-// owners). Fetches GET {audioApiBase}/{meeting_id} with the server-held
-// X-API-Key, the same header dispatchBot already sends for join/leave, just a
-// GET with no body. The audio bytes are streamed straight back to the browser;
-// the API key never reaches the client.
+// owners). Fetches GET {apiBase}/public/audio/{meeting_id} — same origin and
+// same server-held X-API-Key as dispatchBot's /public/join and /public/leave
+// (port 8056 hosted its own copy of this route but wasn't reliably reachable
+// from Cloudflare's network; 8080 is proven to work), just a GET with no
+// body. The audio bytes are streamed straight back to the browser; the API
+// key never reaches the client.
 async function handleRecording(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
@@ -595,7 +585,7 @@ async function handleRecording(request, env) {
     return json({ error: "Failed to authorize that meeting", detail: String((err && err.message) || err) }, 500);
   }
 
-  const endpoint = `${audioApiBase(env)}/${encodeURIComponent(meetingId)}`;
+  const endpoint = `${await resolveApiBase(env)}/public/audio/${encodeURIComponent(meetingId)}`;
   let upstream;
   try {
     upstream = await fetch(endpoint, { headers: { "X-API-Key": env.API_KEY } });
