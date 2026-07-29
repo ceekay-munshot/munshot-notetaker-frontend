@@ -17,6 +17,12 @@ const DEFAULT_LEAVE_ENDPOINT =
 // URL the user is sent to. Override with the CALENDAR_CONNECT_ENDPOINT var.
 const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
   "https://65.1.101.15.nip.io/calendar/connect/start";
+// The recording-audio host — GET {audioApiBase}/{meeting_id} with the
+// server-held X-API-Key returns the recorded webm. Runs on its own port
+// (:8056), a different origin from the join/leave bot API (:8080). Override
+// with the AUDIO_ENDPOINT var if the tunnel changes.
+const DEFAULT_AUDIO_ENDPOINT =
+  "http://65.1.101.15.nip.io:8056/audio";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
@@ -448,6 +454,11 @@ function calendarApiBase(env) {
   }
 }
 
+// The recording-audio API base (see DEFAULT_AUDIO_ENDPOINT above).
+function audioApiBase(env) {
+  return (env.AUDIO_ENDPOINT || DEFAULT_AUDIO_ENDPOINT).replace(/\/+$/, "");
+}
+
 async function resolveApiBase(env) {
   try {
     const override = await env.KV.get(API_BASE_KEY);
@@ -551,9 +562,7 @@ async function handleTranscripts(request, env) {
 // audio from the bot backend. Same per-meeting ACL as /api/ai (a normal user
 // must own the meeting via meeting_owners or legacy owner_email; admin passes
 // ?owner= to pick whose meeting, since meeting_id alone isn't unique across
-// owners). `platform` + `native_meeting_id` are read from the D1 `meetings`
-// table (see resolveMeetingsJoinColumns) and used to build the upstream call —
-// GET {apiBase}/audio/{platform}/{native_meeting_id} with the server-held
+// owners). Fetches GET {audioApiBase}/{meeting_id} with the server-held
 // X-API-Key, the same header dispatchBot already sends for join/leave, just a
 // GET with no body. The audio bytes are streamed straight back to the browser;
 // the API key never reaches the client.
@@ -585,11 +594,7 @@ async function handleRecording(request, env) {
     return json({ error: "Failed to authorize that meeting", detail: String((err && err.message) || err) }, 500);
   }
 
-  const source = await d1MeetingRecordingSource(env, meetingId);
-  if (!source) return json({ error: "No recording available for this meeting yet" }, 404);
-
-  const base = await resolveApiBase(env);
-  const endpoint = `${base}/audio/${encodeURIComponent(source.platform)}/${encodeURIComponent(source.nativeMeetingId)}`;
+  const endpoint = `${audioApiBase(env)}/${encodeURIComponent(meetingId)}`;
   let upstream;
   try {
     upstream = await fetch(endpoint, { headers: { "X-API-Key": env.API_KEY } });
@@ -614,29 +619,6 @@ async function handleRecording(request, env) {
       "Cache-Control": "private, no-store",
     },
   });
-}
-
-// Resolves { platform, nativeMeetingId } for one meeting_id from the D1
-// `meetings` table, trying each candidate join column in turn (see
-// resolveMeetingsJoinColumns). Returns null if the table isn't present or no
-// row for this meeting carries a native_meeting_id yet.
-async function d1MeetingRecordingSource(env, meetingId) {
-  const columns = await resolveMeetingsJoinColumns(env);
-  const id = String(meetingId).trim();
-  for (const col of columns) {
-    try {
-      const res = await env.DB.prepare(
-        `SELECT platform, native_meeting_id FROM meetings WHERE CAST(${col} AS TEXT) = ?1 LIMIT 1`
-      ).bind(id).all();
-      const row = res && res.results && res.results[0];
-      if (row && row.native_meeting_id) {
-        return { platform: String(row.platform || "").trim(), nativeMeetingId: String(row.native_meeting_id).trim() };
-      }
-    } catch {
-      /* this column didn't resolve — the next candidate, if any, still gets a chance */
-    }
-  }
-  return null;
 }
 
 // GET /api/admin/users — admin-only. Every distinct email that could have
