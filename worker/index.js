@@ -19,10 +19,11 @@ const DEFAULT_CALENDAR_CONNECT_ENDPOINT =
   "https://65.1.101.15.nip.io/calendar/connect/start";
 // The recording-audio host — GET {audioApiBase}/{meeting_id} with the
 // server-held X-API-Key returns the recorded webm. Runs on its own port
-// (:8056), a different origin from the join/leave bot API (:8080). Override
-// with the AUDIO_ENDPOINT var if the tunnel changes.
+// (:8056), a different origin from the join/leave bot API (:8080), under the
+// same /public prefix as /public/join and /public/leave. Override with the
+// AUDIO_ENDPOINT var if the tunnel changes.
 const DEFAULT_AUDIO_ENDPOINT =
-  "http://65.1.101.15.nip.io:8056/audio";
+  "http://65.1.101.15.nip.io:8056/public/audio";
 
 const SCHEDULE_PREFIX = "schedule:";
 const MAX_SCHEDULES_PER_USER = 50;
