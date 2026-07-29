@@ -586,9 +586,14 @@ async function handleRecording(request, env) {
   }
 
   const endpoint = `${await resolveApiBase(env)}/public/audio/${encodeURIComponent(meetingId)}`;
+  // Forward the browser's Range header so <audio> can stream and seek natively
+  // instead of buffering the whole file before playback starts.
+  const upstreamHeaders = { "X-API-Key": env.API_KEY };
+  const range = request.headers.get("Range");
+  if (range) upstreamHeaders["Range"] = range;
   let upstream;
   try {
-    upstream = await fetch(endpoint, { headers: { "X-API-Key": env.API_KEY } });
+    upstream = await fetch(endpoint, { headers: upstreamHeaders });
   } catch (err) {
     return json({ error: "Failed to reach the notetaker service", detail: String((err && err.message) || err) }, 502);
   }
@@ -611,16 +616,35 @@ async function handleRecording(request, env) {
     return json({ error: message }, 404);
   }
   if (!upstream.ok) {
+    // Don't flatten everything to 502: a 401/403 from upstream is a permanent
+    // configuration failure (e.g. an expired server-held API key). Report it as
+    // 503 so the client shows it immediately instead of retrying a request that
+    // can never succeed. (Never surface upstream's own 401 verbatim — that
+    // would read as "your session expired" and sign the user out.)
+    if (upstream.status === 401 || upstream.status === 403) {
+      return json(
+        {
+          error: "The notetaker service rejected this request — the server's API key may need renewing",
+          detail: `Upstream returned ${upstream.status}`,
+        },
+        503
+      );
+    }
     return json({ error: "Failed to fetch the recording", detail: `Upstream returned ${upstream.status}` }, 502);
   }
 
-  return new Response(upstream.body, {
-    status: 200,
-    headers: {
-      "Content-Type": upstream.headers.get("Content-Type") || "audio/webm",
-      "Cache-Control": "private, no-store",
-    },
-  });
+  // Pass the upstream status through: 206 (partial) keeps range/seek working in
+  // the browser's native player; anything else stays 200.
+  const headers = {
+    "Content-Type": upstream.headers.get("Content-Type") || "audio/webm",
+    "Cache-Control": "private, no-store",
+    "Accept-Ranges": upstream.headers.get("Accept-Ranges") || "bytes",
+  };
+  for (const h of ["Content-Length", "Content-Range", "Content-Disposition"]) {
+    const v = upstream.headers.get(h);
+    if (v) headers[h] = v;
+  }
+  return new Response(upstream.body, { status: upstream.status === 206 ? 206 : 200, headers });
 }
 
 // GET /api/admin/users — admin-only. Every distinct email that could have

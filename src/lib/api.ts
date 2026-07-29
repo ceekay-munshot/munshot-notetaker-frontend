@@ -188,82 +188,62 @@ export async function summarizeMeeting(
   return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
 }
 
-const RECORDING_FETCH_ATTEMPTS = 5
-/** Per-attempt ceiling. The path between Cloudflare and the recording backend is
- *  intermittently congested: a healthy connection delivers the whole file at
- *  ~4 MB/s (a 30 MB recording lands in seconds), while a degraded one crawls at
- *  ~11 KB/s — which would take ~45 minutes and never fails on its own, it just
- *  hangs. Both were observed on back-to-back requests for the same meeting. So
- *  cap each attempt: a stalled transfer is abandoned fast and retried on a
- *  fresh connection instead of hanging the UI indefinitely. */
-const RECORDING_ATTEMPT_TIMEOUT_MS = 40_000
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function isAbortError(err: unknown): boolean {
-  return (err as Error | undefined)?.name === 'AbortError'
-}
-
-/** Fetches a meeting's recorded audio. The Worker proxies the bot backend's
- *  /public/audio/{meeting_id} with the server-held API key — same ACL as
- *  summarizeMeeting/chatMeeting, just returning an audio blob instead of
- *  transcript text. Throws ApiError(404) when there's no recording yet
- *  (deleted per retention policy, or the meeting was never recorded).
+/** The Worker route serving a meeting's recorded audio. Safe to hand straight to
+ *  an <audio src> or a download link: it's same-origin, so the session cookie
+ *  rides along, and the Worker forwards Range requests to the backend — so the
+ *  browser streams and seeks natively instead of buffering the whole file.
  *
- *  Recordings run tens of MB over a flaky path, so a transfer can either drop
- *  mid-stream (a network error out of res.blob(), even after a 200) or stall to
- *  a crawl and never finish. Both are transient and per-connection, so each
- *  attempt is time-boxed and retried; a real 404/401 is not. `onAttempt` fires
- *  before each try so the UI can show which retry is running. */
-export async function fetchMeetingRecording(
-  episode: Episode,
-  onAttempt?: (attempt: number, total: number) => void,
-): Promise<Blob> {
+ *  Recordings run tens of MB over an intermittently congested path (observed
+ *  anywhere from ~11 KB/s to ~4 MB/s on back-to-back requests for the same
+ *  meeting). Pulling that into a JS Blob before playing meant one unlucky
+ *  connection lost the entire transfer; the browser's own media and download
+ *  stacks handle ranges, partial reads, and interruptions far better, so the
+ *  bytes never pass through application code. */
+export function meetingRecordingUrl(episode: Episode): string {
   const { owner, meetingId } = decodeMeetingId(episode.id)
   const params = new URLSearchParams({ meeting_id: meetingId })
   if (owner) params.set('owner', owner)
-  const url = `/api/recording?${params.toString()}`
+  return `/api/recording?${params.toString()}`
+}
 
-  let lastErr: unknown
-  for (let attempt = 1; attempt <= RECORDING_FETCH_ATTEMPTS; attempt++) {
-    onAttempt?.(attempt, RECORDING_FETCH_ATTEMPTS)
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), RECORDING_ATTEMPT_TIMEOUT_MS)
-    try {
-      const res = await fetch(url, { credentials: 'same-origin', signal: controller.signal })
-      if (res.status === 401) throw new NotAuthedError()
-      if (!res.ok) {
-        let message = `Request failed (${res.status})`
-        try {
-          const data = await res.json()
-          message = (data && (data.error || data.detail)) || message
-        } catch {
-          /* non-JSON error body */
-        }
-        // 502 means the Worker itself couldn't reach/finish talking to the
-        // notetaker backend — worth a retry. Everything else (404, etc.) is
-        // a definitive answer that a retry won't change.
-        if (res.status !== 502) throw new ApiError(message, res.status)
-        lastErr = new ApiError(message, res.status)
-      } else {
-        // The body is still streaming at this point — a 200 only means headers
-        // arrived. A drop throws here; a stall trips the abort above.
-        return await res.blob()
+/** Checks whether a meeting's recording exists, without downloading it. Reads
+ *  only the response headers and then aborts, so this costs a round trip rather
+ *  than tens of MB — the point is to surface the Worker's specific message
+ *  ("deleted per the retention policy", "never recorded", …) before handing the
+ *  URL to a native player, which can only report a generic failure.
+ *
+ *  Throws NotAuthedError on 401 and ApiError otherwise; resolves when the
+ *  recording is available. */
+export async function checkMeetingRecording(episode: Episode, signal?: AbortSignal): Promise<void> {
+  const controller = new AbortController()
+  const abort = () => controller.abort()
+  signal?.addEventListener('abort', abort, { once: true })
+  try {
+    const res = await fetch(meetingRecordingUrl(episode), {
+      credentials: 'same-origin',
+      // Ask for a single byte: enough to confirm the backend can serve this
+      // recording, cheap enough that a congested path can't turn the check
+      // itself into the multi-megabyte transfer we're trying to avoid.
+      headers: { Range: 'bytes=0-0' },
+      signal: controller.signal,
+    })
+    if (res.status === 401) throw new NotAuthedError()
+    if (!res.ok && res.status !== 206) {
+      let message = `Request failed (${res.status})`
+      try {
+        const data = await res.json()
+        message = (data && (data.error || data.detail)) || message
+      } catch {
+        /* non-JSON error body */
       }
-    } catch (err) {
-      if (err instanceof NotAuthedError || err instanceof ApiError) throw err
-      lastErr = err // dropped or stalled mid-stream — retry on a new connection
-    } finally {
-      clearTimeout(timer)
+      throw new ApiError(message, res.status)
     }
-    if (attempt < RECORDING_FETCH_ATTEMPTS) await sleep(500 * attempt)
+    // Headers are all we needed — drop the connection so a server that ignored
+    // the Range header doesn't keep streaming the whole file at us.
+    controller.abort()
+  } finally {
+    signal?.removeEventListener('abort', abort)
   }
-  if (isAbortError(lastErr)) {
-    throw new Error('The recording kept downloading too slowly to finish. Please try again.')
-  }
-  throw lastErr instanceof Error ? lastErr : new Error('Could not load the recording. Please try again.')
 }
 
 /** Free-form chat over a single meeting's transcript. `messages` is the running
