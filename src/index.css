@@ -294,6 +294,43 @@
   transform: scale(0.985);
 }
 
+/* Recording scrubber. The input itself is transparent — the played/buffered
+   fills are painted behind it — so only the thumb is styled here. Vendor
+   pseudo-elements are the only way to reach it, hence plain CSS. */
+.recording-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: #2563eb;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+  cursor: inherit;
+  transition: transform 160ms var(--ease-out);
+}
+.recording-range:active::-webkit-slider-thumb {
+  transform: scale(1.15);
+}
+.recording-range::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: #2563eb;
+  border: 2px solid #ffffff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
+  cursor: inherit;
+}
+.recording-range:disabled::-webkit-slider-thumb {
+  opacity: 0.4;
+}
+.recording-range:disabled::-moz-range-thumb {
+  opacity: 0.4;
+}
+.recording-range::-moz-range-track {
+  background: transparent;
+}
+
 /* Card lift: hover raises, press settles back. Movement, gated to real pointers. */
 .lift {
   transition:

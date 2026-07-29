@@ -1000,7 +1000,7 @@ function TranscriptTab({
   if (!segments.length) {
     return (
       <div className="flex flex-col gap-gutter">
-        <RecordingBar episode={episode} />
+        <RecordingBar key={episode.id} episode={episode} />
         <div className="grid place-items-center gap-sm rounded-2xl border border-dashed border-outline-variant bg-surface-container-low py-xl text-center">
           <Icon name="graphic_eq" size={32} className="text-outline" />
           <h3 className="text-[19px] font-semibold text-on-surface-variant">No transcript yet</h3>
@@ -1024,7 +1024,7 @@ function TranscriptTab({
 
   return (
     <div className="flex flex-col gap-gutter">
-      <RecordingBar episode={episode} />
+      <RecordingBar key={episode.id} episode={episode} />
       <div className="grid grid-cols-12 gap-gutter">
       {/* Highlights */}
       <aside className="col-span-12 md:col-span-4">
@@ -1102,36 +1102,58 @@ function TranscriptTab({
 // they issue range requests, start playback on the first chunk, and survive
 // interruptions that would kill a one-shot fetch.
 function RecordingBar({ episode }: { episode: Episode }) {
-  const [status, setStatus] = useState<'idle' | 'checking' | 'ready' | 'error'>('idle')
+  const [status, setStatus] = useState<'idle' | 'ready' | 'error'>('idle')
   const [error, setError] = useState<string | null>(null)
+  const [downloading, setDownloading] = useState(false)
   const src = meetingRecordingUrl(episode)
   const fileName = `${(episode.title || 'meeting-recording').replace(/[^a-z0-9]+/gi, '-').toLowerCase()}.webm`
 
-  useEffect(() => {
-    // Reset for a freshly opened meeting — a previous episode's state must
-    // never bleed into this one.
-    setStatus('idle')
+  // Mounts the player synchronously inside the click, so playback begins under
+  // the user activation that triggered it — browsers that require audible media
+  // to start within that activation (iOS Safari) would otherwise refuse, and
+  // "Play" would just reveal a player the user has to press again. The
+  // availability check runs alongside rather than in front of it: it exists to
+  // replace a generic media error with the Worker's specific reason ("deleted
+  // per the retention policy", …), not to gate playback.
+  function handlePlay() {
     setError(null)
-  }, [episode.id])
+    setStatus('ready')
+  }
 
-  // Confirms the recording exists (and surfaces the Worker's specific reason if
-  // not) before swapping in the player, which could otherwise only report a
-  // generic media error. Aborts on unmount so navigating away mid-check leaves
-  // nothing running.
   useEffect(() => {
-    if (status !== 'checking') return
+    if (status !== 'ready') return
     const controller = new AbortController()
-    checkMeetingRecording(episode, controller.signal)
-      .then(() => {
-        if (!controller.signal.aborted) setStatus('ready')
-      })
-      .catch((err) => {
-        if (controller.signal.aborted || (err as Error)?.name === 'AbortError') return
-        setError((err as Error)?.message || 'Could not load the recording. Please try again.')
-        setStatus('error')
-      })
+    checkMeetingRecording(episode, controller.signal).catch((err) => {
+      if (controller.signal.aborted || (err as Error)?.name === 'AbortError') return
+      setError((err as Error)?.message || 'Could not load the recording. Please try again.')
+      setStatus('error')
+    })
     return () => controller.abort()
   }, [status, episode])
+
+  // Verify before handing the URL to the browser's downloader: on an
+  // unavailable recording the endpoint answers with a JSON error, which would
+  // otherwise be saved to disk as a .webm file. Downloads aren't bound by the
+  // media-activation rule above, so the check can precede the click.
+  async function handleDownload() {
+    setDownloading(true)
+    setError(null)
+    try {
+      await checkMeetingRecording(episode)
+      const a = document.createElement('a')
+      a.href = src
+      a.download = fileName
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+    } catch (err) {
+      if ((err as Error)?.name === 'AbortError') return
+      setError((err as Error)?.message || 'Could not download the recording. Please try again.')
+      setStatus('error')
+    } finally {
+      setDownloading(false)
+    }
+  }
 
   return (
     <div className="flex flex-wrap items-center gap-3 rounded-2xl border border-outline-variant bg-surface-container-lowest p-md shadow-card">
@@ -1143,50 +1165,174 @@ function RecordingBar({ episode }: { episode: Episode }) {
         {status === 'error' ? (
           <p className="text-metadata text-error">{error}</p>
         ) : status === 'ready' ? (
-          <audio
-            controls
-            autoPlay
-            preload="metadata"
+          <RecordingPlayer
             src={src}
+            fallbackDurationSec={episode.durationSec}
             onError={() => {
               setError('The recording stopped loading. Please try again.')
               setStatus('error')
             }}
-            className="mt-1.5 h-9 w-full max-w-md"
           />
         ) : (
           <p className="text-metadata text-secondary">
-            {status === 'checking'
-              ? 'Loading the recorded audio…'
-              : 'Play or download the audio recorded for this meeting.'}
+            Play or download the audio recorded for this meeting.
           </p>
         )}
       </div>
       <div className="flex shrink-0 items-center gap-2">
         {status !== 'ready' && (
           <button
-            onClick={() => setStatus('checking')}
-            disabled={status === 'checking'}
-            className="press inline-flex items-center gap-1.5 rounded-lg border border-outline-variant bg-surface px-3 py-2 text-metadata font-semibold text-on-surface hover:bg-surface-container-low disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={handlePlay}
+            className="press inline-flex items-center gap-1.5 rounded-lg border border-outline-variant bg-surface px-3 py-2 text-metadata font-semibold text-on-surface hover:bg-surface-container-low"
           >
-            <Icon
-              name={status === 'checking' ? 'progress_activity' : 'play_arrow'}
-              size={16}
-              className={status === 'checking' ? 'animate-spin' : ''}
-            />
+            <Icon name="play_arrow" size={16} />
             Play
           </button>
         )}
-        {/* A real link, not a fetch: the browser downloads it with its own
-            download manager — progress, resume, and no 30MB held in memory. */}
-        <a
-          href={src}
-          download={fileName}
-          className="press inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container"
+        {/* Handed to the browser's own download manager — progress, resume, and
+            nothing buffered in memory. */}
+        <button
+          onClick={() => void handleDownload()}
+          disabled={downloading}
+          className="press inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container disabled:cursor-not-allowed disabled:opacity-50"
         >
-          <Icon name="download" size={16} />
+          <Icon
+            name={downloading ? 'progress_activity' : 'download'}
+            size={16}
+            className={downloading ? 'animate-spin' : ''}
+          />
           Download
-        </a>
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function formatClock(sec: number): string {
+  if (!Number.isFinite(sec) || sec < 0) return '0:00'
+  const total = Math.floor(sec)
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    : `${m}:${String(s).padStart(2, '0')}`
+}
+
+/** Scrubbable player for a meeting recording. Seeking works because the Worker
+ *  forwards Range headers to the backend, so the browser can jump to any offset
+ *  without having downloaded what came before.
+ *
+ *  `fallbackDurationSec` matters: these recordings are WebM written by a live
+ *  capture, and such files routinely carry no duration in their header — the
+ *  element reports Infinity until the whole thing has been read. The meeting's
+ *  own known length stands in so the scrubber is usable from the first second. */
+function RecordingPlayer({
+  src,
+  fallbackDurationSec,
+  onError,
+}: {
+  src: string
+  fallbackDurationSec?: number
+  onError: () => void
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+  const [playing, setPlaying] = useState(false)
+  const [current, setCurrent] = useState(0)
+  const [reported, setReported] = useState(0)
+  const [buffered, setBuffered] = useState(0)
+  const [scrubbing, setScrubbing] = useState(false)
+
+  const duration =
+    Number.isFinite(reported) && reported > 0
+      ? reported
+      : fallbackDurationSec && fallbackDurationSec > 0
+      ? fallbackDurationSec
+      : 0
+  const pct = duration > 0 ? Math.min(100, (current / duration) * 100) : 0
+  const bufferedPct = duration > 0 ? Math.min(100, (buffered / duration) * 100) : 0
+
+  function toggle() {
+    const el = audioRef.current
+    if (!el) return
+    if (el.paused) void el.play()
+    else el.pause()
+  }
+
+  function seekTo(value: number) {
+    const el = audioRef.current
+    if (!el || duration <= 0) return
+    // Show the new position immediately; the element catches up once the range
+    // request for that offset lands.
+    setCurrent(value)
+    el.currentTime = value
+  }
+
+  return (
+    <div className="mt-1.5 w-full max-w-md">
+      <audio
+        ref={audioRef}
+        autoPlay
+        preload="metadata"
+        src={src}
+        onPlay={() => setPlaying(true)}
+        onPause={() => setPlaying(false)}
+        onEnded={() => setPlaying(false)}
+        onDurationChange={(e) => setReported(e.currentTarget.duration)}
+        onLoadedMetadata={(e) => setReported(e.currentTarget.duration)}
+        onTimeUpdate={(e) => {
+          if (!scrubbing) setCurrent(e.currentTarget.currentTime)
+        }}
+        onProgress={(e) => {
+          const el = e.currentTarget
+          if (el.buffered.length) setBuffered(el.buffered.end(el.buffered.length - 1))
+        }}
+        onError={onError}
+        className="hidden"
+      />
+      <div className="flex items-center gap-2.5">
+        <button
+          onClick={toggle}
+          aria-label={playing ? 'Pause recording' : 'Play recording'}
+          className="press grid h-8 w-8 shrink-0 place-items-center rounded-full bg-primary text-on-primary hover:bg-primary-container"
+        >
+          <Icon name={playing ? 'pause' : 'play_arrow'} size={18} fill />
+        </button>
+        <span className="shrink-0 tabular-nums text-metadata text-secondary">{formatClock(current)}</span>
+        <div className="relative flex min-w-0 flex-1 items-center">
+          {/* Track + buffered fill sit behind the range input, which stays
+              transparent so it keeps native keyboard and drag behaviour. */}
+          <div className="pointer-events-none absolute inset-x-0 h-1.5 overflow-hidden rounded-full bg-surface-container-high">
+            <div className="h-full bg-outline-variant" style={{ width: `${bufferedPct}%` }} />
+          </div>
+          <div
+            className="pointer-events-none absolute h-1.5 rounded-full bg-primary"
+            style={{ width: `${pct}%` }}
+          />
+          <input
+            type="range"
+            min={0}
+            max={duration || 0}
+            step={0.1}
+            value={current}
+            disabled={duration <= 0}
+            onMouseDown={() => setScrubbing(true)}
+            onTouchStart={() => setScrubbing(true)}
+            onChange={(e) => setCurrent(Number(e.target.value))}
+            onMouseUp={(e) => {
+              setScrubbing(false)
+              seekTo(Number((e.target as HTMLInputElement).value))
+            }}
+            onTouchEnd={(e) => {
+              setScrubbing(false)
+              seekTo(Number((e.target as HTMLInputElement).value))
+            }}
+            onKeyUp={(e) => seekTo(Number((e.target as HTMLInputElement).value))}
+            aria-label="Seek"
+            className="recording-range relative z-10 h-1.5 w-full cursor-pointer appearance-none bg-transparent disabled:cursor-not-allowed"
+          />
+        </div>
+        <span className="shrink-0 tabular-nums text-metadata text-secondary">{formatClock(duration)}</span>
       </div>
     </div>
   )
