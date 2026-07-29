@@ -988,6 +988,7 @@ function TranscriptTab({
     focusId ? { id: focusId, label: focusLabel } : null,
   )
   const [q, setQ] = useState('')
+  const [seekRequest, setSeekRequest] = useState<{ sec: number; tick: number } | null>(null)
   const segments = episode.transcript ?? []
   const highlights = episode.summary?.highlights.filter((h) => h.segmentId) ?? []
 
@@ -1022,9 +1023,16 @@ function TranscriptTab({
     if (segmentId) document.getElementById(`seg-${segmentId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 
+  // Clicking a transcript timestamp moves the recording to that moment. The
+  // counter makes each click a distinct request, so clicking the same line
+  // twice (after scrubbing away) still seeks back to it.
+  function seekRecording(sec: number) {
+    setSeekRequest((prev) => ({ sec, tick: (prev?.tick ?? 0) + 1 }))
+  }
+
   return (
     <div className="flex flex-col gap-gutter">
-      <RecordingBar key={episode.id} episode={episode} />
+      <RecordingBar key={episode.id} episode={episode} seekRequest={seekRequest} />
       <div className="grid grid-cols-12 gap-gutter">
       {/* Highlights */}
       <aside className="col-span-12 md:col-span-4">
@@ -1079,6 +1087,7 @@ function TranscriptTab({
               focused={focus?.id === seg.id}
               focusLabel={focus?.id === seg.id ? focus.label : undefined}
               sentimentOn={sentimentOn}
+              onSeekAudio={seekRecording}
             />
           ))}
           {visible.length === 0 && <p className="py-md text-center text-metadata text-secondary">No lines match “{q}”.</p>}
@@ -1101,7 +1110,15 @@ function TranscriptTab({
 // download link lets the browser's own media/download stacks do the transfer:
 // they issue range requests, start playback on the first chunk, and survive
 // interruptions that would kill a one-shot fetch.
-function RecordingBar({ episode }: { episode: Episode }) {
+function RecordingBar({
+  episode,
+  seekRequest,
+}: {
+  episode: Episode
+  /** Set when a transcript timestamp is clicked. Opens the player if it isn't
+   *  open yet, then jumps to that moment. */
+  seekRequest?: { sec: number; tick: number } | null
+}) {
   const [status, setStatus] = useState<'idle' | 'ready' | 'error'>('idle')
   const [error, setError] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
@@ -1119,6 +1136,14 @@ function RecordingBar({ episode }: { episode: Episode }) {
     setError(null)
     setStatus('ready')
   }
+
+  // A timestamp click is itself the user activation, so mounting the player
+  // here keeps playback inside it exactly as the Play button does.
+  useEffect(() => {
+    if (!seekRequest) return
+    setError(null)
+    setStatus('ready')
+  }, [seekRequest])
 
   useEffect(() => {
     if (status !== 'ready') return
@@ -1168,6 +1193,7 @@ function RecordingBar({ episode }: { episode: Episode }) {
           <RecordingPlayer
             src={src}
             fallbackDurationSec={episode.durationSec}
+            seekRequest={seekRequest}
             onError={() => {
               setError('The recording stopped loading. Please try again.')
               setStatus('error')
@@ -1208,6 +1234,20 @@ function RecordingBar({ episode }: { episode: Episode }) {
   )
 }
 
+/** "14" | "0:14" | "1:02:33" → seconds. Transcript timestamps come from the
+ *  backend as display strings, so this is the only place their shape is
+ *  interpreted. Returns null for anything unparseable rather than guessing. */
+function parseClock(stamp: string): number | null {
+  const parts = String(stamp || '').trim().split(':')
+  if (!parts.length || parts.length > 3) return null
+  // Number('') is 0, so an empty or half-written stamp would otherwise read as
+  // a valid "jump to 0:00".
+  if (parts.some((p) => p.trim() === '')) return null
+  const nums = parts.map((p) => Number(p))
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null
+  return nums.reduce((acc, n) => acc * 60 + n, 0)
+}
+
 function formatClock(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) return '0:00'
   const total = Math.floor(sec)
@@ -1230,10 +1270,12 @@ function formatClock(sec: number): string {
 function RecordingPlayer({
   src,
   fallbackDurationSec,
+  seekRequest,
   onError,
 }: {
   src: string
   fallbackDurationSec?: number
+  seekRequest?: { sec: number; tick: number } | null
   onError: () => void
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -1242,6 +1284,31 @@ function RecordingPlayer({
   const [reported, setReported] = useState(0)
   const [buffered, setBuffered] = useState(0)
   const [scrubbing, setScrubbing] = useState(false)
+  // A seek that arrived before the element could accept one (the player was
+  // mounted by that very click, so it has no metadata yet). Applied as soon as
+  // it's seekable.
+  const pendingSeekRef = useRef<number | null>(null)
+
+  function applySeek(sec: number) {
+    const el = audioRef.current
+    if (!el) return
+    // readyState < HAVE_METADATA means currentTime isn't settable yet.
+    if (el.readyState < 1) {
+      pendingSeekRef.current = sec
+      return
+    }
+    pendingSeekRef.current = null
+    setCurrent(sec)
+    el.currentTime = sec
+    void el.play()
+  }
+
+  useEffect(() => {
+    if (!seekRequest) return
+    applySeek(seekRequest.sec)
+    // Keyed on tick so clicking the same timestamp twice seeks both times.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seekRequest?.tick])
 
   const duration =
     Number.isFinite(reported) && reported > 0
@@ -1279,7 +1346,11 @@ function RecordingPlayer({
         onPause={() => setPlaying(false)}
         onEnded={() => setPlaying(false)}
         onDurationChange={(e) => setReported(e.currentTarget.duration)}
-        onLoadedMetadata={(e) => setReported(e.currentTarget.duration)}
+        onLoadedMetadata={(e) => {
+          setReported(e.currentTarget.duration)
+          const pending = pendingSeekRef.current
+          if (pending != null) applySeek(pending)
+        }}
         onTimeUpdate={(e) => {
           if (!scrubbing) setCurrent(e.currentTarget.currentTime)
         }}
@@ -1345,6 +1416,7 @@ function TranscriptRow({
   focused = false,
   focusLabel,
   sentimentOn,
+  onSeekAudio,
 }: {
   seg: TranscriptSegment
   activeRef: string | null
@@ -1353,6 +1425,9 @@ function TranscriptRow({
   focused?: boolean
   focusLabel?: string
   sentimentOn: boolean
+  /** Moves the recording to this line's moment. Absent when the timestamp
+   *  can't be parsed into an offset, leaving it as plain text. */
+  onSeekAudio?: (sec: number) => void
 }) {
   const isActive = !!seg.highlight && activeRef === seg.highlight.refId
   // Net lean of the whole segment → a thin left accent so a long transcript is
@@ -1362,6 +1437,8 @@ function TranscriptRow({
     const s = analyzeSentiment(seg.text)
     return s.confident ? (s.label === 'pos' ? 'seg-pos' : 'seg-neg') : ''
   }, [seg.text, sentimentOn])
+
+  const seekSec = useMemo(() => parseClock(seg.timestamp), [seg.timestamp])
 
   return (
     <div
@@ -1381,7 +1458,23 @@ function TranscriptRow({
         </p>
       )}
       <div className="grid grid-cols-[64px_84px_1fr] gap-2">
-        <span className="text-metadata font-semibold text-primary">{seg.timestamp}</span>
+        {onSeekAudio && seekSec != null ? (
+          <button
+            onClick={() => onSeekAudio(seekSec)}
+            title="Play the recording from here"
+            className="press group -ml-1 flex items-start gap-0.5 self-start rounded px-1 text-left text-metadata font-semibold text-primary hover:bg-[#eff5ff]"
+          >
+            <Icon
+              name="play_arrow"
+              size={13}
+              className="mt-[3px] shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+              fill
+            />
+            {seg.timestamp}
+          </button>
+        ) : (
+          <span className="text-metadata font-semibold text-primary">{seg.timestamp}</span>
+        )}
         <span className={`text-metadata font-semibold ${seg.role === 'guest' ? 'text-on-surface' : 'text-on-surface-variant'}`}>
           {seg.speaker}
         </span>
