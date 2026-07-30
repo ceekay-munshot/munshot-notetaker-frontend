@@ -116,6 +116,18 @@ export default {
       if (pathname === "/api" || pathname.startsWith("/api/")) {
         return json({ error: "Not found" }, 404);
       }
+      // The transcript contract owns /youtube outright, for the same reason: a
+      // malformed id, a trailing slash, or the wrong method would otherwise fall
+      // through to the SPA and answer HTTP 200 with an HTML page, which a client
+      // parsing JSON reads as either success or a parse error rather than the
+      // 404/405 it actually is.
+      if (pathname === "/youtube" || pathname.startsWith("/youtube/")) {
+        const known =
+          pathname === "/youtube" || pathname === "/youtube/probe" || YT_ROUTE_RE.test(pathname);
+        return known
+          ? json({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" }, 405)
+          : json({ error: "Not found", code: "NOT_FOUND" }, 404);
+      }
       // Everything else is the React SPA: serve the static asset if one matches,
       // otherwise fall back to index.html so client-side routes (e.g. /meetings/42)
       // load. The app itself enforces auth by calling /api/me on boot.
@@ -5025,8 +5037,14 @@ function nowIso() {
 }
 
 async function ytRowByOwnerVideo(env, owner, videoId) {
+  // Ordered, not just LIMIT 1: if the unique index couldn't be created because
+  // the table already held duplicates for this pair, an unordered pick would
+  // resolve to a different row from one request to the next. Preferring a
+  // completed row, then the newest, at least makes the choice deterministic and
+  // useful while the duplicates remain.
   const res = await env.DB.prepare(
-    `SELECT ${YT_COLUMNS} FROM youtube_transcripts WHERE owner_email = ?1 AND video_id = ?2 LIMIT 1`
+    `SELECT ${YT_COLUMNS} FROM youtube_transcripts WHERE owner_email = ?1 AND video_id = ?2 ` +
+      "ORDER BY (status = 'completed') DESC, transcript_id DESC LIMIT 1"
   )
     .bind(normalizeEmail(owner), videoId)
     .all();
@@ -5473,6 +5491,17 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
   }
   await ytReplaceSegments(env, id, email, result.language, result.segments);
+  // The lease is only honoured while it looks fresh, and a long fetch plus a
+  // long chunked write can outlive it — so the row may have been deleted after
+  // the check above and while these segments were going in. Clean up after
+  // ourselves rather than leaving rows no parent can reach.
+  if (!(await ytRowById(env, id))) {
+    await env.DB.prepare("DELETE FROM youtube_transcript_segments WHERE transcript_id = ?1")
+      .bind(id)
+      .run()
+      .catch(() => {});
+    return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
+  }
   const completedAt = nowIso();
   await ytUpdateRow(env, id, {
     title: result.title || null,
