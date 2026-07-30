@@ -1547,9 +1547,8 @@ function transcriptVocabulary(rows, max = 150) {
 // the meeting's actual vocabulary and asking which entries the user means covers
 // what string distance cannot. Failure here is survivable — the deterministic
 // retrieval still runs — so every error path falls through to an empty plan.
-async function planChatQuery(question, rows, vocab, apiKey, model) {
+async function planChatQuery(question, speakers, vocab, apiKey, model) {
   if (!question || !vocab.length) return { resolved: [], terms: [], scope: "narrow", restated: "" };
-  const speakers = distinctSpeakers(rows, 20);
   const list = vocab.map((v) => `${v.raw} (${v.count})`).join(", ");
   const plan = await openaiJson(
     apiKey,
@@ -1777,7 +1776,7 @@ async function buildChatRequest({ rows, history, apiKey, model, planModel, title
   let plan = { resolved: [], terms: [], scope: "narrow", restated: "" };
   if (question) {
     try {
-      plan = await planChatQuery(question, rows, vocab, apiKey, planModel || model);
+      plan = await planChatQuery(question, distinctSpeakers(rows, 20), vocab, apiKey, planModel || model);
     } catch {
       /* an accelerant, not a dependency */
     }
@@ -2772,6 +2771,221 @@ function buildWeeklyChatContext(sources, master) {
   return out.trim();
 }
 
+// Transcript rows for the week's meetings, ACL-checked exactly as the summary
+// loader is. The weekly chat used to see ONLY the cached summaries — so any
+// question whose answer lived in a detail the summary didn't keep (who said it,
+// when, the exact number) was unanswerable by construction, and came back as
+// "not covered". Reading the transcripts is what makes those answerable.
+async function loadWeeklyTranscripts(env, session, meetings, maxMeetings = 12) {
+  const out = [];
+  const seen = new Set();
+  const email = normalizeEmail(session.identity);
+  for (const m of meetings) {
+    if (out.length >= maxMeetings) break;
+    const meetingId = String((m && m.meeting_id) || "").trim();
+    if (!meetingId || seen.has(meetingId)) continue;
+    seen.add(meetingId);
+    let res;
+    try {
+      res = session.isAdmin
+        ? await env.DB.prepare(
+            "SELECT start_time, text, speaker FROM transcriptions WHERE meeting_id = ?1 ORDER BY start_time",
+          )
+            .bind(meetingId)
+            .all()
+        : await env.DB.prepare(
+            "SELECT start_time, text, speaker FROM transcriptions WHERE meeting_id = ?2 AND (" +
+              "EXISTS (SELECT 1 FROM meeting_owners WHERE meeting_id = ?2 AND owner_email = ?1) " +
+              "OR owner_email = ?1) ORDER BY start_time",
+          )
+            .bind(email, meetingId)
+            .all();
+    } catch {
+      continue; // one bad lookup shouldn't sink the batch
+    }
+    const rows = (res && res.results) || [];
+    if (!rows.length) continue;
+    let title = "";
+    try {
+      title = (await env.KV.get(titleCacheKey(meetingId))) || "";
+    } catch {
+      /* title is best-effort */
+    }
+    out.push({ meetingId, title: (title && title.trim()) || `Meeting ${meetingId}`, rows });
+  }
+  return out;
+}
+
+const WEEKLY_SYSTEM_PROMPT =
+  "You are the analyst for a team's WEEK of meetings. You have the transcripts of those meetings, the " +
+  "summaries built from them, and a weekly master summary.\n\n" +
+  "HOW THE TRANSCRIPTS WERE MADE — this changes how you must read them:\n" +
+  "They are machine transcription of mixed Hindi/English speech, so they contain recognition errors, and the " +
+  "errors cluster in proper nouns: people, companies, products, tools and clients. The same name can appear " +
+  "spelt several ways, and none need match how the user spells it. Treat the user's spelling as an " +
+  "approximation of a sound, never as an exact string to find.\n\n" +
+  "THE RULE THAT MATTERS MOST:\n" +
+  "Never answer that something \"is not mentioned\" or \"was not discussed\" because of a spelling difference. " +
+  "The NAME RESOLUTION and TERM MATCHES sections below already tell you which real spellings the user's words " +
+  "resolved to — trust them and answer about those. Only say something is absent when nothing in the notes, " +
+  "the evidence or the summaries could plausibly be it, and then say what you looked for and offer the " +
+  "nearest thing that IS there.\n\n" +
+  "ANSWERING:\n" +
+  "- Lead with the direct answer. Say which meeting something came from, and cite [MM:SS] within it for " +
+  "specific claims, quotes, decisions and numbers.\n" +
+  "- Draw the week together: name what recurred across meetings, what changed between them, and what is " +
+  "still open. That cross-meeting read is the reason this view exists.\n" +
+  "- Never invent names, numbers, dates, decisions or owners. Distinguish decided from merely floated.\n" +
+  "- Short paragraphs, \"- \" bullets, **bold headers** only for real sections. No \"Based on the summaries\" " +
+  "preamble — just answer. Answer in the user's language.";
+
+// The weekly counterpart of buildChatRequest: same three passes, fanned out over
+// meetings rather than over slices of one meeting.
+async function buildWeeklyChatRequest({ transcripts, sources, master, history, apiKey, model, planModel }) {
+  const lastUser = [...history].reverse().find((m) => m.role === "user");
+  const question = lastUser ? lastUser.content : "";
+  let terms = chatQueryTerms(history);
+
+  // Pass 1 — resolve the question against the whole week's vocabulary.
+  const vocabMap = new Map();
+  const speakerSet = new Set();
+  for (const t of transcripts) {
+    for (const v of transcriptVocabulary(t.rows, 80)) {
+      const key = normWord(v.raw);
+      const entry = vocabMap.get(key);
+      if (entry) entry.count += v.count;
+      else vocabMap.set(key, { raw: v.raw, count: v.count });
+    }
+    for (const s of distinctSpeakers(t.rows, 10)) speakerSet.add(s);
+  }
+  const vocab = [...vocabMap.values()].sort((a, b) => b.count - a.count).slice(0, 150);
+  let plan = { resolved: [], terms: [], scope: "narrow", restated: "" };
+  if (question && vocab.length) {
+    try {
+      plan = await planChatQuery(question, [...speakerSet], vocab, apiKey, planModel || model);
+    } catch {
+      /* an accelerant, not a dependency */
+    }
+  }
+  for (const t of plan.terms) {
+    for (const tok of chatTokens(t)) {
+      if (tok.length >= 2 && !CHAT_STOPWORDS.has(tok) && !terms.includes(tok)) terms.push(tok);
+    }
+  }
+
+  // Phonetic retrieval across every meeting, scored so the map pass can spend
+  // its calls where the week actually discusses the question.
+  const scanned = transcripts.map((t) => {
+    const { scores, spellings } = scanTranscript(t.rows, terms);
+    return { ...t, scores, spellings, total: scores.reduce((a, b) => a + b, 0) };
+  });
+
+  const evidence = scanned
+    .filter((t) => t.total > 0)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 8)
+    .map((t) => {
+      const lines = buildEvidence(t.rows, t.scores, 12, 2000);
+      return lines ? `=== ${t.title} ===\n${lines}` : "";
+    })
+    .filter(Boolean)
+    .join("\n\n");
+
+  const termReport = scanned
+    .map((t) => {
+      const report = buildTermMatchReport(t.rows, terms, t.spellings);
+      return report ? `In "${t.title}":\n${report}` : "";
+    })
+    .filter(Boolean)
+    .join("\n");
+
+  // Pass 2 — one reader per meeting, over the part of it that bears on the
+  // question, concurrently. Capped so a 40-meeting week can't fan out forever.
+  let mapNotes = "";
+  let meetingsRead = 0;
+  if (question && scanned.length) {
+    const ranked = scanned
+      .slice()
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 6)
+      .filter((t) => t.total > 0 || plan.scope === "whole_meeting");
+    meetingsRead = ranked.length;
+    if (ranked.length) {
+      const extra = plan.resolved.flatMap((r) => (Array.isArray(r.transcript) ? r.transcript : []));
+      const notes = await Promise.all(
+        ranked.map(async (t) => {
+          const { text } = buildChatTranscript(t.rows, t.scores, 11000);
+          try {
+            const out = await openaiChat(
+              apiKey,
+              model,
+              [
+                { role: "system", content: MAP_PROMPT },
+                {
+                  role: "user",
+                  content:
+                    `QUESTION: ${plan.restated || question}\n\n` +
+                    (extra.length ? `ALSO TREAT THESE AS THE SUBJECT: ${extra.join(", ")}\n\n` : "") +
+                    `MEETING "${t.title}":\n${text}`,
+                },
+              ],
+              600,
+              0,
+            );
+            const trimmed = String(out || "").trim();
+            return /^none\b/i.test(trimmed) || !trimmed ? "" : `=== ${t.title} ===\n${trimmed}`;
+          } catch {
+            return "";
+          }
+        }),
+      );
+      mapNotes = notes.filter(Boolean).join("\n\n");
+    }
+  }
+
+  // Pass 3 — answer from the notes, the evidence, and the summaries.
+  const resolved = plan.resolved
+    .filter((r) => r && r.asked && Array.isArray(r.transcript) && r.transcript.length)
+    .map((r) => `- the user's "${r.asked}" is this week's ${r.transcript.map((x) => `"${x}"`).join(" / ")}`);
+
+  const sections = [`THIS WEEK: ${transcripts.length} meeting(s) with transcripts, ${sources.length} summarized.`];
+  if (resolved.length) {
+    sections.push(
+      "NAME RESOLUTION — the user's spelling mapped onto what these meetings actually say. Answer about the " +
+        "transcript spelling; do not tell the user their word is absent:\n" + resolved.join("\n"),
+    );
+  }
+  if (termReport) sections.push("TERM MATCHES — where the question's words appear, by meeting:\n" + termReport);
+  if (evidence) sections.push("EVIDENCE — the transcript lines that best match, by meeting:\n" + evidence);
+  if (mapNotes) {
+    sections.push(
+      "READING NOTES — a separate pass read the most relevant meetings and pulled out everything bearing on " +
+        "this question. Treat it as authoritative about what exists:\n" + mapNotes,
+    );
+  }
+  sections.push(buildWeeklyChatContext(sources, master));
+
+  const messages = [
+    { role: "system", content: WEEKLY_SYSTEM_PROMPT },
+    { role: "system", content: sections.join("\n\n") },
+    ...history,
+  ];
+  if (!history.length) {
+    messages.push({ role: "user", content: "Give me a concise recap of this week across all the meetings." });
+  }
+  return {
+    messages,
+    trace: {
+      meetings: transcripts.length,
+      terms,
+      plan,
+      meetingsRead,
+      mapNotes,
+      grounding: messages[1].content,
+    },
+  };
+}
+
 // POST /api/weekly/chat — free-form Q&A grounded on a week's meeting summaries
 // (and the saved master summary). Body: { week, meetings: [{ meeting_id, owner? }],
 // messages: [{ role, content }] }. Same per-meeting ACL as /api/ai.
@@ -2796,32 +3010,46 @@ async function handleWeeklyChat(request, env) {
   } catch {
     /* master is optional extra grounding */
   }
-  if (!sources.length && !master) {
-    return json({ error: "No summarized meetings for this week yet — analyse some meetings first." }, 404);
+  const model = env.OPENAI_MODEL || "gpt-4o";
+  // Transcripts are extra grounding on top of the summaries, so a load failure
+  // degrades the answer rather than blocking it.
+  let transcripts = [];
+  try {
+    transcripts = await loadWeeklyTranscripts(env, session, meetings);
+  } catch {
+    /* fall through — the summaries still ground the answer */
+  }
+  // A week with transcripts but no cached summaries is now answerable — the
+  // transcripts ARE the material. Only a week with neither is a dead end.
+  if (!sources.length && !master && !transcripts.length) {
+    return json({ error: "No meetings with transcripts for this week yet." }, 404);
   }
 
-  const messages = [
-    {
-      role: "system",
-      content:
-        "You are a helpful assistant that answers questions about a team's week of meetings. You are given a " +
-        "weekly master summary and the individual meeting summaries it was built from. Answer ONLY from that " +
-        "material; if something isn't covered, say so briefly. Prefer short paragraphs and bullet points, and " +
-        "never invent names, numbers, decisions, or owners.\n\n" + buildWeeklyChatContext(sources, master),
-    },
-  ];
-  for (const m of clientMessages.slice(-12)) {
+  const history = [];
+  for (const m of clientMessages.slice(-16)) {
     const role = m && m.role === "assistant" ? "assistant" : "user";
     const content = String((m && m.content) || "").slice(0, 4000);
-    if (content) messages.push({ role, content });
+    if (content) history.push({ role, content });
   }
-  if (messages.length === 1) {
-    messages.push({ role: "user", content: "Give me a concise recap of this week across all the meetings." });
+
+  let built;
+  try {
+    built = await buildWeeklyChatRequest({
+      transcripts,
+      sources,
+      master,
+      history,
+      apiKey,
+      model,
+      planModel: env.OPENAI_FAST_MODEL || model,
+    });
+  } catch (err) {
+    return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
   }
 
   try {
-    const reply = await openaiChat(apiKey, env.OPENAI_MODEL || "gpt-4o", messages, 800, 0.3);
-    return json({ ok: true, reply });
+    const reply = await openaiChat(apiKey, model, built.messages, 1600, 0.2);
+    return json({ ok: true, reply, debug: body.debug ? built.trace : undefined });
   } catch (err) {
     return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
   }
@@ -4355,6 +4583,7 @@ function timingSafeEqual(a, b) {
 // export — and deliberately limited to the pure, binding-free chat internals.
 export {
   buildChatRequest,
+  buildWeeklyChatRequest,
   planChatQuery,
   mapTranscript,
   buildChatGrounding,
