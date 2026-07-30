@@ -16,6 +16,7 @@ import type { Episode, Podcast, Summary, WeeklyAi, WeeklySchedule, WeeklySummary
 import type { EmailResult } from './email'
 import { normalizeRecipients } from './recipientsStore'
 import { meetingsFromSegments, decodeMeetingId, type RawSegment } from './meetings'
+import type { VideoRecord } from './videos'
 
 /** Thrown when an /api call comes back 401 — the session expired or is missing. */
 export class NotAuthedError extends Error {
@@ -407,6 +408,80 @@ export async function chatWeekly(
   const data = await request<{ ok: boolean; reply?: string }>('/api/weekly/chat', {
     method: 'POST',
     body: JSON.stringify({ week, meetings, messages }),
+  })
+  return String(data.reply || '')
+}
+
+// ── YouTube videos ───────────────────────────────────────────────────────────
+// The same deal as meetings, for videos: the Worker owns the transcript (indexed
+// per account), so a user only ever sees the videos they added and admin sees
+// every account's. The AI routes mirror /api/ai — cached one-shot summary +
+// free-form chat, both answered from the transcript server-side.
+
+export interface VideoList {
+  videos: VideoRecord[]
+  admin: boolean
+}
+
+/** Every video the signed-in user can see. `email` is admin-only — it narrows
+ *  the cross-user list to one account. In-flight jobs are refreshed server-side
+ *  on each call, so polling this one route keeps the whole list live. */
+export async function fetchVideos(email?: string): Promise<VideoList> {
+  const qs = email ? `?email=${encodeURIComponent(email)}` : ''
+  const data = await request<{ ok: boolean; admin?: boolean; videos?: VideoRecord[] }>(`/api/youtube${qs}`)
+  return { videos: data.videos || [], admin: !!data.admin }
+}
+
+/** Queue a YouTube link for transcription under the signed-in account. Adding a
+ *  video already in the list returns that one (`duplicate`) instead of paying
+ *  for a second transcription of the same video. */
+export async function addVideo(url: string): Promise<{ video: VideoRecord; duplicate: boolean }> {
+  const data = await request<{ ok: boolean; video: VideoRecord; duplicate?: boolean }>('/api/youtube', {
+    method: 'POST',
+    body: JSON.stringify({ url }),
+  })
+  return { video: data.video, duplicate: !!data.duplicate }
+}
+
+/** One video plus its transcript text (empty until transcription completes). */
+export async function fetchVideo(id: string, owner?: string): Promise<{ video: VideoRecord; transcript: string }> {
+  const params = new URLSearchParams({ id })
+  if (owner) params.set('owner', owner)
+  const data = await request<{ ok: boolean; video: VideoRecord; transcript?: string }>(
+    `/api/youtube/video?${params.toString()}`,
+  )
+  return { video: data.video, transcript: String(data.transcript || '') }
+}
+
+/** Remove a video (and its cached transcript) from the account's list. */
+export function deleteVideo(id: string, owner?: string): Promise<{ ok: boolean }> {
+  return request('/api/youtube/delete', { method: 'POST', body: JSON.stringify({ id, owner }) })
+}
+
+/** Ask for a video's one-page summary. Generated once and cached per VIDEO, so
+ *  everyone who transcribes the same video shares it; pass { force } (Refresh)
+ *  to regenerate. `title` comes back when the backend had no name for the video
+ *  and one was minted while summarizing. */
+export async function summarizeVideo(
+  video: { id: string; owner: string },
+  opts?: { force?: boolean },
+): Promise<{ summary: Summary; title?: string }> {
+  const data = await request<{ ok: boolean; reply?: string; title?: string }>('/api/youtube/ai', {
+    method: 'POST',
+    body: JSON.stringify({ id: video.id, owner: video.owner, summarize: true, force: !!opts?.force }),
+  })
+  const title = typeof data.title === 'string' ? data.title.trim() : ''
+  return { summary: summaryFromReply(String(data.reply || '')), title: title || undefined }
+}
+
+/** Free-form chat over a single video's transcript. */
+export async function chatVideo(
+  video: { id: string; owner: string },
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<string> {
+  const data = await request<{ ok: boolean; reply?: string }>('/api/youtube/ai', {
+    method: 'POST',
+    body: JSON.stringify({ id: video.id, owner: video.owner, messages }),
   })
   return String(data.reply || '')
 }
