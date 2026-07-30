@@ -148,6 +148,22 @@ export default function EpisodeDetail() {
     }
   }
 
+  // A [MM:SS] citation in a chat answer → the transcript line it came from. The
+  // model quotes the timestamps the Worker printed on each line, so the match is
+  // usually exact; `<=` picks the line that was being spoken at that moment when
+  // it isn't, rather than dropping the jump.
+  function openCitation(sec: number) {
+    const segs = episode?.transcript ?? []
+    if (!segs.length) return
+    let best: TranscriptSegment | undefined
+    for (const seg of segs) {
+      const at = parseClock(seg.timestamp)
+      if (at == null || at > sec + 1) continue
+      best = seg
+    }
+    openTranscript((best ?? segs[0]).id, `Cited in chat at ${formatClock(sec)}`)
+  }
+
   // Force-regenerate this episode's summary, bypassing the server + client caches
   // (and overwriting them). The content stays visible until the fresh version lands.
   async function refreshSummary() {
@@ -241,7 +257,7 @@ export default function EpisodeDetail() {
           {tab === 'transcript' && (
             <TranscriptTab episode={episode} focusId={jumpTo} focusLabel={jumpLabel} focusTick={jumpTick} />
           )}
-          {tab === 'chat' && <ChatTab episode={episode} />}
+          {tab === 'chat' && <ChatTab episode={episode} onCite={openCitation} />}
         </>
       )}
     </div>
@@ -692,7 +708,7 @@ const CHAT_SUGGESTIONS = [
   'Give me a quick recap of what each person said',
 ]
 
-function ChatTab({ episode }: { episode: Episode }) {
+function ChatTab({ episode, onCite }: { episode: Episode; onCite?: (sec: number) => void }) {
   const terms = useMemo(() => entityTerms(episode.entities), [episode.entities])
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
@@ -802,7 +818,7 @@ function ChatTab({ episode }: { episode: Episode }) {
                     <Icon name="auto_awesome" size={16} className="text-primary" fill />
                   </span>
                   <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-3.5 py-2.5">
-                    <ChatAnswer text={m.content} terms={terms} />
+                    <ChatAnswer text={m.content} terms={terms} onCite={onCite} />
                   </div>
                 </div>
               ),
