@@ -198,6 +198,22 @@ export default function EpisodeDetail() {
     }
   }
 
+  // A [MM:SS] citation in a chat answer → the transcript line it came from. The
+  // model quotes the timestamps the Worker printed on each line, so the match is
+  // usually exact; `<=` picks the line that was being spoken at that moment when
+  // it isn't, rather than dropping the jump.
+  function openCitation(sec: number) {
+    const segs = episode?.transcript ?? []
+    if (!segs.length) return
+    let best: TranscriptSegment | undefined
+    for (const seg of segs) {
+      const at = parseClock(seg.timestamp)
+      if (at == null || at > sec + 1) continue
+      best = seg
+    }
+    openTranscript((best ?? segs[0]).id, `Cited in chat at ${formatClock(sec)}`)
+  }
+
   // Force-regenerate this episode's summary, bypassing the server + client caches
   // (and overwriting them). The content stays visible until the fresh version lands.
   async function refreshSummary() {
@@ -291,7 +307,7 @@ export default function EpisodeDetail() {
           {tab === 'transcript' && (
             <TranscriptTab episode={episode} focusId={jumpTo} focusLabel={jumpLabel} focusTick={jumpTick} />
           )}
-          {tab === 'chat' && <ChatTab episode={episode} />}
+          {tab === 'chat' && <ChatTab episode={episode} onCite={openCitation} />}
         </>
       )}
     </div>
@@ -742,7 +758,7 @@ const CHAT_SUGGESTIONS = [
   'Give me a quick recap of what each person said',
 ]
 
-function ChatTab({ episode }: { episode: Episode }) {
+function ChatTab({ episode, onCite }: { episode: Episode; onCite?: (sec: number) => void }) {
   const terms = useMemo(() => entityTerms(episode.entities), [episode.entities])
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
@@ -852,7 +868,7 @@ function ChatTab({ episode }: { episode: Episode }) {
                     <Icon name="auto_awesome" size={16} className="text-primary" fill />
                   </span>
                   <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-3.5 py-2.5">
-                    <ChatAnswer text={m.content} terms={terms} />
+                    <ChatAnswer text={m.content} terms={terms} onCite={onCite} />
                   </div>
                 </div>
               ),
@@ -919,9 +935,57 @@ function ChatTab({ episode }: { episode: Episode }) {
   )
 }
 
+// The [MM:SS] / [H:MM:SS] citations the assistant is asked to attach to every
+// specific claim. Captured so the text can be split on them and each one turned
+// into a jump back to the line it came from — an answer you can verify in one
+// click rather than one you have to take on faith.
+const CITATION = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g
+
+/** A line of an answer: entity/number/sentiment styling as everywhere else, with
+ *  timestamp citations lifted out into clickable chips. */
+function AnswerLine({ text, terms, onCite }: { text: string; terms: string[]; onCite?: (sec: number) => void }) {
+  const parts = useMemo(() => {
+    const out: { text: string; sec?: number }[] = []
+    let last = 0
+    for (const m of text.matchAll(CITATION)) {
+      const sec = parseClock(m[1])
+      if (sec == null) continue
+      if (m.index > last) out.push({ text: text.slice(last, m.index) })
+      out.push({ text: m[1], sec })
+      last = m.index + m[0].length
+    }
+    if (last < text.length) out.push({ text: text.slice(last) })
+    return out
+  }, [text])
+
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.sec == null ? (
+          <RichText key={i} text={p.text} terms={terms} />
+        ) : onCite ? (
+          <button
+            key={i}
+            onClick={() => onCite(p.sec!)}
+            title="Open this moment in the transcript"
+            className="press mx-0.5 inline-flex items-center gap-0.5 rounded-md border border-outline-variant bg-surface-container-low px-1.5 py-px align-baseline text-[12px] font-semibold tabular-nums text-primary hover:border-primary hover:bg-[#eff5ff]"
+          >
+            <Icon name="play_arrow" size={11} className="shrink-0" fill />
+            {p.text}
+          </button>
+        ) : (
+          <span key={i} className="font-semibold tabular-nums text-primary">
+            {p.text}
+          </span>
+        ),
+      )}
+    </>
+  )
+}
+
 // Renders a chat answer with the same light markdown the summary uses (bold
 // **headers**, "- " bullets, paragraphs) but at a compact, uniform chat size.
-function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
+function ChatAnswer({ text, terms, onCite }: { text: string; terms: string[]; onCite?: (sec: number) => void }) {
   const isBullet = (l: string) => /^([-*•]|\d+[.)])\s+/.test(l)
   const stripBullet = (l: string) => l.replace(/^([-*•]|\d+[.)])\s+/, '')
   const blocks = text
@@ -946,7 +1010,7 @@ function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
             {header && <p className="mb-1 font-semibold text-on-surface">{header}</p>}
             {paras.map((p, j) => (
               <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
-                <RichText text={p} terms={terms} />
+                <AnswerLine text={p} terms={terms} onCite={onCite} />
               </p>
             ))}
             {bullets.length > 0 && (
@@ -955,7 +1019,7 @@ function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
                   <li key={`b${j}`} className="flex gap-2">
                     <span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
                     <span className="min-w-0">
-                      <RichText text={b} terms={terms} />
+                      <AnswerLine text={b} terms={terms} onCite={onCite} />
                     </span>
                   </li>
                 ))}
@@ -988,6 +1052,7 @@ function TranscriptTab({
     focusId ? { id: focusId, label: focusLabel } : null,
   )
   const [q, setQ] = useState('')
+  const [seekRequest, setSeekRequest] = useState<{ sec: number; tick: number } | null>(null)
   const segments = episode.transcript ?? []
   const highlights = episode.summary?.highlights.filter((h) => h.segmentId) ?? []
 
@@ -1022,9 +1087,16 @@ function TranscriptTab({
     if (segmentId) document.getElementById(`seg-${segmentId}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
   }
 
+  // Clicking a transcript timestamp moves the recording to that moment. The
+  // counter makes each click a distinct request, so clicking the same line
+  // twice (after scrubbing away) still seeks back to it.
+  function seekRecording(sec: number) {
+    setSeekRequest((prev) => ({ sec, tick: (prev?.tick ?? 0) + 1 }))
+  }
+
   return (
     <div className="flex flex-col gap-gutter">
-      <RecordingBar key={episode.id} episode={episode} />
+      <RecordingBar key={episode.id} episode={episode} seekRequest={seekRequest} />
       <div className="grid grid-cols-12 gap-gutter">
       {/* Highlights */}
       <aside className="col-span-12 md:col-span-4">
@@ -1079,6 +1151,7 @@ function TranscriptTab({
               focused={focus?.id === seg.id}
               focusLabel={focus?.id === seg.id ? focus.label : undefined}
               sentimentOn={sentimentOn}
+              onSeekAudio={seekRecording}
             />
           ))}
           {visible.length === 0 && <p className="py-md text-center text-metadata text-secondary">No lines match “{q}”.</p>}
@@ -1101,7 +1174,15 @@ function TranscriptTab({
 // download link lets the browser's own media/download stacks do the transfer:
 // they issue range requests, start playback on the first chunk, and survive
 // interruptions that would kill a one-shot fetch.
-function RecordingBar({ episode }: { episode: Episode }) {
+function RecordingBar({
+  episode,
+  seekRequest,
+}: {
+  episode: Episode
+  /** Set when a transcript timestamp is clicked. Opens the player if it isn't
+   *  open yet, then jumps to that moment. */
+  seekRequest?: { sec: number; tick: number } | null
+}) {
   const [status, setStatus] = useState<'idle' | 'ready' | 'error'>('idle')
   const [error, setError] = useState<string | null>(null)
   const [downloading, setDownloading] = useState(false)
@@ -1119,6 +1200,14 @@ function RecordingBar({ episode }: { episode: Episode }) {
     setError(null)
     setStatus('ready')
   }
+
+  // A timestamp click is itself the user activation, so mounting the player
+  // here keeps playback inside it exactly as the Play button does.
+  useEffect(() => {
+    if (!seekRequest) return
+    setError(null)
+    setStatus('ready')
+  }, [seekRequest])
 
   useEffect(() => {
     if (status !== 'ready') return
@@ -1168,6 +1257,7 @@ function RecordingBar({ episode }: { episode: Episode }) {
           <RecordingPlayer
             src={src}
             fallbackDurationSec={episode.durationSec}
+            seekRequest={seekRequest}
             onError={() => {
               setError('The recording stopped loading. Please try again.')
               setStatus('error')
@@ -1208,6 +1298,20 @@ function RecordingBar({ episode }: { episode: Episode }) {
   )
 }
 
+/** "14" | "0:14" | "1:02:33" → seconds. Transcript timestamps come from the
+ *  backend as display strings, so this is the only place their shape is
+ *  interpreted. Returns null for anything unparseable rather than guessing. */
+function parseClock(stamp: string): number | null {
+  const parts = String(stamp || '').trim().split(':')
+  if (!parts.length || parts.length > 3) return null
+  // Number('') is 0, so an empty or half-written stamp would otherwise read as
+  // a valid "jump to 0:00".
+  if (parts.some((p) => p.trim() === '')) return null
+  const nums = parts.map((p) => Number(p))
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null
+  return nums.reduce((acc, n) => acc * 60 + n, 0)
+}
+
 function formatClock(sec: number): string {
   if (!Number.isFinite(sec) || sec < 0) return '0:00'
   const total = Math.floor(sec)
@@ -1230,10 +1334,12 @@ function formatClock(sec: number): string {
 function RecordingPlayer({
   src,
   fallbackDurationSec,
+  seekRequest,
   onError,
 }: {
   src: string
   fallbackDurationSec?: number
+  seekRequest?: { sec: number; tick: number } | null
   onError: () => void
 }) {
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -1242,6 +1348,31 @@ function RecordingPlayer({
   const [reported, setReported] = useState(0)
   const [buffered, setBuffered] = useState(0)
   const [scrubbing, setScrubbing] = useState(false)
+  // A seek that arrived before the element could accept one (the player was
+  // mounted by that very click, so it has no metadata yet). Applied as soon as
+  // it's seekable.
+  const pendingSeekRef = useRef<number | null>(null)
+
+  function applySeek(sec: number) {
+    const el = audioRef.current
+    if (!el) return
+    // readyState < HAVE_METADATA means currentTime isn't settable yet.
+    if (el.readyState < 1) {
+      pendingSeekRef.current = sec
+      return
+    }
+    pendingSeekRef.current = null
+    setCurrent(sec)
+    el.currentTime = sec
+    void el.play()
+  }
+
+  useEffect(() => {
+    if (!seekRequest) return
+    applySeek(seekRequest.sec)
+    // Keyed on tick so clicking the same timestamp twice seeks both times.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seekRequest?.tick])
 
   const duration =
     Number.isFinite(reported) && reported > 0
@@ -1279,7 +1410,11 @@ function RecordingPlayer({
         onPause={() => setPlaying(false)}
         onEnded={() => setPlaying(false)}
         onDurationChange={(e) => setReported(e.currentTarget.duration)}
-        onLoadedMetadata={(e) => setReported(e.currentTarget.duration)}
+        onLoadedMetadata={(e) => {
+          setReported(e.currentTarget.duration)
+          const pending = pendingSeekRef.current
+          if (pending != null) applySeek(pending)
+        }}
         onTimeUpdate={(e) => {
           if (!scrubbing) setCurrent(e.currentTarget.currentTime)
         }}
@@ -1345,6 +1480,7 @@ function TranscriptRow({
   focused = false,
   focusLabel,
   sentimentOn,
+  onSeekAudio,
 }: {
   seg: TranscriptSegment
   activeRef: string | null
@@ -1353,6 +1489,9 @@ function TranscriptRow({
   focused?: boolean
   focusLabel?: string
   sentimentOn: boolean
+  /** Moves the recording to this line's moment. Absent when the timestamp
+   *  can't be parsed into an offset, leaving it as plain text. */
+  onSeekAudio?: (sec: number) => void
 }) {
   const isActive = !!seg.highlight && activeRef === seg.highlight.refId
   // Net lean of the whole segment → a thin left accent so a long transcript is
@@ -1362,6 +1501,8 @@ function TranscriptRow({
     const s = analyzeSentiment(seg.text)
     return s.confident ? (s.label === 'pos' ? 'seg-pos' : 'seg-neg') : ''
   }, [seg.text, sentimentOn])
+
+  const seekSec = useMemo(() => parseClock(seg.timestamp), [seg.timestamp])
 
   return (
     <div
@@ -1381,7 +1522,23 @@ function TranscriptRow({
         </p>
       )}
       <div className="grid grid-cols-[64px_84px_1fr] gap-2">
-        <span className="text-metadata font-semibold text-primary">{seg.timestamp}</span>
+        {onSeekAudio && seekSec != null ? (
+          <button
+            onClick={() => onSeekAudio(seekSec)}
+            title="Play the recording from here"
+            className="press group -ml-1 flex items-start gap-0.5 self-start rounded px-1 text-left text-metadata font-semibold text-primary hover:bg-[#eff5ff]"
+          >
+            <Icon
+              name="play_arrow"
+              size={13}
+              className="mt-[3px] shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+              fill
+            />
+            {seg.timestamp}
+          </button>
+        ) : (
+          <span className="text-metadata font-semibold text-primary">{seg.timestamp}</span>
+        )}
         <span className={`text-metadata font-semibold ${seg.role === 'guest' ? 'text-on-surface' : 'text-on-surface-variant'}`}>
           {seg.speaker}
         </span>
