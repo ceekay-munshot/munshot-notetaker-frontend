@@ -688,7 +688,7 @@ function FailedPanel({ video, onRemove }: { video: VideoRecord; onRemove: () => 
         disabled={busy}
         className="press mt-1 inline-flex items-center gap-2 rounded-lg border border-outline-variant bg-surface px-4 py-2.5 text-metadata font-semibold text-on-surface hover:bg-surface-container-low disabled:opacity-50"
       >
-        <Icon name="delete" size={18} /> Remove from my videos
+        <Icon name="delete" size={18} /> Delete this transcript
       </button>
     </div>
   )

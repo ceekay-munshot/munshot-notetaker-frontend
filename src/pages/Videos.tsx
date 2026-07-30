@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useVideos } from '../store/Videos'
 import { formatDuration, longDate } from '../lib/format'
@@ -263,19 +263,53 @@ function VideoRow({
       </span>
       <span className="flex items-center justify-between gap-1">
         <StatusBadge status={videoProcessingStatus(video.status)} />
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onRemove()
-          }}
-          aria-label={`Remove ${title}`}
-          title="Remove from your list"
-          className="press grid h-8 w-8 shrink-0 place-items-center rounded-lg text-outline opacity-0 transition-opacity hover:bg-surface-container hover:text-error focus:opacity-100 group-hover:opacity-100"
-        >
-          <Icon name="delete" size={17} />
-        </button>
+        <DeleteButton title={title} onDelete={onRemove} />
       </span>
     </div>
+  )
+}
+
+/** Deleting is permanent — it drops the transcript and every one of its stored
+ *  segments, which is not something a stray click on a hover-revealed icon
+ *  should do. So the icon arms first and only the second click deletes; it
+ *  disarms on blur or after a few seconds, and says plainly what it will do. */
+function DeleteButton({ title, onDelete }: { title: string; onDelete: () => void }) {
+  const [armed, setArmed] = useState(false)
+
+  useEffect(() => {
+    if (!armed) return
+    const t = window.setTimeout(() => setArmed(false), 4000)
+    return () => window.clearTimeout(t)
+  }, [armed])
+
+  return (
+    <button
+      onClick={(e) => {
+        e.stopPropagation()
+        if (!armed) {
+          setArmed(true)
+          return
+        }
+        setArmed(false)
+        onDelete()
+      }}
+      onKeyDown={(e) => e.stopPropagation()}
+      onBlur={() => setArmed(false)}
+      aria-label={armed ? `Confirm deleting the transcript for ${title}` : `Delete the transcript for ${title}`}
+      title={
+        armed
+          ? 'Click again to permanently delete this transcript'
+          : 'Delete this transcript permanently (it and all its segments are removed)'
+      }
+      className={
+        armed
+          ? 'press inline-flex h-8 shrink-0 items-center gap-1 rounded-lg bg-error-container px-2 text-[12px] font-semibold text-on-error-container opacity-100'
+          : 'press grid h-8 w-8 shrink-0 place-items-center rounded-lg text-outline opacity-0 transition-opacity hover:bg-surface-container hover:text-error focus:opacity-100 group-hover:opacity-100'
+      }
+    >
+      <Icon name="delete" size={17} />
+      {armed && <span>Delete?</span>}
+    </button>
   )
 }
 

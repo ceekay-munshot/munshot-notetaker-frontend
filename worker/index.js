@@ -5283,6 +5283,31 @@ async function ytForceCooldown(env, email) {
   return { ok: true };
 }
 
+// A per-account ceiling on how many videos it can actually make us FETCH in an
+// hour, independent of what it currently owns. The row cap alone doesn't bound
+// this: deleting a transcript frees its slot AND removes the only record of
+// prior work, so add-delete-add (or rotating video ids) would refetch forever
+// and bot-gate the shared egress. Generous for real use — nobody transcribes 30
+// videos an hour by hand — and it is the backstop the cooldowns above can't be.
+const YT_FETCH_QUOTA = 30;
+const YT_FETCH_WINDOW_MS = 60 * 60 * 1000;
+
+async function ytFetchQuota(env, email) {
+  if (!env.KV) return { ok: true };
+  const bucket = Math.floor(Date.now() / YT_FETCH_WINDOW_MS);
+  const key = `ytquota:${encodeURIComponent(email)}:${bucket}`;
+  try {
+    const used = Number(await env.KV.get(key)) || 0;
+    if (used >= YT_FETCH_QUOTA) {
+      return { ok: false, error: `You've transcribed ${YT_FETCH_QUOTA} videos in the past hour — try again later.` };
+    }
+    await env.KV.put(key, String(used + 1), { expirationTtl: Math.ceil(YT_FETCH_WINDOW_MS / 1000) * 2 });
+  } catch {
+    /* KV hiccup — don't block a legitimate transcription on the limiter */
+  }
+  return { ok: true };
+}
+
 async function createYoutubeTranscript(env, owner, input, opts = {}) {
   if (!env.DB) return { ok: false, status: 503, code: "UPSTREAM_ERROR", error: "Transcripts database is not connected yet" };
   const parsed = parseYoutubeUrl(input);
@@ -5321,6 +5346,12 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
       const age = Date.now() - (Date.parse(existing.updated_at || existing.created_at || "") || 0);
       if (age < YT_PROCESSING_STALE_MS) return { ok: true, row: existing, reused: true };
     }
+  }
+
+  // Everything below fetches YouTube, so this is where the hourly quota is spent.
+  if (!opts.isAdmin) {
+    const quota = await ytFetchQuota(env, email);
+    if (!quota.ok) return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
   }
 
   // A forced refresh of a transcript that already works must not destroy it: the
