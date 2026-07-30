@@ -46,31 +46,50 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const inFlight = useRef(false)
+  // Videos are account-scoped, and this provider stays mounted across an
+  // identity switch (a host-managed session can move from one account to the
+  // next without remounting the dashboard). Every load is stamped with the
+  // identity it was issued for, so a response that lands after the account
+  // changed is dropped instead of showing the previous account's videos.
+  const identityRef = useRef(email)
+  identityRef.current = email
 
   const load = useCallback(async (opts?: { quiet?: boolean }) => {
+    const issuedFor = identityRef.current
     if (inFlight.current) return
     inFlight.current = true
     if (!opts?.quiet) setLoading(true)
     try {
       const { videos: list, admin: isAdmin } = await api.fetchVideos()
+      if (identityRef.current !== issuedFor) return // the account changed mid-flight
       setVideos(list)
       setAdmin(isAdmin)
       setError(null)
     } catch (err) {
       // A background poll must never wipe the list the user is looking at —
       // only a foreground load surfaces the failure.
+      if (identityRef.current !== issuedFor) return
       if (!opts?.quiet) setError((err as Error)?.message || 'Could not load your videos.')
     } finally {
       inFlight.current = false
-      if (!opts?.quiet) setLoading(false)
-      setLoaded(true)
+      if (identityRef.current === issuedFor) {
+        if (!opts?.quiet) setLoading(false)
+        setLoaded(true)
+      }
     }
   }, [])
 
-  // Boot / re-boot whenever the signed-in account changes.
+  // Boot / re-boot whenever the signed-in account changes. The previous
+  // account's videos are cleared immediately — never left on screen while the
+  // new account loads — and its in-flight request is abandoned (the stamp check
+  // above discards its response) so this load isn't skipped by the guard.
   useEffect(() => {
-    if (!authed) return
+    setVideos([])
+    setAdmin(false)
+    setError(null)
     setLoaded(false)
+    inFlight.current = false
+    if (!authed) return
     void load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [authed, email])
@@ -98,10 +117,14 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   const applyVideo = useCallback((video: VideoRecord) => {
     setVideos((prev) => {
       const i = prev.findIndex((v) => v.id === video.id && v.owner === video.owner)
-      if (i === -1) return [video, ...prev]
-      const next = [...prev]
-      next[i] = video
-      return next
+      if (i !== -1) {
+        const next = [...prev]
+        next[i] = video
+        return next
+      }
+      // New (or restored after a failed delete) — keep the server's newest-first
+      // order so a row never lands in the wrong place.
+      return [video, ...prev].sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0))
     })
   }, [])
 
@@ -115,14 +138,19 @@ export function VideosProvider({ children }: { children: ReactNode }) {
     return video
   }, [applyVideo])
 
+  // Never rejects: a failed delete puts the row back and reports why, so the
+  // row can't just vanish and silently reappear on the next poll.
   const removeVideo = useCallback(async (video: VideoRecord) => {
     setVideos((prev) => prev.filter((v) => !(v.id === video.id && v.owner === video.owner))) // optimistic
     try {
       await api.deleteVideo(video.id, video.owner)
-    } finally {
+      setError(null)
       await load({ quiet: true })
+    } catch (err) {
+      applyVideo(video) // put it back where it was
+      setError((err as Error)?.message || 'Could not remove that video.')
     }
-  }, [load])
+  }, [load, applyVideo])
 
   const value = useMemo<VideosData>(
     () => ({

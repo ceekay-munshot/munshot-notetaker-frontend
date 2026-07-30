@@ -119,15 +119,24 @@ interface RawLine {
 function rawLines(text: string): RawLine[] {
   const out: RawLine[] = []
   let pendingStamp: number | null = null
-  for (const line of text.split(/\r?\n/)) {
-    const trimmed = line.trim()
+  const lines = text.split(/\r?\n/).map((l) => l.trim())
+  // The next non-empty line — an SRT cue number is only a cue number when a cue
+  // range follows it.
+  const nextMeaningful = (from: number): string => {
+    for (let i = from; i < lines.length; i++) if (lines[i]) return lines[i]
+    return ''
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i]
     if (!trimmed || /^WEBVTT/i.test(trimmed)) continue
     const cue = CUE_RANGE.exec(trimmed)
     if (cue) {
       pendingStamp = parseStamp(cue[1]) // the next text line belongs to this cue
       continue
     }
-    if (/^\d+$/.test(trimmed) && trimmed.length <= 5) continue // SRT cue number
+    // An SRT cue number — but only in that structural position. A caption whose
+    // whole text is a number ("2026") is real content, not scaffolding.
+    if (/^\d+$/.test(trimmed) && trimmed.length <= 5 && CUE_RANGE.test(nextMeaningful(i + 1))) continue
     let body = trimmed
     let seconds: number | null = pendingStamp
     pendingStamp = null
