@@ -5045,11 +5045,36 @@ async function ytRowsForOwner(env, owner) {
   return res.results || [];
 }
 
-async function ytCountForOwner(env, owner) {
-  const res = await env.DB.prepare("SELECT COUNT(*) AS n FROM youtube_transcripts WHERE owner_email = ?1")
-    .bind(normalizeEmail(owner))
-    .all();
-  return Number((res.results && res.results[0] && res.results[0].n) || 0);
+// Counting and then inserting is not atomic: a burst of concurrent submissions
+// from one account can all read a count below the cap and all insert. The cap
+// therefore lives INSIDE the insert — the row only materializes if the account
+// is still under it at the moment the statement runs.
+function ytInsertUnderCap(env, row) {
+  return env.DB.prepare(
+    "INSERT INTO youtube_transcripts " +
+      "(transcript_id, user_id, owner_email, video_id, url, title, channel, duration_seconds, " +
+      "status, source, language, segment_count, error, created_at, updated_at, completed_at) " +
+      "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16 " +
+      "WHERE (SELECT COUNT(*) FROM youtube_transcripts WHERE owner_email = ?3) < ?17"
+  ).bind(
+    row.transcript_id,
+    0, // user_id is AWS's Postgres id, which this Worker doesn't know
+    row.owner_email,
+    row.video_id,
+    row.url,
+    row.title || null,
+    row.channel || null,
+    row.duration_seconds || null,
+    row.status,
+    row.source || null,
+    row.language || null,
+    row.segment_count || 0,
+    row.error || null,
+    row.created_at,
+    row.updated_at,
+    row.completed_at || null,
+    MAX_VIDEOS_PER_USER
+  );
 }
 
 async function ytSegmentRows(env, id) {
@@ -5069,28 +5094,11 @@ async function ytInsertRow(env, row) {
   let candidate = YT_ID_FLOOR + Date.now();
   for (let attempt = 0; attempt < YT_ID_ATTEMPTS; attempt++) {
     try {
-      await env.DB.prepare(
-        `INSERT INTO youtube_transcripts (${YT_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)`
-      )
-        .bind(
-          candidate,
-          0, // user_id is AWS's Postgres id, which this Worker doesn't know
-          row.owner_email,
-          row.video_id,
-          row.url,
-          row.title || null,
-          row.channel || null,
-          row.duration_seconds || null,
-          row.status,
-          row.source || null,
-          row.language || null,
-          row.segment_count || 0,
-          row.error || null,
-          row.created_at,
-          row.updated_at,
-          row.completed_at || null
-        )
-        .run();
+      const res = await ytInsertUnderCap(env, { ...row, transcript_id: candidate }).run();
+      // No row written and no error: the capped INSERT ... SELECT matched
+      // nothing, i.e. the account is at its limit.
+      const changes = (res && res.meta && res.meta.changes) || 0;
+      if (!changes) return { id: 0, atCap: true };
       return { id: candidate, existed: false };
     } catch (err) {
       const message = String((err && err.message) || err);
@@ -5107,6 +5115,22 @@ async function ytInsertRow(env, row) {
     }
   }
   throw new Error("Could not allocate a transcript id");
+}
+
+// Claims a failed or stale row for THIS request before any fetching happens.
+// Two concurrent retries of the same row would otherwise both run the pipeline,
+// and a later failure could overwrite the row the other one just populated. The
+// claim is a conditional update: exactly one request can move the row out of the
+// state it was in, and the loser backs off and returns the active writer's row.
+async function ytClaimForRetry(env, id, staleBefore) {
+  const res = await env.DB.prepare(
+    "UPDATE youtube_transcripts SET status = 'processing', error = NULL, updated_at = ?2 " +
+      "WHERE transcript_id = ?1 AND (status = 'failed' OR status = 'queued' OR " +
+      "((status = 'processing') AND (updated_at IS NULL OR updated_at < ?3)))"
+  )
+    .bind(id, nowIso(), staleBefore)
+    .run();
+  return ((res && res.meta && res.meta.changes) || 0) > 0;
 }
 
 async function ytUpdateRow(env, id, fields) {
@@ -5131,19 +5155,38 @@ async function ytUpdateRow(env, id, fields) {
 // atomic — no window at all. Longer transcripts (a 3-hour auto-caption track is
 // thousands of cues) are chunked, which is why the upsert ordering above
 // matters.
-const YT_ATOMIC_MAX = 400; // statements sent as a single atomic batch
+// D1 caps bound parameters per query at 100, so each statement carries as many
+// whole rows as fit: 8 columns => 12 rows, 96 parameters. That matters because
+// every statement counts against D1's per-invocation query limit even inside a
+// batch — one statement per cue exhausted it partway through a multi-hour track
+// (thousands of cues), leaving the row stuck in `processing` and every retry
+// failing the same way. At 12 rows a statement, a 3-hour transcript is a few
+// hundred queries instead of a few thousand.
+const YT_ROWS_PER_STATEMENT = 12;
+const YT_ATOMIC_MAX = 40; // statements still sent as a single atomic batch
+
+function ytSegmentInsert(env, id, email, language, chunk) {
+  const values = [];
+  const binds = [];
+  for (let i = 0; i < chunk.length; i++) {
+    const base = i * 8;
+    values.push(`(?${base + 1}, ?${base + 2}, ?${base + 3}, ?${base + 4}, ?${base + 5}, ?${base + 6}, ?${base + 7}, ?${base + 8})`);
+    // speaker is NULL on the captions path — YouTube gives no diarization.
+    binds.push(id, chunk[i].index, chunk[i].start, chunk[i].end, chunk[i].text, null, language || null, email);
+  }
+  return env.DB.prepare(
+    "INSERT OR REPLACE INTO youtube_transcript_segments " +
+      "(transcript_id, segment_index, start_time, end_time, text, speaker, language, owner_email) VALUES " +
+      values.join(", ")
+  ).bind(...binds);
+}
 
 async function ytReplaceSegments(env, id, owner, language, segments) {
   const email = normalizeEmail(owner);
-  const upsert = env.DB.prepare(
-    "INSERT OR REPLACE INTO youtube_transcript_segments " +
-      "(transcript_id, segment_index, start_time, end_time, text, speaker, language, owner_email) " +
-      "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
-  );
-  // speaker is NULL on the captions path — YouTube gives no diarization.
-  const statements = segments.map((sgmt) =>
-    upsert.bind(id, sgmt.index, sgmt.start, sgmt.end, sgmt.text, null, language || null, email)
-  );
+  const statements = [];
+  for (let i = 0; i < segments.length; i += YT_ROWS_PER_STATEMENT) {
+    statements.push(ytSegmentInsert(env, id, email, language, segments.slice(i, i + YT_ROWS_PER_STATEMENT)));
+  }
   const trim = env.DB.prepare(
     "DELETE FROM youtube_transcript_segments WHERE transcript_id = ?1 AND segment_index >= ?2"
   ).bind(id, segments.length);
@@ -5215,6 +5258,27 @@ function transcriptPayload(row, segmentRows) {
 // Idempotent per (owner, video): re-posting a URL already transcribed for that
 // account returns the existing row untouched. A previously FAILED row retries,
 // and force=true re-fetches regardless.
+// One forced refetch per account per window. KV is eventually consistent, which
+// is fine here: the point is to stop a loop, not to be exact to the second.
+const YT_FORCE_COOLDOWN_MS = 5 * 60 * 1000;
+
+async function ytForceCooldown(env, email) {
+  if (!env.KV) return { ok: true };
+  const key = `ytforce:${encodeURIComponent(email)}`;
+  try {
+    const last = Number(await env.KV.get(key)) || 0;
+    const waited = Date.now() - last;
+    if (last && waited < YT_FORCE_COOLDOWN_MS) {
+      const mins = Math.max(1, Math.ceil((YT_FORCE_COOLDOWN_MS - waited) / 60000));
+      return { ok: false, error: `Too many refreshes — try again in about ${mins} minute${mins === 1 ? "" : "s"}.` };
+    }
+    await env.KV.put(key, String(Date.now()), { expirationTtl: Math.ceil(YT_FORCE_COOLDOWN_MS / 1000) * 2 });
+  } catch {
+    /* KV hiccup — don't block a legitimate refresh on the rate limiter */
+  }
+  return { ok: true };
+}
+
 async function createYoutubeTranscript(env, owner, input, opts = {}) {
   if (!env.DB) return { ok: false, status: 503, code: "UPSTREAM_ERROR", error: "Transcripts database is not connected yet" };
   const parsed = parseYoutubeUrl(input);
@@ -5222,6 +5286,16 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
 
   const email = normalizeEmail(owner);
   await ensureYoutubeIndex(env);
+
+  // `force` deliberately skips both the reuse check and the per-account cap, so
+  // without a limit one account could sit on a single video and re-fetch it in a
+  // loop — hammering the shared egress (the exact thing that gets us bot-gated)
+  // and rewriting every segment row each time. One forced refetch per account
+  // per cooldown window; admins, who use it to repair a bad transcript, skip it.
+  if (opts.force && !opts.isAdmin) {
+    const gate = await ytForceCooldown(env, email);
+    if (!gate.ok) return { ok: false, status: 429, code: "TOO_MANY_REFRESHES", error: gate.error };
+  }
 
   const existing = await ytRowByOwnerVideo(env, email, parsed.videoId);
   if (existing && !opts.force) {
@@ -5244,18 +5318,17 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   if (existing) {
     id = existing.transcript_id;
     if (!preserveOnFailure) {
-      await ytUpdateRow(env, id, { status: "processing", error: null, updated_at: at, url: parsed.url });
+      // Take the row before fetching. Losing this means another request is
+      // already transcribing it, so back off and return its row rather than
+      // running the same pipeline twice and racing to write the result.
+      const claimed = await ytClaimForRetry(env, id, new Date(Date.now() - YT_PROCESSING_STALE_MS).toISOString());
+      if (!claimed) {
+        const active = await ytRowById(env, id);
+        if (active) return { ok: true, row: active, reused: true };
+      }
+      await ytUpdateRow(env, id, { url: parsed.url, updated_at: at });
     }
   } else {
-    const count = await ytCountForOwner(env, email);
-    if (count >= MAX_VIDEOS_PER_USER) {
-      return {
-        ok: false,
-        status: 400,
-        code: "LIMIT_REACHED",
-        error: `You can keep up to ${MAX_VIDEOS_PER_USER} videos — delete one first`,
-      };
-    }
     const inserted = await ytInsertRow(env, {
       owner_email: email,
       video_id: parsed.videoId,
@@ -5267,6 +5340,14 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     // Lost the race to a concurrent request for the same video: that request
     // owns the fetch and the segment write, so return its row rather than
     // running the same pipeline against the same rows.
+    if (inserted.atCap) {
+      return {
+        ok: false,
+        status: 400,
+        code: "LIMIT_REACHED",
+        error: `You can keep up to ${MAX_VIDEOS_PER_USER} videos — delete one first`,
+      };
+    }
     if (inserted.existed) {
       const winner = await ytRowById(env, inserted.id);
       if (winner) return { ok: true, row: winner, reused: true };
@@ -5342,7 +5423,10 @@ async function handleTranscriptCreate(request, env) {
   if (session.isAdmin) return json({ error: "Admin accounts can't add videos — sign in as a user" }, 403);
 
   const body = await request.json().catch(() => ({}));
-  const result = await createYoutubeTranscript(env, session.identity, body.url, { force: !!body.force });
+  const result = await createYoutubeTranscript(env, session.identity, body.url, {
+    force: !!body.force,
+    isAdmin: !!session.isAdmin,
+  });
   if (!result.ok) return json({ error: result.error, code: result.code }, result.status || 400);
   if (!result.row) return json({ error: YT_MESSAGES.UPSTREAM_ERROR, code: "UPSTREAM_ERROR" }, 502);
   const segments = result.row.status === "completed" ? await ytSegmentRows(env, result.row.transcript_id) : [];
@@ -5508,7 +5592,10 @@ async function handleCreateVideo(request, env) {
   const body = await request.json().catch(() => ({}));
   let result;
   try {
-    result = await createYoutubeTranscript(env, session.identity, body.url, { force: !!body.force });
+    result = await createYoutubeTranscript(env, session.identity, body.url, {
+      force: !!body.force,
+      isAdmin: !!session.isAdmin,
+    });
   } catch (err) {
     return json({ error: "Failed to transcribe that video", detail: String((err && err.message) || err) }, 500);
   }
@@ -5986,5 +6073,8 @@ export {
   fuzzyScore,
   soundKey,
   openaiChat,
-  CHAT_SYSTEM_PROMPT,
 };
+// CHAT_SYSTEM_PROMPT is deliberately NOT exported. A module Worker treats every
+// named export as a potential entrypoint, so workerd rejects one that isn't a
+// function — "Incorrect type for map entry 'CHAT_SYSTEM_PROMPT'" — and the
+// Worker fails to boot under `wrangler dev`. Nothing imported it anyway.

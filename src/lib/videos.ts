@@ -45,15 +45,47 @@ export interface StoredSegment {
   language: string | null
 }
 
-/** Stored segments → the shape the transcript view renders. */
+/** Stored segments → the shape the transcript view renders.
+ *
+ *  Caption cues are 3–8 words each, so a long video is thousands of them. Kept
+ *  one-to-one they read terribly AND render as thousands of DOM rows, which is
+ *  what makes a multi-hour transcript sluggish. Adjacent cues are merged into
+ *  paragraph-sized blocks carrying the first cue's timestamp — the same shape
+ *  the flat-text parser produces, so both paths render identically. A change of
+ *  speaker always starts a new block (unused on the captions path, which has no
+ *  diarization, but correct if a source ever provides it). */
 export function segmentsFromStored(stored: StoredSegment[]): TranscriptSegment[] {
-  return stored.map((s, i) => ({
-    id: String(s.index ?? i),
-    speaker: s.speaker || 'Transcript',
-    role: 'guest',
-    timestamp: stampFor(s.start),
-    text: s.text,
-  }))
+  const out: TranscriptSegment[] = []
+  let buffer = ''
+  let start = 0
+  let speaker: string | null = null
+
+  const flush = () => {
+    const text = buffer.trim()
+    if (!text) return
+    out.push({
+      id: String(out.length),
+      speaker: speaker || 'Transcript',
+      role: 'guest',
+      timestamp: stampFor(start),
+      text,
+    })
+    buffer = ''
+  }
+
+  for (const seg of stored) {
+    const text = (seg.text || '').trim()
+    if (!text) continue
+    if (buffer && seg.speaker !== speaker) flush()
+    if (!buffer) {
+      start = seg.start
+      speaker = seg.speaker ?? null
+    }
+    buffer = buffer ? `${buffer} ${text}` : text
+    if (buffer.length >= BLOCK_CHARS || (buffer.length > BLOCK_CHARS / 2 && /[.!?]["')\]]?$/.test(text))) flush()
+  }
+  flush()
+  return out
 }
 
 /** True while the backend is still working on it — the UI polls in this state. */
