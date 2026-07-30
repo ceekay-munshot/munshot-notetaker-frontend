@@ -112,11 +112,12 @@ Two schema additions, both additive and created on demand. The first is
 existing row without refetching, unless `force: true`. A previously failed row
 retries.
 
-The second is a `worker_youtube_fetch_quota` table, which is **ours alone** —
+The second is a `worker_youtube_fetch_budget` table, which is **ours alone** —
 nothing else reads it, and it is not one of the two shared transcript tables. It
-holds a per-account hourly count of how many videos this Worker was asked to
-fetch, reserved with a single upsert so a burst of concurrent requests can't all
-slip past the limit. That ceiling is what stops one account looping
+is a per-account token bucket over how many videos this Worker is asked to
+fetch: tokens refill continuously and each fetch spends one, reserved by a
+single upsert so neither a burst of concurrent requests nor an hour boundary
+lets an account past the ceiling. That ceiling is what stops one account looping
 add → delete → re-add (which frees the row cap and erases the record of prior
 work) until YouTube bot-gates the shared egress.
 

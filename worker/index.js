@@ -5313,38 +5313,43 @@ const YT_FETCH_WINDOW_MS = 60 * 60 * 1000;
 // This table is OURS and additive — it is not one of the two transcript tables
 // AWS shares, and nothing else reads it. Created on demand so no migration step
 // is needed.
+//
+// It is a token bucket, not an hourly counter. Fixed epoch-hour buckets reset on
+// the clock, so an account could spend its whole allowance just before the
+// boundary and the whole of the next one just after — 60 fetches in seconds,
+// which is exactly the burst the limit exists to prevent. Tokens refill
+// continuously at quota-per-window, so the ceiling holds no matter where the
+// requests fall.
 let ytQuotaTableReady = false;
 async function ensureQuotaTable(env) {
   if (ytQuotaTableReady) return;
   await env.DB.prepare(
-    "CREATE TABLE IF NOT EXISTS worker_youtube_fetch_quota (" +
-      "owner_email TEXT NOT NULL, window_start INTEGER NOT NULL, used INTEGER NOT NULL, " +
-      "PRIMARY KEY (owner_email, window_start))"
+    "CREATE TABLE IF NOT EXISTS worker_youtube_fetch_budget (" +
+      "owner_email TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_ms INTEGER NOT NULL)"
   ).run();
+  // The fixed-window table this replaced, from one deploy earlier. Ours, and
+  // only ever held rate-limit counters.
+  await env.DB.prepare("DROP TABLE IF EXISTS worker_youtube_fetch_quota").run().catch(() => {});
   ytQuotaTableReady = true;
 }
 
 async function ytFetchQuota(env, email) {
   if (!env.DB) return { ok: true };
-  const windowStart = Math.floor(Date.now() / YT_FETCH_WINDOW_MS);
+  const now = Date.now();
   try {
     await ensureQuotaTable(env);
+    // One statement does refill, spend and refusal together, so the read and the
+    // write can't be split by a concurrent request. MIN() caps the refill at a
+    // full bucket; the WHERE refuses anyone without a whole token to spend.
+    const refill = "MIN(?2, tokens + CAST(?3 - updated_ms AS REAL) * ?2 / ?4)";
     const res = await env.DB.prepare(
-      "INSERT INTO worker_youtube_fetch_quota (owner_email, window_start, used) VALUES (?1, ?2, 1) " +
-        "ON CONFLICT(owner_email, window_start) DO UPDATE SET used = used + 1 WHERE used < ?3"
+      "INSERT INTO worker_youtube_fetch_budget (owner_email, tokens, updated_ms) VALUES (?1, ?2 - 1, ?3) " +
+        `ON CONFLICT(owner_email) DO UPDATE SET tokens = ${refill} - 1, updated_ms = ?3 WHERE ${refill} >= 1`
     )
-      .bind(normalizeEmail(email), windowStart, YT_FETCH_QUOTA)
+      .bind(normalizeEmail(email), YT_FETCH_QUOTA, now, YT_FETCH_WINDOW_MS)
       .run();
-    // Nothing changed: the upsert's WHERE refused it, i.e. the window is spent.
     if (!((res && res.meta && res.meta.changes) || 0)) {
       return { ok: false, error: `You've transcribed ${YT_FETCH_QUOTA} videos in the past hour — try again later.` };
-    }
-    // Old windows are dead weight; clear them opportunistically.
-    if (windowStart % 8 === 0) {
-      await env.DB.prepare("DELETE FROM worker_youtube_fetch_quota WHERE window_start < ?1")
-        .bind(windowStart - 2)
-        .run()
-        .catch(() => {});
     }
   } catch {
     /* D1 hiccup — don't block a legitimate transcription on the limiter */
@@ -5461,6 +5466,12 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     return { ok: true, row: row || null, failed: true, code: result.code, error: result.error };
   }
 
+  // The row can still have been deleted while this request was fetching — a
+  // stale claim is deletable by design. Writing segments for a parent that no
+  // longer exists would leave rows nothing can reach or clean up.
+  if (!(await ytRowById(env, id))) {
+    return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
+  }
   await ytReplaceSegments(env, id, email, result.language, result.segments);
   const completedAt = nowIso();
   await ytUpdateRow(env, id, {
@@ -5729,6 +5740,17 @@ async function handleDeleteVideo(request, env) {
   const body = await request.json().catch(() => ({}));
   const row = await ytRowForSession(env, session, body.id);
   if (!row) return json({ error: "Not found" }, 404);
+  // Deleting a row another request is actively writing would leave that writer
+  // to finish into a parent that no longer exists — orphaned segments, and a
+  // 500 for the request that was doing real work. A row only counts as held
+  // while its claim is fresh, so one abandoned by an interrupted request is
+  // still removable.
+  if (row.status === "processing" || row.status === "queued") {
+    const age = Date.now() - (Date.parse(row.updated_at || row.created_at || "") || 0);
+    if (age < YT_PROCESSING_STALE_MS) {
+      return json({ error: "This video is still being transcribed — try again in a moment", code: "IN_PROGRESS" }, 409);
+    }
+  }
   try {
     await ytDeleteTranscript(env, row.transcript_id);
   } catch (err) {
