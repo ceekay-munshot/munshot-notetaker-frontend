@@ -53,6 +53,9 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   // changed is dropped instead of showing the previous account's videos.
   const identityRef = useRef(email)
   identityRef.current = email
+  // Admin's list legitimately spans every account; a normal session's does not.
+  const adminSessionRef = useRef(false)
+  adminSessionRef.current = authed && state.isAdmin
 
   const load = useCallback(async (opts?: { quiet?: boolean }) => {
     const issuedFor = identityRef.current
@@ -115,6 +118,13 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   )
 
   const applyVideo = useCallback((video: VideoRecord) => {
+    // Never fold a record from another account into this account's list. Every
+    // caller here writes after an await (add, restore-after-failed-delete, the
+    // detail view's refresh), and the provider stays mounted across an identity
+    // switch — so without this an in-flight response for account A could land in
+    // account B's freshly-cleared list and expose A's video.
+    const current = identityRef.current
+    if (!adminSessionRef.current && video.owner.toLowerCase() !== current.toLowerCase()) return
     setVideos((prev) => {
       const i = prev.findIndex((v) => v.id === video.id && v.owner === video.owner)
       if (i !== -1) {
@@ -129,7 +139,9 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const addVideo = useCallback(async (url: string) => {
+    const issuedFor = identityRef.current
     const { video } = await api.addVideo(url)
+    if (identityRef.current !== issuedFor) return video // the account changed mid-flight
     // Show it immediately — KV list is eventually consistent, so re-listing right
     // after the write can miss the new key (the same reason schedules are added
     // optimistically rather than re-listed).
@@ -141,12 +153,15 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   // Never rejects: a failed delete puts the row back and reports why, so the
   // row can't just vanish and silently reappear on the next poll.
   const removeVideo = useCallback(async (video: VideoRecord) => {
+    const issuedFor = identityRef.current
     setVideos((prev) => prev.filter((v) => !(v.id === video.id && v.owner === video.owner))) // optimistic
     try {
       await api.deleteVideo(video.id, video.owner)
+      if (identityRef.current !== issuedFor) return // the account changed mid-flight
       setError(null)
       await load({ quiet: true })
     } catch (err) {
+      if (identityRef.current !== issuedFor) return
       applyVideo(video) // put it back where it was
       setError((err as Error)?.message || 'Could not remove that video.')
     }
