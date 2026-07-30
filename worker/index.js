@@ -77,6 +77,7 @@ export default {
       if (method === "POST" && pathname === "/api/calendar/meetings/remove") return handleCalendarRemove(request, env);
       if (method === "POST" && pathname === "/api/calendar/meetings/restore") return handleCalendarRestore(request, env);
       if (method === "POST" && pathname === "/api/calendar/unsubscribe") return handleCalendarUnsubscribe(request, env);
+      if (method === "GET" && pathname === "/api/version") return handleVersion();
       if (method === "GET" && pathname === "/api/config") return handleGetConfig(request, env);
       if (method === "POST" && pathname === "/api/config") return handleSetConfig(request, env);
       if (method === "GET" && pathname === "/api/tracking/directory") return handleTrackingDirectory(request, env);
@@ -1859,6 +1860,27 @@ async function buildChatRequest({ rows, history, apiKey, model, planModel, title
       grounding,
     },
   };
+}
+
+// A build marker, bumped whenever the chat pipeline changes shape. Nothing but
+// a deploy can change what this returns, which is the point: "is the new code
+// actually live?" should cost one request, not three rounds of inference from
+// how an answer is phrased. Deliberately public and deliberately boring — a
+// version string and a feature list, no data, no secrets, no session needed.
+const BUILD_MARKER = "chat-pipeline-v2";
+
+function handleVersion() {
+  return json({
+    ok: true,
+    build: BUILD_MARKER,
+    meetingChat: {
+      passes: ["resolve-names", "read-every-slice", "answer"],
+      phoneticRetrieval: true,
+      citesTimestamps: true,
+      debugFlag: true,
+    },
+    weeklyChat: { passes: ["resolve-names", "read-every-meeting", "answer"], readsTranscripts: true },
+  });
 }
 
 // Chat over a single meeting's transcript with OpenAI. The transcript is loaded
