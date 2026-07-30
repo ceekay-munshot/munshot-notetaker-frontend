@@ -3814,6 +3814,41 @@ async function refreshVideo(env, rec) {
   return next;
 }
 
+// Which in-flight records this list call should poll upstream. Refreshing every
+// one of them would be unbounded (a list call would fan out to one subrequest
+// per pending video), so it's capped — but a fixed "newest N" slice would starve
+// everything past the cap: with more pending jobs than the cap, the same newest
+// N are chosen every time (readVideos sorts newest-first), and an older job that
+// finished upstream could read as queued indefinitely behind a slow one. So the
+// window ROTATES: a per-scope cursor in KV advances by the batch size each call,
+// giving every pending record its turn within a few polls. The cursor is only
+// read/written when there are actually more pending records than the cap, so the
+// common case (a handful of videos) costs nothing extra and refreshes all of them.
+function ytCursorKey(scope) {
+  return `ytcursor:v1:${encodeURIComponent(scope)}`;
+}
+
+async function pendingRefreshBatch(env, scope, pending) {
+  if (pending.length <= YT_REFRESH_BATCH) return pending;
+  let start = 0;
+  try {
+    start = Number(await env.KV.get(ytCursorKey(scope))) || 0;
+  } catch {
+    /* KV hiccup — start from the top rather than skipping the refresh */
+  }
+  if (!Number.isFinite(start) || start < 0) start = 0;
+  start %= pending.length;
+  // Wrap around the end so the window is always full, even at the tail.
+  const batch = [];
+  for (let i = 0; i < YT_REFRESH_BATCH; i++) batch.push(pending[(start + i) % pending.length]);
+  try {
+    await env.KV.put(ytCursorKey(scope), String((start + YT_REFRESH_BATCH) % pending.length));
+  } catch {
+    /* best-effort — a lost cursor write just repeats this window once */
+  }
+  return batch;
+}
+
 // GET /api/youtube — the signed-in user's videos (admin: everyone's, or one
 // user's with ?email=). In-flight jobs are refreshed inline so the list is live
 // and the client only has to re-poll this one route.
@@ -3822,6 +3857,9 @@ async function handleListVideos(request, env) {
   if (!session) return json({ error: "Not authenticated" }, 401);
   const url = new URL(request.url);
   const filter = normalizeEmail(url.searchParams.get("email") || "");
+  // Which set of records this call is listing — also the rotation cursor's key,
+  // so admin's cross-account view and a user's own list rotate independently.
+  const scope = session.isAdmin ? (filter ? `admin:${filter}` : "admin:all") : normalizeEmail(session.identity);
 
   let records;
   try {
@@ -3832,9 +3870,10 @@ async function handleListVideos(request, env) {
     return json({ error: "Failed to load your videos", detail: String((err && err.message) || err) }, 500);
   }
 
-  const pending = records.filter((r) => !YT_TERMINAL.has(r.status)).slice(0, YT_REFRESH_BATCH);
-  if (pending.length) {
-    const fresh = await Promise.all(pending.map((r) => refreshVideo(env, r).catch(() => r)));
+  const pending = records.filter((r) => !YT_TERMINAL.has(r.status));
+  const batch = await pendingRefreshBatch(env, scope, pending);
+  if (batch.length) {
+    const fresh = await Promise.all(batch.map((r) => refreshVideo(env, r).catch(() => r)));
     const byKey = new Map(fresh.map((r) => [r._key, r]));
     records = records.map((r) => byKey.get(r._key) || r);
   }
@@ -3855,13 +3894,15 @@ async function handleCreateVideo(request, env) {
   const owner = normalizeEmail(session.identity);
 
   const existing = await readVideos(env, ytPrefixFor(owner)).catch(() => []);
+  // Re-adding a video you already have hands back the one you have, instead of
+  // paying for a second transcription of the same thing. This is checked BEFORE
+  // the capacity limit: re-adding claims no new slot, so a full list must still
+  // resolve to the record it already holds rather than a "delete one first".
+  const already = existing.find((r) => r.videoId === parsed.videoId && r.status !== "failed");
+  if (already) return json({ ok: true, video: publicVideo(already), duplicate: true });
   if (existing.length >= MAX_VIDEOS_PER_USER) {
     return json({ error: `You can keep up to ${MAX_VIDEOS_PER_USER} videos — delete one first` }, 400);
   }
-  // Re-adding a video you already have hands back the one you have, instead of
-  // paying for a second transcription of the same thing.
-  const already = existing.find((r) => r.videoId === parsed.videoId && r.status !== "failed");
-  if (already) return json({ ok: true, video: publicVideo(already), duplicate: true });
 
   let upstream, text;
   try {

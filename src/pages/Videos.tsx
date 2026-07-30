@@ -227,6 +227,9 @@ function VideoRow({
       tabIndex={0}
       onClick={onOpen}
       onKeyDown={(e) => {
+        // Only the row itself opens on Enter/Space — a keydown that bubbled up
+        // from the nested Remove button must activate THAT button, not this row.
+        if (e.target !== e.currentTarget) return
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault()
           onOpen()
