@@ -432,15 +432,28 @@ export async function fetchVideos(email?: string): Promise<VideoList> {
   return { videos: data.videos || [], admin: !!data.admin }
 }
 
-/** Queue a YouTube link for transcription under the signed-in account. Adding a
- *  video already in the list returns that one (`duplicate`) instead of paying
- *  for a second transcription of the same video. */
-export async function addVideo(url: string): Promise<{ video: VideoRecord; duplicate: boolean }> {
-  const data = await request<{ ok: boolean; video: VideoRecord; duplicate?: boolean }>('/api/youtube', {
-    method: 'POST',
-    body: JSON.stringify({ url }),
-  })
-  return { video: data.video, duplicate: !!data.duplicate }
+/** Transcribe a YouTube link under the signed-in account. The Worker fetches and
+ *  stores the captions inline, so the result is already known when this resolves:
+ *  `failed` + `error` when the video couldn't be transcribed (no captions, a live
+ *  stream, an unavailable video, a bot-gated fetch). Adding a video already in the
+ *  list returns that one (`duplicate`) instead of transcribing it twice. */
+export async function addVideo(url: string): Promise<{ video: VideoRecord; duplicate: boolean; failed: boolean; error: string }> {
+  const data = await request<{
+    ok: boolean
+    video: VideoRecord
+    duplicate?: boolean
+    failed?: boolean
+    error?: string | null
+  }>('/api/youtube', { method: 'POST', body: JSON.stringify({ url }) })
+  // Transcription runs inline, so the row can come back already failed — with
+  // its reason. That is not an HTTP error (the video IS in the list now), so the
+  // caller has to surface it rather than reporting a success.
+  return {
+    video: data.video,
+    duplicate: !!data.duplicate,
+    failed: !!data.failed || data.video?.status === 'failed',
+    error: String(data.error || data.video?.error || ''),
+  }
 }
 
 /** One video plus its transcript. `segments` is the stored, already-timed

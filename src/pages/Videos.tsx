@@ -125,7 +125,11 @@ export default function Videos() {
 
 /** The add box: paste a YouTube link, the backend transcribes it, and it lands
  *  in this account's list as "Queued" and updates itself as it progresses. */
-function AddVideo({ onAdd }: { onAdd: (url: string) => Promise<VideoRecord> }) {
+function AddVideo({
+  onAdd,
+}: {
+  onAdd: (url: string) => Promise<{ video: VideoRecord; failed: boolean; error: string }>
+}) {
   const [url, setUrl] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -143,13 +147,18 @@ function AddVideo({ onAdd }: { onAdd: (url: string) => Promise<VideoRecord> }) {
     setError(null)
     setNote(null)
     try {
-      const video = await onAdd(value)
+      const { video, failed, error: why } = await onAdd(value)
       setUrl('')
-      setNote(
-        isVideoPending(video)
-          ? 'Queued — transcription usually takes a few minutes. This list updates itself.'
-          : 'Added — that video was already transcribed.',
-      )
+      // The transcript is fetched inline, so a failure is already known here —
+      // report it instead of a success note. The row stays in the list carrying
+      // the same reason.
+      if (failed) setError(why || video.error || 'That video could not be transcribed.')
+      else
+        setNote(
+          isVideoPending(video)
+            ? 'Transcribing — this list updates itself.'
+            : `Transcribed — ${video.title || 'the video'} is ready.`,
+        )
     } catch (err) {
       setError((err as Error)?.message || 'Could not queue that video.')
     } finally {

@@ -25,9 +25,11 @@ interface VideosData {
   error: string | null
   videoByHandle: (handle: string) => VideoRecord | undefined
   refresh: () => Promise<void>
-  /** Queue a YouTube link. Resolves with the record (existing one if already
-   *  added); rejects with the server's message so the form can show it. */
-  addVideo: (url: string) => Promise<VideoRecord>
+  /** Transcribe a YouTube link. Resolves with the stored record — which may
+   *  already be `failed`, since transcription runs inline, so the caller must
+   *  check `failed`/`error` rather than assuming success. Rejects with the
+   *  server's message when the request itself is refused. */
+  addVideo: (url: string) => Promise<{ video: VideoRecord; failed: boolean; error: string }>
   removeVideo: (video: VideoRecord) => Promise<void>
   /** Fold a fresher copy of one video (e.g. from the detail view) into the list. */
   applyVideo: (video: VideoRecord) => void
@@ -140,14 +142,14 @@ export function VideosProvider({ children }: { children: ReactNode }) {
 
   const addVideo = useCallback(async (url: string) => {
     const issuedFor = identityRef.current
-    const { video } = await api.addVideo(url)
-    if (identityRef.current !== issuedFor) return video // the account changed mid-flight
+    const { video, failed, error } = await api.addVideo(url)
+    if (identityRef.current !== issuedFor) return { video, failed, error } // the account changed mid-flight
     // Show it immediately — KV list is eventually consistent, so re-listing right
     // after the write can miss the new key (the same reason schedules are added
     // optimistically rather than re-listed).
     applyVideo(video)
     setError(null)
-    return video
+    return { video, failed, error }
   }, [applyVideo])
 
   // Never rejects: a failed delete puts the row back and reports why, so the

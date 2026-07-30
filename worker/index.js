@@ -3500,6 +3500,13 @@ const YT_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 const YT_ID_FLOOR = 1000000000;
 const YT_ID_ATTEMPTS = 25; // same-millisecond id collisions retry from the floor up
 const YT_SEGMENT_CHUNK = 100; // segment INSERTs per D1 batch
+// Bounds what one account can make us fetch and store: every submission is a
+// YouTube round trip plus a row and potentially thousands of segment rows.
+const MAX_VIDEOS_PER_USER = 300;
+// A row left "processing" by an interrupted request would otherwise look like
+// an active concurrent write forever, and the video would sit transcribing for
+// good. Past this age it is treated as orphaned and retried.
+const YT_PROCESSING_STALE_MS = 2 * 60 * 1000;
 // The public InnerTube web key, used only when the (bot-gated) watch page didn't
 // give us one to scrape. Not a secret — it ships in every youtube.com page.
 const YT_PUBLIC_INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
@@ -3682,7 +3689,9 @@ async function fetchPlayerResponse(env, videoId) {
     }
     if (fallback) {
       const { reason } = playabilityOf(fallback);
-      if (!looksBotGated(reason, "")) return { ok: true, player: fallback };
+      // `degraded` records that the watch page was gated, so what came back is
+      // whatever YouTube is willing to tell a blocked IP — see the caller.
+      if (!looksBotGated(reason, "")) return { ok: true, player: fallback, degraded: true };
     }
     if (!player) return { ok: false, code: "BOT_GATED", error: YT_MESSAGES.BOT_GATED };
     if (looksBotGated(playabilityOf(player).reason, html)) {
@@ -3798,6 +3807,13 @@ async function fetchYoutubeTranscript(env, videoId) {
   const got = await fetchPlayerResponse(env, videoId);
   if (!got.ok) return got;
   const player = got.player;
+  // The watch page was bot-gated and this came from the fallback, so YouTube is
+  // already treating this egress as a bot. Verified against the deployed Worker:
+  // in that state it answers with the video's REAL title but UNPLAYABLE /
+  // "Video unavailable" and zero caption tracks — for videos that are perfectly
+  // available elsewhere. Reporting that as "unavailable" or "no captions" would
+  // blame the video for our own egress being blocked, so both read as gated.
+  const degraded = !!got.degraded;
   const details = player.videoDetails || {};
   const { status, reason } = playabilityOf(player);
 
@@ -3805,13 +3821,18 @@ async function fetchYoutubeTranscript(env, videoId) {
     return { ok: false, code: "IS_LIVE", error: YT_MESSAGES.IS_LIVE };
   }
   if (status && status !== "OK") {
+    if (degraded) return { ok: false, code: "BOT_GATED", error: YT_MESSAGES.BOT_GATED };
     // Pass YouTube's own wording through for private / removed / age-gated.
     return { ok: false, code: "UNAVAILABLE", error: reason || YT_MESSAGES.UNAVAILABLE };
   }
 
   const tracklist = player.captions && player.captions.playerCaptionsTracklistRenderer;
   const tracks = (tracklist && Array.isArray(tracklist.captionTracks) && tracklist.captionTracks) || [];
-  if (!tracks.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+  if (!tracks.length) {
+    return degraded
+      ? { ok: false, code: "BOT_GATED", error: YT_MESSAGES.BOT_GATED }
+      : { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+  }
 
   const track = pickCaptionTrack(tracks, videoLanguageOf(player));
   if (!track) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
@@ -3895,6 +3916,13 @@ async function ytRowsForOwner(env, owner) {
   return res.results || [];
 }
 
+async function ytCountForOwner(env, owner) {
+  const res = await env.DB.prepare("SELECT COUNT(*) AS n FROM youtube_transcripts WHERE owner_email = ?1")
+    .bind(normalizeEmail(owner))
+    .all();
+  return Number((res.results && res.results[0] && res.results[0].n) || 0);
+}
+
 async function ytSegmentRows(env, id) {
   const res = await env.DB.prepare(
     "SELECT segment_index, start_time, end_time, text, speaker, language FROM youtube_transcript_segments " +
@@ -3934,14 +3962,16 @@ async function ytInsertRow(env, row) {
           row.completed_at || null
         )
         .run();
-      return candidate;
+      return { id: candidate, existed: false };
     } catch (err) {
       const message = String((err && err.message) || err);
       // A clash on (owner_email, video_id) means someone else just created the
       // same transcript — hand back whatever now exists instead of duplicating.
       if (/uq_yt_owner_video|owner_email/i.test(message)) {
         const existing = await ytRowByOwnerVideo(env, row.owner_email, row.video_id);
-        if (existing) return existing.transcript_id;
+        // The caller must NOT go on to fetch and write segments for a row it
+        // didn't create — both requests would replace each other's segments.
+        if (existing) return { id: existing.transcript_id, existed: true };
       }
       if (!/UNIQUE|PRIMARY KEY|constraint/i.test(message)) throw err;
       candidate++;
@@ -4045,17 +4075,38 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
 
   const existing = await ytRowByOwnerVideo(env, email, parsed.videoId);
   if (existing && !opts.force) {
-    // Completed, or still being written by a concurrent request: hand it back.
-    if (existing.status !== "failed") return { ok: true, row: existing, reused: true };
+    if (existing.status === "completed") return { ok: true, row: existing, reused: true };
+    // A row another request is actively writing is handed back as-is; one left
+    // behind by an interrupted request is retried below rather than pinning the
+    // video in "transcribing" forever.
+    if (existing.status === "processing" || existing.status === "queued") {
+      const age = Date.now() - (Date.parse(existing.updated_at || existing.created_at || "") || 0);
+      if (age < YT_PROCESSING_STALE_MS) return { ok: true, row: existing, reused: true };
+    }
   }
+
+  // A forced refresh of a transcript that already works must not destroy it: the
+  // row keeps its completed state and segments until a replacement is in hand.
+  const preserveOnFailure = !!existing && existing.status === "completed";
 
   const at = nowIso();
   let id;
   if (existing) {
     id = existing.transcript_id;
-    await ytUpdateRow(env, id, { status: "processing", error: null, updated_at: at, url: parsed.url });
+    if (!preserveOnFailure) {
+      await ytUpdateRow(env, id, { status: "processing", error: null, updated_at: at, url: parsed.url });
+    }
   } else {
-    id = await ytInsertRow(env, {
+    const count = await ytCountForOwner(env, email);
+    if (count >= MAX_VIDEOS_PER_USER) {
+      return {
+        ok: false,
+        status: 400,
+        code: "LIMIT_REACHED",
+        error: `You can keep up to ${MAX_VIDEOS_PER_USER} videos — delete one first`,
+      };
+    }
+    const inserted = await ytInsertRow(env, {
       owner_email: email,
       video_id: parsed.videoId,
       url: parsed.url,
@@ -4063,6 +4114,14 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
       created_at: at,
       updated_at: at,
     });
+    // Lost the race to a concurrent request for the same video: that request
+    // owns the fetch and the segment write, so return its row rather than
+    // running the same pipeline against the same rows.
+    if (inserted.existed) {
+      const winner = await ytRowById(env, inserted.id);
+      if (winner) return { ok: true, row: winner, reused: true };
+    }
+    id = inserted.id;
   }
 
   let result;
@@ -4073,10 +4132,15 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   }
 
   if (!result.ok) {
-    const failedAt = nowIso();
-    await ytUpdateRow(env, id, { status: "failed", error: result.error || YT_MESSAGES.UPSTREAM_ERROR, updated_at: failedAt });
+    if (preserveOnFailure) {
+      // Keep the working transcript; report why the refresh didn't happen.
+      await ytUpdateRow(env, id, { updated_at: nowIso() });
+      const kept = await ytRowById(env, id);
+      return { ok: true, row: kept || existing, refreshFailed: true, code: result.code, error: result.error };
+    }
+    await ytUpdateRow(env, id, { status: "failed", error: result.error || YT_MESSAGES.UPSTREAM_ERROR, updated_at: nowIso() });
     const row = await ytRowById(env, id);
-    return { ok: true, row: row || null, failed: true, code: result.code };
+    return { ok: true, row: row || null, failed: true, code: result.code, error: result.error };
   }
 
   await ytReplaceSegments(env, id, email, result.language, result.segments);
@@ -4093,6 +4157,15 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     updated_at: completedAt,
     completed_at: completedAt,
   });
+  // The cached summary was written from the OLD captions, so a replacement
+  // transcript must invalidate it or the brief silently describes stale content.
+  if (opts.force && env.KV) {
+    try {
+      await env.KV.delete(`${YT_SUMMARY_PREFIX}${parsed.videoId}`);
+    } catch {
+      /* best-effort */
+    }
+  }
   return { ok: true, row: await ytRowById(env, id) };
 }
 
@@ -4286,7 +4359,21 @@ async function handleCreateVideo(request, env) {
   }
   if (!result.ok) return json({ error: result.error, code: result.code }, result.status || 400);
   if (!result.row) return json({ error: YT_MESSAGES.UPSTREAM_ERROR, code: "UPSTREAM_ERROR" }, 502);
-  return json({ ok: true, video: publicVideo(result.row), duplicate: !!result.reused }, result.reused ? 200 : 202);
+  // Transcription runs inline, so its outcome is already known here. The row is
+  // returned either way (a failed video belongs in the list, with its reason),
+  // but `failed` tells the client not to report this as a success.
+  return json(
+    {
+      ok: true,
+      video: publicVideo(result.row),
+      duplicate: !!result.reused,
+      failed: !!result.failed,
+      refreshFailed: !!result.refreshFailed,
+      error: result.error || null,
+      code: result.code || null,
+    },
+    result.reused ? 200 : 202,
+  );
 }
 
 // GET /api/youtube/video?id=…&owner=… — one video, its transcript segments, and
