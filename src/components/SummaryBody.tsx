@@ -1,4 +1,6 @@
+import { useMemo } from 'react'
 import { RichText } from './RichText'
+import { Icon } from './Icon'
 import { parseSummaryBlock } from '../lib/summaryFormat'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,9 +59,74 @@ export function SummaryBody({ blocks, terms }: { blocks: string[]; terms: string
   )
 }
 
+// The [MM:SS] / [H:MM:SS] citations the assistant is asked to attach to every
+// specific claim. Captured so the text can be split on them and each one turned
+// into a jump back to the line it came from — an answer you can verify in one
+// click rather than one you have to take on faith. Shared by the meeting and
+// video chats, since both assistants are asked to cite the same way.
+const CITATION = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g
+
+function clockToSeconds(stamp: string): number | null {
+  const parts = stamp.split(':')
+  if (parts.length < 2 || parts.length > 3) return null
+  const nums = parts.map((p) => Number(p))
+  if (nums.some((n) => !Number.isFinite(n) || n < 0)) return null
+  return nums.reduce((acc, n) => acc * 60 + n, 0)
+}
+
+/** A line of an answer: entity/number/sentiment styling as everywhere else, with
+ *  timestamp citations lifted out into clickable chips. */
+function AnswerLine({ text, terms, onCite }: { text: string; terms: string[]; onCite?: (sec: number) => void }) {
+  const parts = useMemo(() => {
+    const out: { text: string; sec?: number }[] = []
+    let last = 0
+    for (const m of text.matchAll(CITATION)) {
+      const sec = clockToSeconds(m[1])
+      if (sec == null) continue
+      if (m.index > last) out.push({ text: text.slice(last, m.index) })
+      out.push({ text: m[1], sec })
+      last = m.index + m[0].length
+    }
+    if (last < text.length) out.push({ text: text.slice(last) })
+    return out
+  }, [text])
+
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.sec == null ? (
+          <RichText key={i} text={p.text} terms={terms} />
+        ) : onCite ? (
+          <button
+            key={i}
+            onClick={() => onCite(p.sec!)}
+            title="Open this moment in the transcript"
+            className="press mx-0.5 inline-flex items-center gap-0.5 rounded-md border border-outline-variant bg-surface-container-low px-1.5 py-px align-baseline text-[12px] font-semibold tabular-nums text-primary hover:border-primary hover:bg-[#eff5ff]"
+          >
+            <Icon name="play_arrow" size={11} className="shrink-0" fill />
+            {p.text}
+          </button>
+        ) : (
+          <span key={i} className="font-semibold tabular-nums text-primary">
+            {p.text}
+          </span>
+        ),
+      )}
+    </>
+  )
+}
+
 /** A chat answer — the same light markdown (bold **headers**, "- " bullets,
  *  paragraphs) at a compact, uniform chat size. */
-export function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
+export function ChatAnswer({
+  text,
+  terms,
+  onCite,
+}: {
+  text: string
+  terms: string[]
+  onCite?: (sec: number) => void
+}) {
   const isBullet = (l: string) => /^([-*•]|\d+[.)])\s+/.test(l)
   const stripBullet = (l: string) => l.replace(/^([-*•]|\d+[.)])\s+/, '')
   const blocks = text
@@ -84,7 +151,7 @@ export function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
             {header && <p className="mb-1 font-semibold text-on-surface">{header}</p>}
             {paras.map((p, j) => (
               <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
-                <RichText text={p} terms={terms} />
+                <AnswerLine text={p} terms={terms} onCite={onCite} />
               </p>
             ))}
             {bullets.length > 0 && (
@@ -93,7 +160,7 @@ export function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
                   <li key={`b${j}`} className="flex gap-2">
                     <span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
                     <span className="min-w-0">
-                      <RichText text={b} terms={terms} />
+                      <AnswerLine text={b} terms={terms} onCite={onCite} />
                     </span>
                   </li>
                 ))}

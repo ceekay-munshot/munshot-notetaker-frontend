@@ -5,7 +5,8 @@ import { useAppData } from '../store/AppData'
 import { useSentiment } from '../store/Sentiment'
 import { downloadSummary } from '../lib/exportSummary'
 import { downloadSummaryPdf } from '../lib/pdfRender'
-import { ApiError, chatMeeting, checkMeetingRecording, emailEpisodeSummary, meetingRecordingUrl, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
+import { ApiError, chatMeeting, checkMeetingRecording, diagnoseMeetingChat, emailEpisodeSummary, meetingRecordingUrl, registerWeeklyRecipient, unregisterWeeklyRecipient } from '../lib/api'
+import type { ChatTrace } from '../lib/api'
 import { addRecipient, loadRecipients, removeRecipient } from '../lib/recipientsStore'
 import { formatDuration, longDate, statusMeta } from '../lib/format'
 import type { Episode, EpisodeInsight, ProcessingStatus, QuantPoint, Takeaway, TranscriptSegment } from '../lib/types'
@@ -148,6 +149,22 @@ export default function EpisodeDetail() {
     }
   }
 
+  // A [MM:SS] citation in a chat answer → the transcript line it came from. The
+  // model quotes the timestamps the Worker printed on each line, so the match is
+  // usually exact; `<=` picks the line that was being spoken at that moment when
+  // it isn't, rather than dropping the jump.
+  function openCitation(sec: number) {
+    const segs = episode?.transcript ?? []
+    if (!segs.length) return
+    let best: TranscriptSegment | undefined
+    for (const seg of segs) {
+      const at = parseClock(seg.timestamp)
+      if (at == null || at > sec + 1) continue
+      best = seg
+    }
+    openTranscript((best ?? segs[0]).id, `Cited in chat at ${formatClock(sec)}`)
+  }
+
   // Force-regenerate this episode's summary, bypassing the server + client caches
   // (and overwriting them). The content stays visible until the fresh version lands.
   async function refreshSummary() {
@@ -241,7 +258,7 @@ export default function EpisodeDetail() {
           {tab === 'transcript' && (
             <TranscriptTab episode={episode} focusId={jumpTo} focusLabel={jumpLabel} focusTick={jumpTick} />
           )}
-          {tab === 'chat' && <ChatTab episode={episode} />}
+          {tab === 'chat' && <ChatTab episode={episode} onCite={openCitation} />}
         </>
       )}
     </div>
@@ -692,14 +709,36 @@ const CHAT_SUGGESTIONS = [
   'Give me a quick recap of what each person said',
 ]
 
-function ChatTab({ episode }: { episode: Episode }) {
+function ChatTab({ episode, onCite }: { episode: Episode; onCite?: (sec: number) => void }) {
   const terms = useMemo(() => entityTerms(episode.entities), [episode.entities])
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [trace, setTrace] = useState<ChatTrace | null>(null)
+  const [tracing, setTracing] = useState(false)
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Re-runs the last question with the Worker's debug flag, so a wrong answer
+  // can be pinned on a specific stage instead of guessed at. The number that
+  // matters most is `lines`: if the Worker loaded far fewer lines than the
+  // Transcript tab shows, the model never had the answer and no amount of
+  // prompting would have helped.
+  async function diagnose() {
+    const upto = [...messages]
+    while (upto.length && upto[upto.length - 1].role === 'assistant') upto.pop()
+    if (!upto.length || tracing) return
+    setTracing(true)
+    setError(null)
+    try {
+      setTrace(await diagnoseMeetingChat(episode, upto))
+    } catch (err) {
+      setError((err as Error)?.message || 'Could not read the diagnostics.')
+    } finally {
+      setTracing(false)
+    }
+  }
 
   // Keep the newest message (and the typing indicator) in view.
   useEffect(() => {
@@ -801,13 +840,28 @@ function ChatTab({ episode }: { episode: Episode }) {
                   <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full chip-signal">
                     <Icon name="auto_awesome" size={16} className="text-primary" fill />
                   </span>
-                  <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-3.5 py-2.5">
-                    <ChatAnswer text={m.content} terms={terms} />
+                  <div className="min-w-0 max-w-[85%]">
+                    <div className="rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-3.5 py-2.5">
+                      <ChatAnswer text={m.content} terms={terms} onCite={onCite} />
+                    </div>
+                    {i === messages.length - 1 && (
+                      <button
+                        onClick={() => void diagnose()}
+                        disabled={tracing}
+                        title="Show what the assistant was actually given — how much transcript loaded, what it searched for, what it found"
+                        className="mt-1 inline-flex items-center gap-1 px-1 text-[11px] font-semibold text-secondary hover:text-primary disabled:opacity-50"
+                      >
+                        <Icon name="troubleshoot" size={13} />
+                        {tracing ? 'Checking…' : "Why this answer?"}
+                      </button>
+                    )}
                   </div>
                 </div>
               ),
             )
           )}
+
+          {trace && <ChatDiagnostics trace={trace} shown={episode.transcript?.length ?? 0} onClose={() => setTrace(null)} />}
 
           {busy && (
             <div className="flex gap-2.5">
@@ -866,6 +920,65 @@ function ChatTab({ episode }: { episode: Episode }) {
         </div>
       </div>
     </section>
+  )
+}
+
+// What the Worker assembled, in the order the questions get asked when an answer
+// looks wrong: did it load the transcript at all, did it search for the right
+// words, did it find them, and what did the readers see. `shown` is the line
+// count the Transcript tab renders — when the two disagree, the chat and the tab
+// are reading different data, and that is the bug rather than the prompt.
+function ChatDiagnostics({ trace, shown, onClose }: { trace: ChatTrace; shown: number; onClose: () => void }) {
+  const mismatch = shown > 0 && trace.lines < shown * 0.9
+  const found = trace.plan.resolved.filter((r) => r.transcript?.length)
+  const Row = ({ label, children }: { label: string; children: ReactNode }) => (
+    <div className="flex gap-2 py-1">
+      <span className="w-40 shrink-0 text-secondary">{label}</span>
+      <span className="min-w-0 flex-1 break-words">{children}</span>
+    </div>
+  )
+  return (
+    <div className="rounded-xl border border-outline-variant bg-surface-container-low px-3 py-2.5 text-[12px] leading-relaxed">
+      <div className="mb-1 flex items-center gap-2">
+        <Icon name="troubleshoot" size={14} className="text-primary" />
+        <span className="font-semibold text-on-surface">What the assistant was given</span>
+        <button onClick={onClose} className="ml-auto text-secondary hover:text-on-surface" aria-label="Close">
+          <Icon name="close" size={14} />
+        </button>
+      </div>
+      <Row label="Transcript loaded">
+        <span className={mismatch ? 'font-semibold text-error' : ''}>{trace.lines} lines</span>
+        {shown > 0 && <span className="text-secondary"> · Transcript tab shows {shown}</span>}
+        {mismatch && (
+          <span className="mt-0.5 block text-error">
+            The chat is reading less than the Transcript tab. It never had the missing lines — that is the bug,
+            not the wording of the answer.
+          </span>
+        )}
+      </Row>
+      <Row label="Searched for">{trace.terms.join(', ') || <span className="text-secondary">nothing</span>}</Row>
+      <Row label="Names resolved">
+        {found.length ? (
+          found.map((r) => `"${r.asked}" → ${r.transcript.join(' / ')}`).join('; ')
+        ) : (
+          <span className="text-secondary">none matched the meeting's vocabulary</span>
+        )}
+      </Row>
+      <Row label="Slices read">
+        {trace.chunksRead}/{trace.chunksTotal}
+        {!trace.mapNotes && trace.chunksRead > 0 && (
+          <span className="text-secondary"> · readers found nothing relevant</span>
+        )}
+      </Row>
+      <details className="mt-1.5">
+        <summary className="cursor-pointer font-semibold text-primary">
+          Full context sent to the model ({Math.round(trace.grounding.length / 1000)}k characters)
+        </summary>
+        <pre className="mt-1.5 max-h-72 overflow-auto whitespace-pre-wrap rounded-lg bg-surface p-2 text-[11px] text-on-surface">
+          {trace.grounding}
+        </pre>
+      </details>
+    </div>
   )
 }
 

@@ -9,6 +9,7 @@
     "dev:worker": "wrangler dev",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test:chat": "node scripts/chat-pipeline.test.mjs",
     "preview": "vite preview",
     "deploy": "npm run build && wrangler deploy"
   },
