@@ -9,7 +9,7 @@
 // get dropped) and the guarantee that matters most: when OpenAI is unreachable,
 // the phonetic layer still puts the buried line in front of the model.
 const calls = []
-globalThis.fetch = async (url, init) => {
+const stubFetch = async (url, init) => {
   const body = JSON.parse(init.body)
   calls.push(body)
   const isPlan = body.response_format?.type === 'json_object'
@@ -31,7 +31,8 @@ globalThis.fetch = async (url, init) => {
   return { ok: true, json: async () => ({ choices: [{ message: { content } }] }) }
 }
 
-const { buildChatRequest, chunkTranscript, transcriptVocabulary } = await import('../worker/index.js')
+globalThis.fetch = stubFetch
+const { buildChatRequest, buildWeeklyChatRequest, chunkTranscript, transcriptVocabulary } = await import('../worker/index.js')
 
 const rows = []
 // Realistic filler: 'Routine' opens a sentence, and the same word appears
@@ -75,6 +76,42 @@ const degraded = await buildChatRequest({ rows, history: [{ role: 'user', conten
 check('still returns messages', degraded.messages.length >= 3)
 check('phonetic retrieval still finds Nadam', degraded.messages[1].content.includes('Why is Nadam looking so incomplete?'))
 check('no reading notes claimed', !degraded.messages[1].content.includes('READING NOTES'))
+
+
+// ── Weekly chat — the same three passes, fanned out over meetings ────────────
+// Its old design could only see cached summaries, so any detail the summary
+// dropped was unanswerable. These assert it now reads the transcripts too.
+console.log('\nweekly chat')
+globalThis.fetch = stubFetch
+calls.length = 0
+const otherRows = []
+for (let i = 0; i < 120; i++) otherRows.push({ start_time: i * 5, speaker: 'Noel Vaz', text: 'Pricing discussion for the enterprise tier and the renewal timeline.' })
+const weekly = await buildWeeklyChatRequest({
+  transcripts: [
+    { meetingId: 'm1', title: 'Dashboard Review', rows },
+    { meetingId: 'm2', title: 'Pricing Sync', rows: otherRows },
+  ],
+  sources: [{ index: 1, meetingId: 'm1', title: 'Dashboard Review', summary: 'Reviewed the dashboard.' }],
+  master: 'A week of dashboard and pricing work.',
+  history: [{ role: 'user', content: 'discussion about nadam?' }],
+  apiKey: 'test', model: 'gpt-4o', planModel: 'gpt-4o-mini',
+})
+const wg = weekly.messages[1].content
+check('reads transcripts, not just summaries', wg.includes('Why is Nadam looking so incomplete?'))
+check('attributes evidence to its meeting', wg.includes('=== Dashboard Review ==='))
+check('keeps the summaries as well', wg.includes('A week of dashboard and pricing work'))
+check('spends readers on the matching meeting', weekly.trace.meetingsRead >= 1 && weekly.trace.meetingsRead <= 6, String(weekly.trace.meetingsRead))
+check('resolves the name across the week', wg.includes('NAME RESOLUTION'))
+
+console.log('\nweekly degradation when OpenAI is down')
+globalThis.fetch = async () => { throw new Error('network down') }
+const wDegraded = await buildWeeklyChatRequest({
+  transcripts: [{ meetingId: 'm1', title: 'Dashboard Review', rows }],
+  sources: [], master: 'A week of dashboard work.',
+  history: [{ role: 'user', content: 'discussion about nadam?' }],
+  apiKey: 'x', model: 'gpt-4o',
+})
+check('still grounds on the transcript', wDegraded.messages[1].content.includes('Why is Nadam looking so incomplete?'))
 
 console.log(`\n${pass} passed, ${fail} failed`)
 process.exit(fail ? 1 : 0)
