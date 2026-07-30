@@ -5261,6 +5261,10 @@ function transcriptPayload(row, segmentRows) {
 // One forced refetch per account per window. KV is eventually consistent, which
 // is fine here: the point is to stop a loop, not to be exact to the second.
 const YT_FORCE_COOLDOWN_MS = 5 * 60 * 1000;
+// The same window for retrying a row that already failed. With the 300-row cap,
+// this bounds one account to roughly one YouTube request a second even if it
+// tries to loop over every row it owns.
+const YT_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
 
 async function ytForceCooldown(env, email) {
   if (!env.KV) return { ok: true };
@@ -5300,6 +5304,16 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   const existing = await ytRowByOwnerVideo(env, email, parsed.videoId);
   if (existing && !opts.force) {
     if (existing.status === "completed") return { ok: true, row: existing, reused: true };
+    // A failed row retries — but not on demand, without limit. Re-posting the
+    // same failing video (no captions, unavailable, live, bot-gated) reran the
+    // whole fetch every time while occupying just one of the account's rows, so
+    // one account could hammer the shared egress indefinitely. Hold it for the
+    // same window a forced refresh uses; the row is handed back meanwhile,
+    // carrying the reason it failed.
+    if (existing.status === "failed" && !opts.isAdmin) {
+      const since = Date.now() - (Date.parse(existing.updated_at || existing.created_at || "") || 0);
+      if (since < YT_RETRY_COOLDOWN_MS) return { ok: true, row: existing, reused: true, failed: true, error: existing.error };
+    }
     // A row another request is actively writing is handed back as-is; one left
     // behind by an interrupted request is retried below rather than pinning the
     // video in "transcribing" forever.
@@ -5430,7 +5444,16 @@ async function handleTranscriptCreate(request, env) {
   if (!result.ok) return json({ error: result.error, code: result.code }, result.status || 400);
   if (!result.row) return json({ error: YT_MESSAGES.UPSTREAM_ERROR, code: "UPSTREAM_ERROR" }, 502);
   const segments = result.row.status === "completed" ? await ytSegmentRows(env, result.row.transcript_id) : [];
-  return json(transcriptPayload(result.row, segments), 202);
+  const payload = transcriptPayload(result.row, segments);
+  // A forced refresh that failed deliberately keeps the old transcript, which
+  // would otherwise come back as a plain 202 — indistinguishable from freshly
+  // fetched captions. Say so, so the caller knows what it is holding.
+  if (result.refreshFailed) {
+    payload.refresh_failed = true;
+    payload.refresh_error = result.error || YT_MESSAGES.UPSTREAM_ERROR;
+    payload.code = result.code || "UPSTREAM_ERROR";
+  }
+  return json(payload, 202);
 }
 
 async function handleTranscriptGet(request, env, id) {
