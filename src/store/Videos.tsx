@@ -7,11 +7,11 @@ import { useAuth } from './Auth'
 // The Videos tab's data layer: every YouTube video the signed-in account has
 // queued (admin: every account's), loaded from GET /api/youtube.
 //
-// A queued video is transcribed by the backend over the following minutes, so
-// the list polls itself while anything is still in flight — the Worker refreshes
-// in-flight jobs on each list call, so one poll of one route keeps the whole
-// tab live. Polling stops the moment everything is settled (and while the tab is
-// hidden), so an idle dashboard costs nothing.
+// The Worker fetches and stores a video's captions inline, so a video is
+// normally already completed by the time the POST returns. The polling below is
+// the safety net for anything left in flight (a row another tab is still
+// writing): it runs only while something is actually pending, and only while
+// this tab is visible, so an idle dashboard costs nothing.
 
 const POLL_MS = 8000
 

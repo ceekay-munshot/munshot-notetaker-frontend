@@ -1,12 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // YouTube video ⇄ UI-model mapping.
 //
-// The second transcript source alongside meetings. A video is a job on the bot
-// backend (queued → transcribed) that this Worker indexes per owner; the UI
-// shows it with the same transcript / summary / chat surface a meeting gets, so
-// this module maps a VideoRecord onto the existing Episode + Podcast shapes and
-// parses the transcript text into the TranscriptSegment list those components
-// already render.
+// The second transcript source alongside meetings. The Worker fetches a video's
+// captions from YouTube itself and stores them in D1, so the UI can show it with
+// the same transcript / summary / chat surface a meeting gets. This module maps
+// a VideoRecord onto the existing Episode + Podcast shapes, and turns stored
+// segments (or, as a fallback, raw transcript text) into the TranscriptSegment
+// list those components already render.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { Episode, Podcast, ProcessingStatus, TranscriptSegment } from './types'
@@ -16,9 +16,9 @@ export type VideoStatus = 'queued' | 'processing' | 'completed' | 'failed'
 
 /** A video as the Worker stores and returns it (GET /api/youtube). */
 export interface VideoRecord {
-  /** The upstream job id — unique per owner. */
+  /** The transcript id — the D1 primary key, as a string. */
   id: string
-  /** The account that queued it (and owns the transcript). */
+  /** The account that added it (and owns the transcript). */
   owner: string
   url: string
   /** The 11-character YouTube id, when known. */
@@ -31,6 +31,29 @@ export interface VideoRecord {
   createdAt: number
   updatedAt: number
   hasTranscript?: boolean
+}
+
+/** One stored transcript line, exactly as the Worker holds it in D1 — already
+ *  timed, so the UI never has to infer timings from text. `speaker` is null on
+ *  the captions path (YouTube gives no diarization). */
+export interface StoredSegment {
+  index: number
+  start: number
+  end: number
+  text: string
+  speaker: string | null
+  language: string | null
+}
+
+/** Stored segments → the shape the transcript view renders. */
+export function segmentsFromStored(stored: StoredSegment[]): TranscriptSegment[] {
+  return stored.map((s, i) => ({
+    id: String(s.index ?? i),
+    speaker: s.speaker || 'Transcript',
+    role: 'guest',
+    timestamp: stampFor(s.start),
+    text: s.text,
+  }))
 }
 
 /** True while the backend is still working on it — the UI polls in this state. */
