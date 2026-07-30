@@ -5010,10 +5010,14 @@ async function ensureYoutubeIndex(env) {
     await env.DB.prepare(
       "CREATE UNIQUE INDEX IF NOT EXISTS uq_yt_owner_video ON youtube_transcripts (owner_email, video_id)"
     ).run();
+    ytIndexReady = true;
   } catch {
-    /* Best-effort: the lookup below is what actually enforces idempotency. */
+    // Creation fails if the table already holds a duplicate (owner, video) pair.
+    // Marking it ready anyway would quietly leave idempotency resting on the
+    // lookup alone, which two concurrent inserts can slip past — so the flag
+    // stays clear and the next request tries again. The lookup still runs
+    // meanwhile, so behaviour degrades rather than breaking.
   }
-  ytIndexReady = true;
 }
 
 function nowIso() {
@@ -5252,7 +5256,13 @@ function transcriptPayload(row, segmentRows) {
 /* ------------------- transcripts: create / fetch / store ------------------- */
 
 // Creates (or returns) the transcript for one video under one account, doing the
-// YouTube fetch + parse + store inline. Captions are a metadata fetch plus one
+// YouTube fetch + parse + store inline.
+//
+// Every limit below applies to every caller. There is no admin exemption: both
+// create routes refuse admin accounts outright (a transcript belongs to the user
+// who added it, and an admin has no account of their own to own one), so an
+// exemption here could never fire and only read as though it did. Repairing a
+// user's transcript as an admin would need its own owner-scoped route. Captions are a metadata fetch plus one
 // text download, so this stays well inside the request budget.
 //
 // Idempotent per (owner, video): re-posting a URL already transcribed for that
@@ -5288,22 +5298,56 @@ async function ytForceCooldown(env, email) {
 // this: deleting a transcript frees its slot AND removes the only record of
 // prior work, so add-delete-add (or rotating video ids) would refetch forever
 // and bot-gate the shared egress. Generous for real use — nobody transcribes 30
-// videos an hour by hand — and it is the backstop the cooldowns above can't be.
+// videos an hour by hand — and it is the backstop the row-keyed limits can't be.
+//
+// The reservation is a single D1 statement, not a KV read-modify-write: KV is
+// eventually consistent and the read/write pair is not atomic, so a burst of
+// concurrent submissions could all observe the same count, all pass, and all hit
+// YouTube — defeating the one safeguard that exists to keep the shared egress
+// off YouTube's bad list. SQLite's upsert does the whole thing in one go: the
+// row is inserted or incremented, and the WHERE on the update means a request
+// over the limit changes nothing and is refused.
 const YT_FETCH_QUOTA = 30;
 const YT_FETCH_WINDOW_MS = 60 * 60 * 1000;
 
+// This table is OURS and additive — it is not one of the two transcript tables
+// AWS shares, and nothing else reads it. Created on demand so no migration step
+// is needed.
+let ytQuotaTableReady = false;
+async function ensureQuotaTable(env) {
+  if (ytQuotaTableReady) return;
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS worker_youtube_fetch_quota (" +
+      "owner_email TEXT NOT NULL, window_start INTEGER NOT NULL, used INTEGER NOT NULL, " +
+      "PRIMARY KEY (owner_email, window_start))"
+  ).run();
+  ytQuotaTableReady = true;
+}
+
 async function ytFetchQuota(env, email) {
-  if (!env.KV) return { ok: true };
-  const bucket = Math.floor(Date.now() / YT_FETCH_WINDOW_MS);
-  const key = `ytquota:${encodeURIComponent(email)}:${bucket}`;
+  if (!env.DB) return { ok: true };
+  const windowStart = Math.floor(Date.now() / YT_FETCH_WINDOW_MS);
   try {
-    const used = Number(await env.KV.get(key)) || 0;
-    if (used >= YT_FETCH_QUOTA) {
+    await ensureQuotaTable(env);
+    const res = await env.DB.prepare(
+      "INSERT INTO worker_youtube_fetch_quota (owner_email, window_start, used) VALUES (?1, ?2, 1) " +
+        "ON CONFLICT(owner_email, window_start) DO UPDATE SET used = used + 1 WHERE used < ?3"
+    )
+      .bind(normalizeEmail(email), windowStart, YT_FETCH_QUOTA)
+      .run();
+    // Nothing changed: the upsert's WHERE refused it, i.e. the window is spent.
+    if (!((res && res.meta && res.meta.changes) || 0)) {
       return { ok: false, error: `You've transcribed ${YT_FETCH_QUOTA} videos in the past hour — try again later.` };
     }
-    await env.KV.put(key, String(used + 1), { expirationTtl: Math.ceil(YT_FETCH_WINDOW_MS / 1000) * 2 });
+    // Old windows are dead weight; clear them opportunistically.
+    if (windowStart % 8 === 0) {
+      await env.DB.prepare("DELETE FROM worker_youtube_fetch_quota WHERE window_start < ?1")
+        .bind(windowStart - 2)
+        .run()
+        .catch(() => {});
+    }
   } catch {
-    /* KV hiccup — don't block a legitimate transcription on the limiter */
+    /* D1 hiccup — don't block a legitimate transcription on the limiter */
   }
   return { ok: true };
 }
@@ -5321,7 +5365,7 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   // loop — hammering the shared egress (the exact thing that gets us bot-gated)
   // and rewriting every segment row each time. One forced refetch per account
   // per cooldown window; admins, who use it to repair a bad transcript, skip it.
-  if (opts.force && !opts.isAdmin) {
+  if (opts.force) {
     const gate = await ytForceCooldown(env, email);
     if (!gate.ok) return { ok: false, status: 429, code: "TOO_MANY_REFRESHES", error: gate.error };
   }
@@ -5335,7 +5379,7 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     // one account could hammer the shared egress indefinitely. Hold it for the
     // same window a forced refresh uses; the row is handed back meanwhile,
     // carrying the reason it failed.
-    if (existing.status === "failed" && !opts.isAdmin) {
+    if (existing.status === "failed") {
       const since = Date.now() - (Date.parse(existing.updated_at || existing.created_at || "") || 0);
       if (since < YT_RETRY_COOLDOWN_MS) return { ok: true, row: existing, reused: true, failed: true, error: existing.error };
     }
@@ -5349,10 +5393,8 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   }
 
   // Everything below fetches YouTube, so this is where the hourly quota is spent.
-  if (!opts.isAdmin) {
-    const quota = await ytFetchQuota(env, email);
-    if (!quota.ok) return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
-  }
+  const quota = await ytFetchQuota(env, email);
+  if (!quota.ok) return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
 
   // A forced refresh of a transcript that already works must not destroy it: the
   // row keeps its completed state and segments until a replacement is in hand.
@@ -5468,10 +5510,7 @@ async function handleTranscriptCreate(request, env) {
   if (session.isAdmin) return json({ error: "Admin accounts can't add videos — sign in as a user" }, 403);
 
   const body = await request.json().catch(() => ({}));
-  const result = await createYoutubeTranscript(env, session.identity, body.url, {
-    force: !!body.force,
-    isAdmin: !!session.isAdmin,
-  });
+  const result = await createYoutubeTranscript(env, session.identity, body.url, { force: !!body.force });
   if (!result.ok) return json({ error: result.error, code: result.code }, result.status || 400);
   if (!result.row) return json({ error: YT_MESSAGES.UPSTREAM_ERROR, code: "UPSTREAM_ERROR" }, 502);
   const segments = result.row.status === "completed" ? await ytSegmentRows(env, result.row.transcript_id) : [];
@@ -5646,10 +5685,7 @@ async function handleCreateVideo(request, env) {
   const body = await request.json().catch(() => ({}));
   let result;
   try {
-    result = await createYoutubeTranscript(env, session.identity, body.url, {
-      force: !!body.force,
-      isAdmin: !!session.isAdmin,
-    });
+    result = await createYoutubeTranscript(env, session.identity, body.url, { force: !!body.force });
   } catch (err) {
     return json({ error: "Failed to transcribe that video", detail: String((err && err.message) || err) }, 500);
   }
