@@ -94,6 +94,7 @@ export default {
       // GET /youtube/<id>.txt. Callers written against that contract are
       // unchanged; the email is taken from the session, never the payload.
       if (method === "POST" && pathname === "/youtube") return handleTranscriptCreate(request, env);
+      if (method === "GET" && pathname === "/youtube/probe") return handleTranscriptProbe(request, env);
       if (method === "GET" && YT_ROUTE_RE.test(pathname)) {
         const [, transcriptId, asText] = YT_ROUTE_RE.exec(pathname);
         return asText
@@ -4147,6 +4148,85 @@ async function handleTranscriptText(request, env, id) {
   return new Response(ytTranscriptText(segments), {
     headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "private, no-store" },
   });
+}
+
+
+// GET /youtube/probe?v=<id> — read-only diagnostics for the YouTube path.
+// Writes nothing. This exists because the whole design rests on Cloudflare's
+// egress not being bot-gated the way EC2's is, and that can change under us: it
+// reports exactly what each hop returns so a failure can be told apart from a
+// genuinely unavailable video, and so the egress can be monitored over time.
+// The extra client probes here are deliberate and manual — the transcript path
+// itself still makes at most one InnerTube call.
+async function handleTranscriptProbe(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  const url = new URL(request.url);
+  const videoId = String(url.searchParams.get("v") || "aircAruvnKk").trim();
+  if (!YT_ID_RE.test(videoId)) return json({ error: YT_MESSAGES.BAD_VIDEO_ID, code: "BAD_VIDEO_ID" }, 400);
+
+  const out = { videoId, watch: {}, innertube: {} };
+
+  try {
+    const res = await fetch(`${ytOrigin(env)}/watch?v=${encodeURIComponent(videoId)}&hl=en&bpctr=9999999999&has_verified=1`, {
+      headers: ytHeaders({
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Cookie: "CONSENT=YES+1; SOCS=CAI",
+      }),
+    });
+    const html = await res.text().catch(() => "");
+    const player = res.ok ? playerResponseFromHtml(html) : null;
+    const play = playabilityOf(player);
+    const tracks =
+      (player && player.captions && player.captions.playerCaptionsTracklistRenderer &&
+        player.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+    out.watch = {
+      status: res.status,
+      bytes: html.length,
+      botGated: looksBotGated(play.reason, html),
+      hasPlayerResponse: !!player,
+      playability: play.status || null,
+      reason: play.reason || null,
+      captionTracks: tracks.length,
+      languages: tracks.map((t) => `${t.languageCode}${String(t.kind || "") === "asr" ? " (asr)" : ""}`),
+      hasInnertubeKey: !!innertubeKeyFromHtml(html),
+    };
+  } catch (err) {
+    out.watch = { error: String((err && err.message) || err) };
+  }
+
+  // Both InnerTube clients, so a failure tells us WHICH one Cloudflare can still
+  // use rather than just that the fallback didn't work.
+  for (const client of ["WEB", "ANDROID"]) {
+    try {
+      const body =
+        client === "ANDROID"
+          ? { videoId, context: { client: { clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 30, hl: "en", gl: "US" } } }
+          : { videoId, context: { client: { clientName: "WEB", clientVersion: "2.20240401.00.00", hl: "en", gl: "US" } } };
+      const res = await fetch(`${ytOrigin(env)}/youtubei/v1/player?key=${YT_PUBLIC_INNERTUBE_KEY}&prettyPrint=false`, {
+        method: "POST",
+        headers: ytHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      const data = safeJsonParse(await res.text().catch(() => "")) || {};
+      const play = playabilityOf(data);
+      const tracks =
+        (data.captions && data.captions.playerCaptionsTracklistRenderer &&
+          data.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+      out.innertube[client] = {
+        status: res.status,
+        playability: play.status || null,
+        reason: play.reason || null,
+        botGated: looksBotGated(play.reason, ""),
+        captionTracks: tracks.length,
+        title: (data.videoDetails && data.videoDetails.title) || null,
+      };
+    } catch (err) {
+      out.innertube[client] = { error: String((err && err.message) || err) };
+    }
+  }
+
+  return json({ ok: true, probe: out });
 }
 
 /* ------------------------- the dashboard's Videos tab ------------------------- */
