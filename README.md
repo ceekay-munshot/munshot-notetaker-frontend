@@ -5,6 +5,7 @@ A **React dashboard** (Vite + TypeScript + Tailwind) served by a **Cloudflare Wo
 - **Architecture** — `worker/index.js` handles `/api/*` (auth, transcripts, AI, schedules, calendar, the join/leave bot) and serves the built SPA from `./dist` via the `[assets]` binding. The React app (in `src/`) calls those routes; it probes `/api/me` on boot and shows the login screen until there's a session.
 - **Logins** — email + password stored in Workers KV (one `user:<email>` key per user). Passwords are PBKDF2-SHA256 hashed with a per-user salt. Sessions are KV-backed and carried in an HttpOnly cookie. Sign-in / register are rebuilt in the SPA.
 - **Meetings** — the dashboard lists every meeting the notetaker has transcribed (`/api/transcripts`, grouped by `meeting_id`), with a per-meeting detail view (transcript + on-demand AI summary), search across transcripts, and a weekly digest.
+- **Videos** — paste a YouTube link and the backend transcribes it (`/api/youtube`). Each account sees only the videos it added; admin sees every account's. A video gets the same treatment a meeting does: stored transcript, one-page AI summary, and chat over it.
 - **Send the notetaker** — paste a meeting link to send the bot now (`/public/join`), or schedule it for later (one-time / daily / weekdays / weekly). The `X-API-Key` is a Worker **secret** injected server-side, so it never reaches the browser. A Cloudflare **Cron Trigger** fires due schedules every minute.
 - **Calendar** — sync your calendar and send the notetaker to upcoming meetings in one click.
 - **Meeting Assistant (AI)** — each meeting auto-summarizes its transcript and answers follow-up questions. The transcript is loaded server-side (per-user scoping) and sent to OpenAI with the `OPENAI_API_KEY` held as a Worker **secret**.
@@ -33,6 +34,11 @@ npm run dev        # vite          (the SPA; proxies /api -> :8787)
 | POST   | `/api/join`             | Proxy to `/public/join` with the API key         |
 | POST   | `/api/leave`            | Proxy to `/public/leave` with the API key        |
 | GET    | `/api/transcripts`      | Transcripts for the signed-in user (all, admin)  |
+| GET    | `/api/youtube`          | The user's YouTube videos (all accounts', admin) |
+| POST   | `/api/youtube`          | Queue a YouTube link for transcription           |
+| GET    | `/api/youtube/video`    | One video + its transcript text                  |
+| POST   | `/api/youtube/delete`   | Remove a video from the account's list           |
+| POST   | `/api/youtube/ai`       | Summarize / chat over a video transcript (OpenAI) |
 | POST   | `/api/ai`               | Summarize / chat over a meeting transcript (OpenAI) |
 | GET    | `/api/schedules`        | List the signed-in user's schedules              |
 | POST   | `/api/schedules`        | Create a schedule / routine                      |
@@ -45,6 +51,27 @@ npm run dev        # vite          (the SPA; proxies /api -> :8787)
 ```json
 { "email": "<notetaker email>", "meeting_url": "<your meeting link>" }
 ```
+
+### YouTube videos
+
+`POST /api/youtube` takes `{ "url": "<youtube link>" }`; the owner is the session
+email, never the body. The Worker forwards it to the bot backend with the
+server-held `X-API-Key`:
+
+```
+POST /public/youtube            {email, url}  -> 202 {id, status, video_id, …}
+GET  /public/youtube/<id>?email=…             -> that job's current state
+GET  /public/youtube/<id>.txt?email=…         -> the transcript as plain text
+```
+
+Upstream has no "list my videos" route, so every queued video is also indexed in
+KV under `yt:<owner>:<id>` — that index is what an account's Videos tab lists
+(admin scans every owner's prefix). `GET /api/youtube` refreshes the in-flight
+jobs inline, so the dashboard keeps the whole list live by polling that one
+route, and a finished transcript is cached in KV (`yttext:v1:<owner>:<id>`) the
+moment it lands. A video's AI summary is cached by **video id**
+(`ytsummary:v1:<videoId>`), so two accounts that transcribe the same video share
+one summary instead of paying to generate it twice.
 
 ### Scheduling
 

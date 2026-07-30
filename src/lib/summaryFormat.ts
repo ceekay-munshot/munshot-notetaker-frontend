@@ -26,6 +26,11 @@ export const SUMMARY_SECTION_TITLES: ReadonlySet<string> = new Set([
   'Actionable To-Dos',
   'Decisions & Action Items',
   'Detailed Discussion',
+  // A video brief's sections (same light Markdown, different anatomy — see
+  // generateVideoSummary in worker/index.js).
+  'Video Summary',
+  'Key Topics',
+  'Key Takeaways',
 ])
 
 export interface SummaryBullet {

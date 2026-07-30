@@ -11,6 +11,7 @@ type NavItem = { to: string; label: string; icon: string; end?: boolean; sub?: b
 const NAV: NavItem[] = [
   { to: '/', label: 'Home', icon: 'home', end: true },
   { to: '/meetings', label: 'Meetings', icon: 'forum' },
+  { to: '/videos', label: 'Videos', icon: 'smart_display' },
   { to: '/weekly', label: 'Weekly Summary', icon: 'bar_chart', end: true },
   { to: '/weekly/archive', label: 'Past Editions', icon: 'history', sub: true },
   { to: '/search', label: 'Search', icon: 'search' },

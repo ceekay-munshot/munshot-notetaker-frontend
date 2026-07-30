@@ -4,6 +4,7 @@ import { AppDataProvider } from './store/AppData'
 import { DateRangeProvider } from './store/DateRange'
 import { ChannelFilterProvider } from './store/ChannelFilter'
 import { SentimentProvider } from './store/Sentiment'
+import { VideosProvider } from './store/Videos'
 import { Layout } from './components/Layout'
 import { Icon } from './components/Icon'
 import Login from './pages/Login'
@@ -16,6 +17,8 @@ import WeeklyArchive from './pages/WeeklyArchive'
 import Search from './pages/Search'
 import Tracking from './pages/Tracking'
 import ScheduledMeetings from './pages/ScheduledMeetings'
+import Videos from './pages/Videos'
+import VideoDetail from './pages/VideoDetail'
 
 export default function App() {
   return (
@@ -51,23 +54,27 @@ function Dashboard() {
       <DateRangeProvider>
         <ChannelFilterProvider>
           <SentimentProvider>
-            <Routes>
-              <Route element={<Layout />}>
-                <Route index element={<Home />} />
-                <Route path="discover" element={<Discover />} />
-                <Route path="meetings" element={<Episodes />} />
-                <Route path="meetings/:id" element={<EpisodeDetail />} />
-                {/* Back-compat with the old podcast routes. */}
-                <Route path="episodes" element={<Episodes />} />
-                <Route path="episodes/:id" element={<EpisodeDetail />} />
-                <Route path="weekly" element={<Weekly />} />
-                <Route path="weekly/archive" element={<WeeklyArchive />} />
-                <Route path="tracking" element={<Tracking />} />
-                <Route path="scheduled" element={<ScheduledMeetings />} />
-                <Route path="search" element={<Search />} />
-                <Route path="*" element={<NotFound />} />
-              </Route>
-            </Routes>
+            <VideosProvider>
+              <Routes>
+                <Route element={<Layout />}>
+                  <Route index element={<Home />} />
+                  <Route path="discover" element={<Discover />} />
+                  <Route path="meetings" element={<Episodes />} />
+                  <Route path="meetings/:id" element={<EpisodeDetail />} />
+                  {/* Back-compat with the old podcast routes. */}
+                  <Route path="episodes" element={<Episodes />} />
+                  <Route path="episodes/:id" element={<EpisodeDetail />} />
+                  <Route path="videos" element={<Videos />} />
+                  <Route path="videos/:id" element={<VideoDetail />} />
+                  <Route path="weekly" element={<Weekly />} />
+                  <Route path="weekly/archive" element={<WeeklyArchive />} />
+                  <Route path="tracking" element={<Tracking />} />
+                  <Route path="scheduled" element={<ScheduledMeetings />} />
+                  <Route path="search" element={<Search />} />
+                  <Route path="*" element={<NotFound />} />
+                </Route>
+              </Routes>
+            </VideosProvider>
           </SentimentProvider>
         </ChannelFilterProvider>
       </DateRangeProvider>
