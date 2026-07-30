@@ -198,6 +198,22 @@ export default function EpisodeDetail() {
     }
   }
 
+  // A [MM:SS] citation in a chat answer → the transcript line it came from. The
+  // model quotes the timestamps the Worker printed on each line, so the match is
+  // usually exact; `<=` picks the line that was being spoken at that moment when
+  // it isn't, rather than dropping the jump.
+  function openCitation(sec: number) {
+    const segs = episode?.transcript ?? []
+    if (!segs.length) return
+    let best: TranscriptSegment | undefined
+    for (const seg of segs) {
+      const at = parseClock(seg.timestamp)
+      if (at == null || at > sec + 1) continue
+      best = seg
+    }
+    openTranscript((best ?? segs[0]).id, `Cited in chat at ${formatClock(sec)}`)
+  }
+
   // Force-regenerate this episode's summary, bypassing the server + client caches
   // (and overwriting them). The content stays visible until the fresh version lands.
   async function refreshSummary() {
@@ -291,7 +307,7 @@ export default function EpisodeDetail() {
           {tab === 'transcript' && (
             <TranscriptTab episode={episode} focusId={jumpTo} focusLabel={jumpLabel} focusTick={jumpTick} />
           )}
-          {tab === 'chat' && <ChatTab episode={episode} />}
+          {tab === 'chat' && <ChatTab episode={episode} onCite={openCitation} />}
         </>
       )}
     </div>
@@ -742,7 +758,7 @@ const CHAT_SUGGESTIONS = [
   'Give me a quick recap of what each person said',
 ]
 
-function ChatTab({ episode }: { episode: Episode }) {
+function ChatTab({ episode, onCite }: { episode: Episode; onCite?: (sec: number) => void }) {
   const terms = useMemo(() => entityTerms(episode.entities), [episode.entities])
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
@@ -852,7 +868,7 @@ function ChatTab({ episode }: { episode: Episode }) {
                     <Icon name="auto_awesome" size={16} className="text-primary" fill />
                   </span>
                   <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-3.5 py-2.5">
-                    <ChatAnswer text={m.content} terms={terms} />
+                    <ChatAnswer text={m.content} terms={terms} onCite={onCite} />
                   </div>
                 </div>
               ),
@@ -919,9 +935,57 @@ function ChatTab({ episode }: { episode: Episode }) {
   )
 }
 
+// The [MM:SS] / [H:MM:SS] citations the assistant is asked to attach to every
+// specific claim. Captured so the text can be split on them and each one turned
+// into a jump back to the line it came from — an answer you can verify in one
+// click rather than one you have to take on faith.
+const CITATION = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g
+
+/** A line of an answer: entity/number/sentiment styling as everywhere else, with
+ *  timestamp citations lifted out into clickable chips. */
+function AnswerLine({ text, terms, onCite }: { text: string; terms: string[]; onCite?: (sec: number) => void }) {
+  const parts = useMemo(() => {
+    const out: { text: string; sec?: number }[] = []
+    let last = 0
+    for (const m of text.matchAll(CITATION)) {
+      const sec = parseClock(m[1])
+      if (sec == null) continue
+      if (m.index > last) out.push({ text: text.slice(last, m.index) })
+      out.push({ text: m[1], sec })
+      last = m.index + m[0].length
+    }
+    if (last < text.length) out.push({ text: text.slice(last) })
+    return out
+  }, [text])
+
+  return (
+    <>
+      {parts.map((p, i) =>
+        p.sec == null ? (
+          <RichText key={i} text={p.text} terms={terms} />
+        ) : onCite ? (
+          <button
+            key={i}
+            onClick={() => onCite(p.sec!)}
+            title="Open this moment in the transcript"
+            className="press mx-0.5 inline-flex items-center gap-0.5 rounded-md border border-outline-variant bg-surface-container-low px-1.5 py-px align-baseline text-[12px] font-semibold tabular-nums text-primary hover:border-primary hover:bg-[#eff5ff]"
+          >
+            <Icon name="play_arrow" size={11} className="shrink-0" fill />
+            {p.text}
+          </button>
+        ) : (
+          <span key={i} className="font-semibold tabular-nums text-primary">
+            {p.text}
+          </span>
+        ),
+      )}
+    </>
+  )
+}
+
 // Renders a chat answer with the same light markdown the summary uses (bold
 // **headers**, "- " bullets, paragraphs) but at a compact, uniform chat size.
-function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
+function ChatAnswer({ text, terms, onCite }: { text: string; terms: string[]; onCite?: (sec: number) => void }) {
   const isBullet = (l: string) => /^([-*•]|\d+[.)])\s+/.test(l)
   const stripBullet = (l: string) => l.replace(/^([-*•]|\d+[.)])\s+/, '')
   const blocks = text
@@ -946,7 +1010,7 @@ function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
             {header && <p className="mb-1 font-semibold text-on-surface">{header}</p>}
             {paras.map((p, j) => (
               <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
-                <RichText text={p} terms={terms} />
+                <AnswerLine text={p} terms={terms} onCite={onCite} />
               </p>
             ))}
             {bullets.length > 0 && (
@@ -955,7 +1019,7 @@ function ChatAnswer({ text, terms }: { text: string; terms: string[] }) {
                   <li key={`b${j}`} className="flex gap-2">
                     <span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
                     <span className="min-w-0">
-                      <RichText text={b} terms={terms} />
+                      <AnswerLine text={b} terms={terms} onCite={onCite} />
                     </span>
                   </li>
                 ))}

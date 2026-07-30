@@ -1127,6 +1127,443 @@ async function generateDetailedSummary(rows, apiKey, model) {
   return md.trim();
 }
 
+// ── Transcript retrieval — the chat's grounding layer ─────────────────────────
+// The meeting chat used to hand the model a head+tail slice of the transcript
+// and a two-line system prompt. That produced the exact failure this layer
+// exists to kill: ask "discussion about nadam?" and the model replies "the
+// transcript does not mention anything about nadam" — even though the line is
+// sitting there at 28:11. Two causes, both fixed here:
+//
+//   1. The line was never sent. A 30k-char head+tail slice drops the entire
+//      middle of any meeting longer than ~40 minutes, which is precisely where
+//      a 28-minute mark lands.
+//   2. The user's spelling never literally appears. The transcript is ASR over
+//      mixed Hindi/English, so a person or product the user knows as "Nadam"
+//      may be written "Nadaam", "Nadim", or "Na Dam" — and a model scanning for
+//      a literal string reports absence with total confidence.
+//
+// So the Worker now searches the FULL transcript itself, phonetically, before
+// the model is asked anything, and hands over the lines it found, the actual
+// spellings those lines used, and as much surrounding transcript as the context
+// window allows. "Not mentioned" now has to survive evidence already on the table.
+
+// Words carrying no retrieval signal. Deliberately small: an over-eager stoplist
+// is how a real question term ("about", in "the About page") gets discarded.
+const CHAT_STOPWORDS = new Set(
+  ("the a an and or but if then than that this these those there here is are was were be been being am " +
+    "do does did doing done have has had having will would shall should can could may might must " +
+    "i me my we us our you your he him his she her it its they them their who whom whose what which " +
+    "when where why how all any both each few more most other some such no nor not only own same so " +
+    "too very just about above after again against below between during for from into of off on once " +
+    "out over under until up down with within without to at by as in out please tell say said talk " +
+    "talked talking discuss discussed discussion mention mentioned anything something someone anyone " +
+    "meeting transcript call give me show list summary summarize summarise " +
+    "ok okay yeah yes yep no nope hmm uh um like really actually basically").split(" "),
+);
+
+// Lowercase, strip accents and punctuation. The common denominator every
+// comparison below runs on.
+function normWord(word) {
+  return String(word || "")
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, "");
+}
+
+// A crude phonetic key, tuned for Indian-English ASR rather than for English
+// surnames (which is what Soundex/Metaphone are built for). Aspirated pairs are
+// folded to their base consonant, the usual k/c/q and s/z confusions collapse,
+// and vowels — where ASR is least reliable on transliterated names — are dropped
+// after the first character. "nadam", "Nadaam", "Nadim" and "Nadhim" all key to
+// "ndm"; that is the whole point.
+function soundKey(word) {
+  let w = normWord(word);
+  if (!w) return "";
+  w = w
+    .replace(/ph/g, "f")
+    .replace(/([gkbdt])h/g, "$1")
+    .replace(/ck/g, "k")
+    .replace(/q/g, "k")
+    .replace(/c(?=[eiy])/g, "s")
+    .replace(/c/g, "k")
+    .replace(/z/g, "s")
+    .replace(/w/g, "v")
+    .replace(/x/g, "ks")
+    .replace(/y/g, "i");
+  const key = w[0] + w.slice(1).replace(/[aeiou]/g, "");
+  return key.replace(/(.)\1+/g, "$1");
+}
+
+// Levenshtein distance, abandoned as soon as it provably exceeds `max`. Bounding
+// it matters: this runs over every token of a transcript that can be tens of
+// thousands of words, inside a Worker's CPU budget.
+function editWithin(a, b, max) {
+  if (a === b) return 0;
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      if (curr[j] < rowMin) rowMin = curr[j];
+    }
+    if (rowMin > max) return max + 1;
+    prev = curr;
+  }
+  return prev[b.length];
+}
+
+// How well a transcript token answers a query token, 0 (no) to 1 (exact). The
+// tiers below the exact match are what let a question survive an ASR misspelling;
+// each is scored lower than the one above so a literal hit always outranks a
+// phonetic one when both exist.
+function fuzzyScore(q, t) {
+  if (!q || !t) return 0;
+  if (q === t) return 1;
+  // Shared stem — "deploy" ↔ "deployment", "Nadam" ↔ "Nadam's".
+  if (q.length >= 4 && t.startsWith(q)) return 0.9;
+  if (t.length >= 4 && q.startsWith(t)) return 0.85;
+  // The looser tiers below are gated on the two words starting with the same
+  // sound. ASR mangles the inside of a name far more often than its opening
+  // consonant, and without the gate a 1-edit rule quietly matches "tool" to
+  // "cool" and "nadam" to "madam" — noise that reads as evidence.
+  const kq = soundKey(q);
+  const kt = soundKey(t);
+  if (!kq || !kt || kq[0] !== kt[0]) return 0;
+  if (q.length >= 4) {
+    const budget = q.length <= 6 ? 1 : 2;
+    if (editWithin(q, t, budget) <= budget) return 0.75;
+  }
+  // Last resort: same sound, similar length. Cheap enough to be worth it, loose
+  // enough that it only ever contributes evidence — never a claim on its own.
+  if (q.length >= 3 && Math.abs(q.length - t.length) <= 3 && kq.length >= 2 && kq === kt) return 0.6;
+  return 0;
+}
+
+// Tokens paired with the spelling they had in the source, so the term report can
+// show the user the transcript's own casing ("Nadam") rather than the normalized
+// form the matching ran on ("nadam").
+function chatTokenPairs(text) {
+  const out = [];
+  for (const raw of String(text || "").split(/[^A-Za-z0-9']+/)) {
+    const n = normWord(raw);
+    if (n) out.push({ n, raw });
+  }
+  return out;
+}
+
+function chatTokens(text) {
+  return chatTokenPairs(text).map((p) => p.n);
+}
+
+// The terms a question is actually *about*. Walks backwards through the user's
+// turns so a follow-up ("and what about the timeline?") still carries the subject
+// of the turn that set it up, which is where a single-message extraction fails.
+function chatQueryTerms(clientMessages) {
+  const terms = [];
+  const seen = new Set();
+  const userTurns = clientMessages.filter((m) => m && m.role !== "assistant");
+  for (let i = userTurns.length - 1; i >= 0; i--) {
+    for (const tok of chatTokens(userTurns[i].content)) {
+      // Two-character terms are kept: "HR", "AI", "QA", "UI" are exactly the
+      // acronyms this product's meetings turn on. They can only ever match
+      // exactly (fuzzyScore's looser tiers all require more characters), so
+      // they add precision without adding noise.
+      if (tok.length < 2 || CHAT_STOPWORDS.has(tok) || seen.has(tok)) continue;
+      seen.add(tok);
+      if (terms.push(tok) >= 12) return terms;
+    }
+    // Reach further back ONLY when the latest turn is too thin to locate
+    // anything by itself ("and when?", "who owns that?"). A question that
+    // already names its own subject must not have an older, unrelated one
+    // dragged into its scoring.
+    if (terms.length >= 3) break;
+  }
+  return terms;
+}
+
+// Scores every transcript line against the query terms and records which real
+// spellings each term matched. Terms common across the whole meeting are
+// down-weighted (a crude IDF) so "dashboard" in a meeting about dashboards
+// doesn't drown out the one rare name that actually locates the answer.
+function scanTranscript(rows, terms) {
+  const lineTokens = rows.map((r) => chatTokenPairs(`${r.speaker || ""} ${r.text || ""}`));
+  const df = new Map();
+  const scores = new Array(rows.length).fill(0);
+  // term → Map(normalized spelling → { count, firstIndex, raw })
+  const spellings = new Map();
+  if (!terms.length) return { scores, spellings };
+
+  const perLineBest = terms.map(() => new Array(rows.length).fill(0));
+  terms.forEach((term, ti) => {
+    let hits = 0;
+    for (let li = 0; li < rows.length; li++) {
+      let best = 0;
+      let bestTok = null;
+      for (const tok of lineTokens[li]) {
+        const s = fuzzyScore(term, tok.n);
+        if (s > best) {
+          best = s;
+          bestTok = tok;
+          if (s === 1) break;
+        }
+      }
+      if (!best) continue;
+      hits++;
+      perLineBest[ti][li] = best;
+      if (!spellings.has(term)) spellings.set(term, new Map());
+      const m = spellings.get(term);
+      const prev = m.get(bestTok.n);
+      if (prev) prev.count++;
+      else m.set(bestTok.n, { count: 1, firstIndex: li, raw: bestTok.raw });
+    }
+    df.set(term, hits);
+  });
+
+  terms.forEach((term, ti) => {
+    const hits = df.get(term) || 0;
+    if (!hits) return;
+    // A term on more than a third of the lines is background, not signal.
+    const idf = hits / Math.max(1, rows.length) > 0.33 ? 0.2 : 1;
+    for (let li = 0; li < rows.length; li++) {
+      if (perLineBest[ti][li] > 0) scores[li] += perLineBest[ti][li] * idf;
+    }
+  });
+  return { scores, spellings };
+}
+
+function clockOf(row) {
+  const t = Math.max(0, Math.floor(Number(row && row.start_time) || 0));
+  const h = Math.floor(t / 3600);
+  const mm = String(Math.floor((t % 3600) / 60)).padStart(2, "0");
+  const ss = String(t % 60).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function chatLine(row) {
+  return `[${clockOf(row)}] ${row.speaker || "Unknown"}: ${row.text || ""}`;
+}
+
+// The lines that matched the question, in meeting order. Sent to the model as a
+// separate block so the answer is anchored even when the transcript below had to
+// be sampled — and so a wrong "not discussed" would have to contradict lines the
+// model was handed explicitly.
+function buildEvidence(rows, scores, maxLines = 40, maxChars = 7000) {
+  const ranked = [];
+  for (let i = 0; i < rows.length; i++) if (scores[i] > 0) ranked.push([i, scores[i]]);
+  if (!ranked.length) return "";
+  ranked.sort((a, b) => b[1] - a[1]);
+  const keep = ranked.slice(0, maxLines).map(([i]) => i).sort((a, b) => a - b);
+  const out = [];
+  let used = 0;
+  for (const i of keep) {
+    const line = chatLine(rows[i]);
+    if (used + line.length > maxChars) break;
+    out.push(line);
+    used += line.length + 1;
+  }
+  return out.join("\n");
+}
+
+// Merge [start, end) index windows into non-overlapping, sorted ranges.
+function mergeWindows(windows) {
+  const sorted = windows.slice().sort((a, b) => a[0] - b[0]);
+  const out = [];
+  for (const w of sorted) {
+    const last = out[out.length - 1];
+    if (last && w[0] <= last[1]) last[1] = Math.max(last[1], w[1]);
+    else out.push([w[0], w[1]]);
+  }
+  return out;
+}
+
+// The transcript as the chat model sees it. Whole, whenever it fits — which for
+// gpt-4o is nearly every real meeting, and is the single biggest reason the old
+// chat "forgot" the middle of a long call. When it genuinely doesn't fit, the
+// opening, the close, and the highest-scoring passages are kept, in meeting
+// order, with the omissions marked so the model can say what it couldn't see
+// instead of quietly answering from a hole.
+function buildChatTranscript(rows, scores, maxChars = 90000) {
+  const lines = rows.map(chatLine);
+  const lineCost = lines.map((l) => l.length + 1);
+  const total = lineCost.reduce((a, b) => a + b, 0);
+  if (total <= maxChars) return { text: lines.join("\n"), complete: true };
+
+  const n = rows.length;
+  const cost = (a, b) => {
+    let c = 0;
+    for (let i = a; i < b; i++) c += lineCost[i];
+    return c;
+  };
+
+  // Seed: the opening and the close (where framing and commitments live), plus a
+  // window around each line that matched the question, best first.
+  const edge = Math.min(60, Math.floor(n * 0.1));
+  let windows = [[0, edge], [Math.max(0, n - edge), n]];
+  let budget = maxChars - cost(0, edge) - cost(Math.max(0, n - edge), n);
+
+  const ranked = [];
+  for (let i = 0; i < n; i++) if (scores[i] > 0) ranked.push([i, scores[i]]);
+  ranked.sort((a, b) => b[1] - a[1]);
+  for (const [i] of ranked) {
+    if (budget <= 0) break;
+    const a = Math.max(0, i - 10);
+    const b = Math.min(n, i + 11);
+    const c = cost(a, b);
+    if (c > budget) continue;
+    windows.push([a, b]);
+    budget -= c;
+  }
+  windows = mergeWindows(windows);
+
+  // Spend whatever budget is left widening what we kept, a slice at a time,
+  // round-robin so no one window eats the remainder. Without this pass a
+  // question with few matches would ship a couple of hundred lines and leave
+  // most of the context window empty — strictly worse than the head+tail slice
+  // this replaced. With it, an omission only ever means the budget really ran out.
+  let grew = true;
+  while (budget > 0 && grew) {
+    grew = false;
+    for (const w of windows) {
+      if (budget <= 0) break;
+      const before = Math.max(0, w[0] - 20);
+      if (before < w[0]) {
+        const c = cost(before, w[0]);
+        if (c <= budget) {
+          budget -= c;
+          w[0] = before;
+          grew = true;
+        }
+      }
+      const after = Math.min(n, w[1] + 20);
+      if (after > w[1]) {
+        const c = cost(w[1], after);
+        if (c <= budget) {
+          budget -= c;
+          w[1] = after;
+          grew = true;
+        }
+      }
+    }
+    windows = mergeWindows(windows);
+  }
+
+  const parts = [];
+  let cursor = 0;
+  for (const [a, b] of windows) {
+    if (a > cursor) parts.push(`…[${a - cursor} lines not shown]…`);
+    parts.push(lines.slice(a, b).join("\n"));
+    cursor = b;
+  }
+  if (cursor < n) parts.push(`…[${n - cursor} lines not shown]…`);
+  return { text: parts.join("\n"), complete: cursor === n && windows.length === 1 && windows[0][0] === 0 };
+}
+
+// Tells the model, in plain terms, which real transcript spellings each of the
+// user's words resolved to — "you asked about 'nadam'; the transcript writes it
+// 'Nadam', first at 28:11". Without this the model has to rediscover the
+// misspelling on its own, and it reliably doesn't.
+function buildTermMatchReport(rows, terms, spellings) {
+  const lines = [];
+  for (const term of terms) {
+    const m = spellings.get(term);
+    if (!m || !m.size) continue;
+    const variants = [...m.entries()]
+      .sort((a, b) => b[1].count - a[1].count)
+      .slice(0, 4)
+      .map(([, info]) => `"${info.raw}" (${info.count}×, first at ${clockOf(rows[info.firstIndex])})`);
+    lines.push(`- "${term}" → ${variants.join(", ")}`);
+  }
+  const missing = terms.filter((t) => !spellings.has(t));
+  if (lines.length && missing.length) {
+    lines.push(`- no close match in the transcript for: ${missing.map((t) => `"${t}"`).join(", ")}`);
+  }
+  return lines.join("\n");
+}
+
+const CHAT_SYSTEM_PROMPT =
+  "You are the analyst for ONE recorded meeting. You have its transcript and answer questions about it.\n\n" +
+  "HOW THE TRANSCRIPT WAS MADE — this changes how you must read it:\n" +
+  "It is machine transcription of mixed Hindi/English speech, so it contains recognition errors, and the " +
+  "errors cluster in proper nouns: people, companies, products, tools, and clients. The same name can appear " +
+  "spelt several different ways in the same meeting, and none of them need match how the user spells it. " +
+  "Treat the user's spelling as an approximation of a sound, never as an exact string to find.\n\n" +
+  "THE RULE THAT MATTERS MOST:\n" +
+  "Never answer that something \"is not mentioned\" or \"does not appear\" because of a spelling difference. " +
+  "Before you say a topic is absent, look for names that SOUND like what the user typed (nadam/Nadaam/Nadim, " +
+  "aashita/Ashita, munshot/Moonshot). The TERM MATCHES section below already tells you which real transcript " +
+  "spellings the user's words resolved to — trust it, and answer about those. Only say something is absent " +
+  "when neither TERM MATCHES nor EVIDENCE nor the transcript shows anything that could plausibly be it, and " +
+  "when you do, say what you looked for and offer the nearest thing that IS discussed.\n\n" +
+  "ANSWERING:\n" +
+  "- Lead with the direct answer to what was actually asked. Do not restate the whole meeting for a narrow question.\n" +
+  "- Cite timestamps in square brackets, e.g. [28:11], for every specific claim, quote, decision, or number. " +
+  "Use the timestamps exactly as they appear at the start of each transcript line.\n" +
+  "- Attribute to the speaker the transcript attributes it to. Speaker labels are also machine-assigned and can " +
+  "be wrong on a line or two; if a line's attribution clearly contradicts the surrounding turns, say so rather " +
+  "than repeating it as fact.\n" +
+  "- Quote the transcript when the exact words matter; otherwise clean up the speech into plain professional " +
+  "English. Answer in the user's language.\n" +
+  "- Never invent names, numbers, dates, decisions, or owners. Distinguish what was decided from what was only " +
+  "floated, and say when something was left open.\n" +
+  "- Format for skimming: short paragraphs, \"- \" bullets, and **bold headers** only when there are real sections. " +
+  "No preamble like \"Based on the transcript\" — just answer.\n" +
+  "- If parts of the transcript are marked as not shown, and the answer would depend on them, say which stretch " +
+  "you could not see.";
+
+// Assembles the grounding message: what meeting this is, which spellings the
+// question resolved to, the matching lines, and the transcript itself.
+function buildChatGrounding(rows, terms, meta) {
+  const { scores, spellings } = scanTranscript(rows, terms);
+  const termReport = buildTermMatchReport(rows, terms, spellings);
+  const evidence = buildEvidence(rows, scores);
+  const { text: transcript, complete } = buildChatTranscript(rows, scores);
+  const speakers = distinctSpeakers(rows, 20);
+
+  const header = [
+    `MEETING: ${meta.title || "(untitled)"}`,
+    `LENGTH: ${clockOf(rows[rows.length - 1])} · ${rows.length} transcript lines`,
+    speakers.length ? `SPEAKERS: ${speakers.join(", ")}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  const sections = [header];
+  if (termReport) {
+    sections.push(
+      "TERM MATCHES — how the words in the user's question appear in this transcript.\n" +
+        "These were found by a phonetic search over the FULL transcript, so they are reliable even where the " +
+        "spelling differs from the user's:\n" +
+        termReport,
+    );
+  } else if (terms.length) {
+    sections.push(
+      "TERM MATCHES: a phonetic search over the full transcript found no close match for the distinctive words " +
+        `in this question (${terms.map((t) => `"${t}"`).join(", ")}). Say so plainly, and point to the nearest ` +
+        "related thing the meeting does cover.",
+    );
+  }
+  if (evidence) {
+    sections.push("EVIDENCE — the transcript lines that best match this question, in meeting order:\n" + evidence);
+  }
+  if (meta.summary) {
+    sections.push(
+      "PREPARED SUMMARY of this meeting (secondary — the transcript below is authoritative and wins any conflict):\n" +
+        meta.summary,
+    );
+  }
+  sections.push(
+    (complete
+      ? "FULL TRANSCRIPT (every line of the meeting):\n"
+      : "TRANSCRIPT (too long to include whole — the opening, the close, and the passages most relevant to this " +
+        "question are included; omitted stretches are marked):\n") + transcript,
+  );
+  return sections.join("\n\n");
+}
+
 // Chat over a single meeting's transcript with OpenAI. The transcript is loaded
 // server-side and scoped to the session (all meetings for admin), and the OpenAI
 // key is a Worker secret that never reaches the browser. Same ACL as transcripts.
@@ -1249,23 +1686,44 @@ async function handleAiChat(request, env) {
     }
   }
 
-  const messages = [
-    {
-      role: "system",
-      content:
-        "You are a concise meeting assistant. You are given the transcript of a single meeting. " +
-        "Answer only from what the transcript supports; if something isn't covered, say so briefly. " +
-        "Prefer short paragraphs and bullet points, and do not invent names, numbers, or decisions.\n\n" +
-        "MEETING TRANSCRIPT:\n" + buildTranscriptText(rows),
-    },
-  ];
-  for (const m of clientMessages.slice(-12)) {
+  // Normalize the client's turns first: the grounding below is built FROM the
+  // question, so it has to be derived from the same messages the model will see.
+  const history = [];
+  for (const m of clientMessages.slice(-16)) {
     const role = m && m.role === "assistant" ? "assistant" : "user";
     const content = String((m && m.content) || "").slice(0, 4000);
-    if (content) messages.push({ role, content });
+    if (content) history.push({ role, content });
   }
+
+  // The meeting's own name and its cached summary, when they exist — both are
+  // best-effort context, so a KV hiccup must not cost the user their answer.
+  let meetingTitle = "";
+  let cachedSummary = "";
+  try {
+    meetingTitle = (await d1MeetingNames(env, [meetingId]))[meetingId] || "";
+  } catch {
+    /* name is best-effort */
+  }
+  if (env.KV) {
+    try {
+      if (!meetingTitle) meetingTitle = (await env.KV.get(titleCacheKey(meetingId))) || "";
+      cachedSummary = ((await env.KV.get(summaryCacheKey(meetingId))) || "").slice(0, 6000);
+    } catch {
+      /* KV is optional context, never a hard dependency here */
+    }
+  }
+
+  const terms = chatQueryTerms(history);
+  const messages = [
+    { role: "system", content: CHAT_SYSTEM_PROMPT },
+    {
+      role: "system",
+      content: buildChatGrounding(rows, terms, { title: meetingTitle, summary: cachedSummary }),
+    },
+    ...history,
+  ];
   // Chat opened with no user message yet: seed with a quick per-person breakdown.
-  if (messages.length === 1) {
+  if (!history.length) {
     messages.push({
       role: "user",
       content:
@@ -1287,7 +1745,11 @@ async function handleAiChat(request, env) {
     upstream = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 700 }),
+      // Low temperature: this is a question answered from evidence, not a piece
+      // of writing. The token budget is generous enough that a per-person recap
+      // (what the empty-chat seed asks for) can finish instead of being cut off
+      // mid-person, which the old 700 regularly did.
+      body: JSON.stringify({ model, messages, temperature: 0.2, max_tokens: 1600 }),
     });
   } catch (err) {
     return json({ error: "Failed to reach the AI service", detail: String((err && err.message) || err) }, 502);
