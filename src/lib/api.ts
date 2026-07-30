@@ -261,6 +261,51 @@ export async function chatMeeting(
   return String(data.reply || '')
 }
 
+/** What the Worker actually assembled for a question, before the model saw it.
+ *
+ *  A wrong answer has several possible authors — the transcript the Worker
+ *  loaded, the search over it, the readers, or the model — and from the outside
+ *  they all look identical. This returns the trace that tells them apart:
+ *  notably `lines` (how much transcript the Worker really has, which can differ
+ *  from what the Transcript tab renders) and `grounding` (the exact text handed
+ *  to the model). Costs a second run of the pipeline, so it's on demand only. */
+export interface ChatTrace {
+  lines: number
+  terms: string[]
+  vocabularySample: string[]
+  plan: {
+    resolved: { asked: string; transcript: string[]; confidence: string }[]
+    terms: string[]
+    scope: string
+    restated: string
+  }
+  chunksTotal: number
+  chunksRead: number
+  mapNotes: string
+  grounding: string
+}
+
+export async function diagnoseMeetingChat(
+  episode: Episode,
+  messages: { role: 'user' | 'assistant'; content: string }[],
+): Promise<ChatTrace | null> {
+  const { owner, meetingId } = decodeMeetingId(episode.id)
+  const data = await request<{ ok: boolean; debug?: ChatTrace }>('/api/ai', {
+    method: 'POST',
+    body: JSON.stringify({ meeting_id: meetingId, owner, messages, debug: true }),
+  })
+  return data.debug ?? null
+}
+
+/** The deployed Worker's build marker. Unauthenticated, so it answers "is the
+ *  new code live?" without a session — `build` changes only when a deploy
+ *  lands. */
+export async function fetchVersion(): Promise<{ build: string } & Record<string, unknown>> {
+  const res = await fetch('/api/version', { credentials: 'same-origin' })
+  if (!res.ok) throw new ApiError(`Version check failed (${res.status})`, res.status)
+  return res.json()
+}
+
 // ── Weekly per-person rollup ────────────────────────────────────────────────────
 
 /** A single structured action item within a person's rollup. Identity (`id`)

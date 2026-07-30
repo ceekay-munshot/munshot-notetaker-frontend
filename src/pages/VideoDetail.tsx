@@ -284,7 +284,7 @@ export default function VideoDetail() {
             />
           )}
           {tab === 'transcript' && <TranscriptTab segments={segments} watchUrl={watchUrl} />}
-          {tab === 'chat' && <ChatTab video={video} title={title} />}
+          {tab === 'chat' && <ChatTab video={video} title={title} watchUrl={watchUrl} />}
         </>
       )}
     </div>
@@ -460,7 +460,24 @@ const CHAT_SUGGESTIONS = [
   'What should I take away from this?',
 ]
 
-function ChatTab({ video, title }: { video: VideoRecord; title: string }) {
+function ChatTab({ video, title, watchUrl }: { video: VideoRecord; title: string; watchUrl: string }) {
+  // A [MM:SS] citation in an answer opens the video at that second — the video
+  // equivalent of jumping to a transcript line, and the only way to check a
+  // claim against the source without scrubbing for it by hand.
+  const onCite = watchUrl
+    ? (sec: number) => {
+        let href = watchUrl
+        try {
+          const u = new URL(watchUrl)
+          u.searchParams.set('t', `${Math.floor(sec)}s`)
+          href = u.toString()
+        } catch {
+          /* a malformed watch URL still opens the video, just not at the moment */
+        }
+        window.open(href, '_blank', 'noopener,noreferrer')
+      }
+    : undefined
+
   const [messages, setMessages] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -567,7 +584,7 @@ function ChatTab({ video, title }: { video: VideoRecord; title: string }) {
                     <Icon name="auto_awesome" size={16} className="text-primary" fill />
                   </span>
                   <div className="min-w-0 max-w-[85%] rounded-2xl rounded-tl-md border border-outline-variant bg-surface px-3.5 py-2.5">
-                    <ChatAnswer text={m.content} terms={[]} />
+                    <ChatAnswer text={m.content} terms={[]} onCite={onCite} />
                   </div>
                 </div>
               ),
