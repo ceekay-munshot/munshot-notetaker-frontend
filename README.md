@@ -115,13 +115,24 @@ creates or alters them. Two rules follow from sharing:
   Worker-origin rows store `0`. `owner_email` is set on **both** tables — that is
   what the dashboard filters on.
 
-A transcript up to 468 cues is written as **one atomic D1 batch**. Past that it
-commits in pieces, so for the duration the row holds a new prefix over an old
-suffix. On a forced refresh — the only case where the row was already
-`completed` — it is moved to `processing` first, which is the state every reader
-already handles, and an interrupted write leaves a stale claim the retry path
-rebuilds from scratch. There is no staging table to switch over instead: these
-are AWS's tables too.
+**One writer per row.** Every request that intends to fetch claims the row
+first, with a conditional update that exactly one of them can win; the losers
+are handed the winner's row and never reach YouTube. That includes a forced
+refresh of a row that is already `completed` — the KV cooldown meant to space
+those out is eventually consistent, so without the claim two of them could both
+fetch and both write the same segment indexes, interleaving two transcripts.
+
+The trade is that a forced refresh reports itself as being written for the few
+seconds it runs, rather than serving the old text meanwhile. Nothing is
+destroyed by that: the segment rows stay where they are, and every failure below
+restores `completed` over them intact.
+
+A transcript up to 468 cues is written as **one atomic D1 batch**, so a failed
+write leaves the previous segments exactly as they were and the row simply goes
+back to `completed`. Past that it commits in pieces, and a failure part-way
+leaves a real mix — that row is marked `failed` with a message saying it will be
+rebuilt, rather than being handed back as though it were whole. There is no
+staging table to switch over instead: these are AWS's tables too.
 
 Two schema additions, both additive and created on demand. The first is
 `CREATE UNIQUE INDEX IF NOT EXISTS uq_yt_owner_video ON youtube_transcripts

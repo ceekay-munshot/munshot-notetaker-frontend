@@ -5180,10 +5180,17 @@ async function ytInsertRow(env, row) {
 // and a later failure could overwrite the row the other one just populated. The
 // claim is a conditional update: exactly one request can move the row out of the
 // state it was in, and the loser backs off and returns the active writer's row.
-async function ytClaimForRetry(env, id, staleBefore) {
+// `allowCompleted` is for a forced refresh, which is the one case that starts
+// from a row that already works. Without it two concurrent force requests both
+// walk past the claim — the cooldown that is supposed to stop them lives in KV
+// and is eventually consistent — and then both fetch and both write the same
+// segment indexes, interleaving two transcripts and letting one request's
+// failure handling overwrite the other's success.
+async function ytClaimForRetry(env, id, staleBefore, allowCompleted = false) {
   const res = await env.DB.prepare(
     "UPDATE youtube_transcripts SET status = 'processing', error = NULL, updated_at = ?2 " +
       "WHERE transcript_id = ?1 AND (status = 'failed' OR status = 'queued' OR " +
+      (allowCompleted ? "status = 'completed' OR " : "") +
       "((status = 'processing') AND (updated_at IS NULL OR updated_at < ?3)))"
   )
     .bind(id, nowIso(), staleBefore)
@@ -5557,20 +5564,30 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   let id;
   if (existing) {
     id = existing.transcript_id;
-    if (!preserveOnFailure) {
-      // Take the row before fetching. Losing this means another request is
-      // already transcribing it, so back off and return its row rather than
-      // running the same pipeline twice and racing to write the result.
-      const claimed = await ytClaimForRetry(env, id, new Date(Date.now() - YT_PROCESSING_STALE_MS).toISOString());
-      if (!claimed) {
-        const active = await ytRowById(env, id);
-        if (active) {
-          await ytRefundQuota(env, email); // another writer owns the fetch
-          return { ok: true, row: active, reused: true };
-        }
+    // Take the row before fetching. Losing this means another request is
+    // already transcribing it, so back off and return its row rather than
+    // running the same pipeline twice and racing to write the result.
+    //
+    // A completed row is claimed too, on a forced refresh — see
+    // ytClaimForRetry. That does mean a refresh shows as being written rather
+    // than serving the old text for those few seconds, which is the price of
+    // there being exactly one writer. Nothing is destroyed by it: the old
+    // segments stay where they are, and any failure below puts the row back to
+    // `completed` over them.
+    const claimed = await ytClaimForRetry(
+      env,
+      id,
+      new Date(Date.now() - YT_PROCESSING_STALE_MS).toISOString(),
+      preserveOnFailure
+    );
+    if (!claimed) {
+      const active = await ytRowById(env, id);
+      if (active) {
+        await ytRefundQuota(env, email); // another writer owns the fetch
+        return { ok: true, row: active, reused: true };
       }
-      await ytUpdateRow(env, id, { url: parsed.url, updated_at: at });
     }
+    await ytUpdateRow(env, id, { url: parsed.url, updated_at: at });
   } else {
     const inserted = await ytInsertRow(env, {
       owner_email: email,
@@ -5617,8 +5634,10 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
 
   if (!result.ok) {
     if (preserveOnFailure) {
-      // Keep the working transcript; report why the refresh didn't happen.
-      await ytUpdateRow(env, id, { updated_at: nowIso() });
+      // Keep the working transcript; report why the refresh didn't happen. The
+      // claim above moved the row to `processing` and nothing has touched its
+      // segments, so putting the status back restores it exactly as it was.
+      await ytUpdateRow(env, id, { status: "completed", error: null, updated_at: nowIso() });
       const kept = await ytRowById(env, id);
       return { ok: true, row: kept || existing, refreshFailed: true, code: result.code, error: result.error };
     }
@@ -5633,29 +5652,32 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   if (!(await ytRowById(env, id))) {
     return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
   }
-  // A replacement too big for one atomic batch commits in pieces, so for its
-  // duration the row holds a new prefix over an old suffix. On a forced refresh
-  // the row is still `completed`, so a concurrent reader would be served that
-  // mix as a finished transcript — and if a later batch failed it would stay
-  // that way for good, with nothing marking it as broken.
-  //
-  // The tables are AWS's too, so there is no staging table or version column to
-  // switch over. What the row can say is that it is being written: `processing`
-  // is the state every reader already handles (the .txt route answers 409, the
-  // UI shows it as pending), and an interrupted write leaves a stale claim,
-  // which the retry path re-runs from scratch rather than leaving a half-old
-  // transcript to be read as whole. Below the threshold nothing changes — the
-  // single batch either lands or doesn't, and the old transcript survives it.
-  const staged = preserveOnFailure && !ytReplaceIsAtomic(result.segments.length);
-  if (staged) await ytUpdateRow(env, id, { status: "processing", updated_at: nowIso() });
+  // The row is `processing` by now either way — it was claimed before the fetch
+  // — so no reader is being served a half-written transcript as a finished one.
+  // What is left to decide is how a failed write recovers, and that depends on
+  // whether the replacement was one atomic batch.
+  const atomic = ytReplaceIsAtomic(result.segments.length);
   try {
     await ytReplaceSegments(env, id, email, result.language, result.segments);
   } catch (err) {
-    if (!staged) throw err;
-    // The segments are already part new, part old: there is no transcript here
-    // to preserve any more, so say so rather than restoring `completed` over a
-    // mix. `failed` carries the reason to the page and is retried on its own
-    // cooldown, which rebuilds the whole thing.
+    // One batch: it either landed or it didn't, so the old segments are exactly
+    // as they were and the row can go straight back to serving them.
+    if (atomic && preserveOnFailure) {
+      await ytUpdateRow(env, id, { status: "completed", error: null, updated_at: nowIso() });
+      const kept = await ytRowById(env, id);
+      return {
+        ok: true,
+        row: kept || existing,
+        refreshFailed: true,
+        code: "UPSTREAM_ERROR",
+        error: YT_MESSAGES.UPSTREAM_ERROR,
+      };
+    }
+    if (atomic) throw err;
+    // Several batches, and one of them didn't land: the segments are part new,
+    // part old. There is no transcript here to restore, so say so rather than
+    // marking it complete over a mix. `failed` carries the reason to the page
+    // and retries on its own cooldown, which rebuilds the whole thing.
     await ytUpdateRow(env, id, {
       status: "failed",
       error: "The refresh was interrupted — the transcript will be rebuilt on the next attempt.",
