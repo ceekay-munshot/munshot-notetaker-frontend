@@ -72,12 +72,19 @@ so it is the natural owner.
 | POST   | `/youtube`            | Transcribe a video (`{ url, force }`)               |
 | GET    | `/youtube/<id>`       | The transcript record + its segments                |
 | GET    | `/youtube/<id>.txt`   | Plain text; 409 while it is still being written     |
+| POST   | `/youtube/probe?v=`   | Admin-only diagnostics: what each YouTube hop returns |
 
 These keep the shape the EC2 API returned, so callers written against that
 contract are unchanged. The owner email is always taken from the **session** — an
 email in the body or query string is ignored, since trusting it would let any
 caller read or write another customer's transcripts. Requesting a transcript you
 don't own answers **404**, never 403: a 403 would confirm the id exists.
+
+`/youtube/probe` reads nothing but is a **POST** on purpose. The session cookie
+is `SameSite=None` (this app is embedded cross-site), so a page an admin merely
+visits could otherwise fire authenticated GETs at it from an `<img>` tag, and
+each call spends three requests on the shared egress. As a POST it goes through
+the Origin check, and a short per-admin cooldown bounds it after that.
 
 **How a transcript is built.** `GET /watch?v=<id>` → extract
 `ytInitialPlayerResponse` → read

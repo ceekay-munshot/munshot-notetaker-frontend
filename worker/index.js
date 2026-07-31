@@ -95,7 +95,9 @@ export default {
       // GET /youtube/<id>.txt. Callers written against that contract are
       // unchanged; the email is taken from the session, never the payload.
       if (method === "POST" && pathname === "/youtube") return handleTranscriptCreate(request, env);
-      if (method === "GET" && pathname === "/youtube/probe") return handleTranscriptProbe(request, env);
+      // POST, not GET: see handleTranscriptProbe. A GET falls through to the
+      // 405 below, which is the honest answer for it.
+      if (method === "POST" && pathname === "/youtube/probe") return handleTranscriptProbe(request, env);
       if (method === "GET" && YT_ROUTE_RE.test(pathname)) {
         const [, transcriptId, asText] = YT_ROUTE_RE.exec(pathname);
         return asText
@@ -4618,6 +4620,13 @@ const YT_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 // never collide and overwrite each other's transcripts.
 const YT_ID_FLOOR = 1000000000;
 const YT_ID_ATTEMPTS = 25; // same-millisecond id collisions retry from the floor up
+// Every request in the same millisecond would otherwise start from the SAME
+// candidate and walk forward in lockstep, so N of them need N probes each and
+// the 26th fails outright — and the ids they claim push the collision into the
+// next millisecond too. A random offset spreads the starting points instead, so
+// the probe only ever handles the rare genuine clash. Well clear of AWS's small
+// Postgres serials either way, which is all the floor has to guarantee.
+const YT_ID_JITTER = 4096;
 const YT_SEGMENT_CHUNK = 100; // segment INSERTs per D1 batch
 // Bounds what one account can make us fetch and store: every submission is a
 // YouTube round trip plus a row and potentially thousands of segment rows.
@@ -4903,13 +4912,25 @@ function parseJson3(data) {
     // only. Fall through and let it become a cue of its own, which is what it
     // renders as anyway; dropping it would lose the words outright.
     if (ev.aAppend && rows.length) {
-      rows[rows.length - 1].text += ` ${text}`;
+      const prev = rows[rows.length - 1];
+      prev.text += ` ${text}`;
+      // The append carries its own timing, and it is later than the line it
+      // joins. Taking only the text would leave the cue ending before half of
+      // its own words are spoken, so every timestamp link and citation into
+      // that stretch points at the wrong moment. Carry the append's end as a
+      // floor on the cue's, which only ever extends it.
+      const apStart = Number(ev.tStartMs);
+      if (Number.isFinite(apStart) && apStart >= 0) {
+        const apDur = Number(ev.dDurationMs);
+        const apEnd = apStart + (Number.isFinite(apDur) && apDur > 0 ? apDur : 0);
+        if (prev.minEndMs == null || apEnd > prev.minEndMs) prev.minEndMs = apEnd;
+      }
       continue;
     }
     const startMs = Number(ev.tStartMs);
     if (!Number.isFinite(startMs) || startMs < 0) continue;
     const durMs = Number(ev.dDurationMs);
-    rows.push({ startMs, durMs: Number.isFinite(durMs) && durMs > 0 ? durMs : null, text });
+    rows.push({ startMs, durMs: Number.isFinite(durMs) && durMs > 0 ? durMs : null, minEndMs: null, text });
   }
   rows.sort((a, b) => a.startMs - b.startMs);
 
@@ -4917,9 +4938,11 @@ function parseJson3(data) {
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i];
     // dDurationMs is absent on some events: fall back to the next event's start,
-    // and for the last event to start + 2s.
-    const endMs =
+    // and for the last event to start + 2s. An append merged into this cue then
+    // raises the floor, so the cue covers the words it actually carries.
+    let endMs =
       row.durMs != null ? row.startMs + row.durMs : i + 1 < rows.length ? rows[i + 1].startMs : row.startMs + 2000;
+    if (row.minEndMs != null && row.minEndMs > endMs) endMs = row.minEndMs;
     segments[i] = {
       index: i,
       start: Math.round(row.startMs) / 1000,
@@ -5120,11 +5143,13 @@ async function ytSegmentRows(env, id) {
   return res.results || [];
 }
 
-// Allocates a transcript_id in the Worker's own range. Date.now() is monotonic
-// enough for this; the only realistic clash is two inserts in the same
-// millisecond, which walks forward a few ids rather than failing the request.
+// Allocates a transcript_id in the Worker's own range: the clock for ordering,
+// a random offset (see YT_ID_JITTER) so concurrent inserts don't all start from
+// the same candidate, and a bounded forward probe for the clash that survives
+// both. Ordering stays by created_at, which transcript_id only ever tie-breaks,
+// so the jitter costs nothing there.
 async function ytInsertRow(env, row) {
-  let candidate = YT_ID_FLOOR + Date.now();
+  let candidate = YT_ID_FLOOR + Date.now() + Math.floor(Math.random() * YT_ID_JITTER);
   for (let attempt = 0; attempt < YT_ID_ATTEMPTS; attempt++) {
     try {
       const res = await ytInsertUnderCap(env, { ...row, transcript_id: candidate }).run();
@@ -5340,6 +5365,10 @@ const YT_FORCE_COOLDOWN_MS = 5 * 60 * 1000;
 // this bounds one account to roughly one YouTube request a second even if it
 // tries to loop over every row it owns.
 const YT_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+// The diagnostic probe's window (see ytProbeCooldown). Seconds, not minutes:
+// it is run by hand to answer one question, and the point is only to stop it
+// being looped.
+const YT_PROBE_COOLDOWN_MS = 20 * 1000;
 
 async function ytForceCooldown(env, email) {
   if (!env.KV) return { ok: true };
@@ -5354,6 +5383,29 @@ async function ytForceCooldown(env, email) {
     await env.KV.put(key, String(Date.now()), { expirationTtl: Math.ceil(YT_FORCE_COOLDOWN_MS / 1000) * 2 });
   } catch {
     /* KV hiccup — don't block a legitimate refresh on the rate limiter */
+  }
+  return { ok: true };
+}
+
+// The diagnostic probe's own limiter. It is admin-only and writes nothing, but
+// each call still spends three requests on the shared egress outside every
+// per-account allowance — so without this an admin holding the page open on a
+// refresh, or a script looping it, is indistinguishable from the abuse the rest
+// of these limits exist to prevent. Short: it is a thing you run by hand and
+// read, not a monitor to poll.
+async function ytProbeCooldown(env, email) {
+  if (!env.KV) return { ok: true };
+  const key = `ytprobe:${encodeURIComponent(normalizeEmail(email))}`;
+  try {
+    const last = Number(await env.KV.get(key)) || 0;
+    const waited = Date.now() - last;
+    if (last && waited < YT_PROBE_COOLDOWN_MS) {
+      const secs = Math.max(1, Math.ceil((YT_PROBE_COOLDOWN_MS - waited) / 1000));
+      return { ok: false, error: `Probed too recently — try again in about ${secs} second${secs === 1 ? "" : "s"}.` };
+    }
+    await env.KV.put(key, String(Date.now()), { expirationTtl: 60 });
+  } catch {
+    /* KV hiccup — a diagnostic that can't reach its limiter still runs */
   }
   return { ok: true };
 }
@@ -5673,13 +5725,21 @@ async function handleTranscriptText(request, env, id) {
 }
 
 
-// GET /youtube/probe?v=<id> — read-only diagnostics for the YouTube path.
+// POST /youtube/probe?v=<id> — read-only diagnostics for the YouTube path.
 // Writes nothing. This exists because the whole design rests on Cloudflare's
 // egress not being bot-gated the way EC2's is, and that can change under us: it
 // reports exactly what each hop returns so a failure can be told apart from a
 // genuinely unavailable video, and so the egress can be monitored over time.
 // The extra client probes here are deliberate and manual — the transcript path
 // itself still makes at most one InnerTube call.
+//
+// POST for a route that reads nothing, deliberately. The session cookie is
+// SameSite=None (this app is embedded cross-site), so where third-party cookies
+// are still allowed a page an admin merely VISITS can fire authenticated GETs
+// at us from an <img> or <iframe> — and each one spends three requests on the
+// shared egress. As a POST it goes through the Origin check in the fetch
+// handler, which no cross-site form or tag can satisfy. The cooldown below then
+// bounds it even for a legitimate admin, since nothing else does.
 async function handleTranscriptProbe(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
@@ -5691,6 +5751,8 @@ async function handleTranscriptProbe(request, env) {
   const url = new URL(request.url);
   const videoId = String(url.searchParams.get("v") || "aircAruvnKk").trim();
   if (!YT_ID_RE.test(videoId)) return json({ error: YT_MESSAGES.BAD_VIDEO_ID, code: "BAD_VIDEO_ID" }, 400);
+  const gate = await ytProbeCooldown(env, session.identity);
+  if (!gate.ok) return json({ error: gate.error, code: "TOO_MANY_PROBES" }, 429);
 
   const out = { videoId, watch: {}, innertube: {} };
 
