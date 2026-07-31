@@ -5182,7 +5182,12 @@ async function ytProviderKeyless(env, videoId) {
   let res;
   let body;
   try {
-    res = await fetch(`${origin}/transcript/${encodeURIComponent(videoId)}.txt`, { headers: { Accept: "text/plain" } });
+    res = await fetch(`${origin}/transcript/${encodeURIComponent(videoId)}.txt`, {
+      // A bare datacenter request with no browser identity is what bot
+      // protection in front of a service like this exists to challenge, and a
+      // challenge comes back as HTTP 200 carrying HTML.
+      headers: { Accept: "text/markdown, text/plain;q=0.9, */*;q=0.8", "User-Agent": YT_UA },
+    });
     body = await res.text().catch(() => "");
   } catch {
     return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
@@ -5214,8 +5219,17 @@ async function ytProviderKeyless(env, videoId) {
     if (dur) durationSeconds = ytStampSeconds(dur[1]) || 0;
   }
 
+  // Anything can answer 200. A challenge page, an interstitial or a rewritten
+  // error all arrive that way, and none of them say anything about the video —
+  // so the reply has to be recognisable as this service's own document before a
+  // shortage of cues in it is allowed to mean "this video has no captions".
+  // Getting that wrong stores a permanent verdict over a transport failure and
+  // tells the user to stop trying.
   const start = body.indexOf("## Transcript");
-  const transcript = start === -1 ? body : body.slice(start + "## Transcript".length);
+  if (start === -1 || !/^#\s*Transcript/m.test(body)) {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  }
+  const transcript = body.slice(start + "## Transcript".length);
   const raw = [];
   const re = /\[(\d+(?::\d+){1,2})\]\s*([^[]*)/g;
   let m;
@@ -6118,6 +6132,54 @@ async function handleTranscriptProbe(request, env) {
     } catch (err) {
       out.innertube[client] = { error: String((err && err.message) || err) };
     }
+  }
+
+  // The providers are where a transcript actually comes from now, so a probe
+  // that only reported the direct path would be reporting the one hop we
+  // already know is blocked. What matters for each: did it answer, and does
+  // what it returned actually look like its own payload — a challenge page or
+  // an interstitial answers 200 with HTML and would otherwise be mistaken for
+  // a verdict about the video.
+  out.providers = {};
+  const keylessOrigin = ytProviderOrigin(env, "YT_TEXT_ORIGIN", "https://youtube-transcript.ai");
+  try {
+    const res = await fetch(`${keylessOrigin}/transcript/${encodeURIComponent(videoId)}.txt`, {
+      headers: { Accept: "text/markdown, text/plain;q=0.9, */*;q=0.8", "User-Agent": YT_UA },
+    });
+    const text = await res.text().catch(() => "");
+    out.providers.keyless = {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      bytes: text.length,
+      looksLikeTranscript: /^#\s*Transcript/m.test(text) && text.includes("## Transcript"),
+      cues: (text.match(/\[\d+(?::\d+){1,2}\]/g) || []).length,
+      head: text.slice(0, 200),
+    };
+  } catch (err) {
+    out.providers.keyless = { error: String((err && err.message) || err) };
+  }
+
+  if (String((env && env.SUPADATA_API_KEY) || "").trim()) {
+    const supaOrigin = ytProviderOrigin(env, "SUPADATA_ORIGIN", "https://api.supadata.ai");
+    try {
+      const res = await fetch(
+        `${supaOrigin}/v1/transcript?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`,
+        { headers: { "x-api-key": String(env.SUPADATA_API_KEY).trim(), Accept: "application/json" } }
+      );
+      const text = await res.text().catch(() => "");
+      const data = safeJsonParse(text) || {};
+      out.providers.supadata = {
+        status: res.status,
+        cues: Array.isArray(data.content) ? data.content.length : null,
+        lang: data.lang || null,
+        // Their error wording, never the key.
+        head: res.ok ? undefined : text.slice(0, 200),
+      };
+    } catch (err) {
+      out.providers.supadata = { error: String((err && err.message) || err) };
+    }
+  } else {
+    out.providers.supadata = { configured: false };
   }
 
   return json({ ok: true, probe: out });
