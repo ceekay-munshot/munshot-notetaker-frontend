@@ -5415,16 +5415,18 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     }
   }
 
-  // Everything below fetches YouTube, so this is where the hourly quota is spent.
-  const quota = await ytFetchQuota(env, email);
-  if (!quota.ok) return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
-
   // A forced refresh of a transcript that already works must not destroy it: the
   // row keeps its completed state and segments until a replacement is in hand.
   const preserveOnFailure = !!existing && existing.status === "completed";
 
   const at = nowIso();
   let id;
+  // What to undo if the quota refuses this request below, once a row has been
+  // taken: a row this request created is removed, and one it claimed goes back
+  // to the state it was in. Without that, a refusal would strand a row in
+  // `processing` that nobody is writing.
+  let createdRow = false;
+  let claimedFrom = null;
   if (existing) {
     id = existing.transcript_id;
     if (!preserveOnFailure) {
@@ -5436,6 +5438,7 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
         const active = await ytRowById(env, id);
         if (active) return { ok: true, row: active, reused: true };
       }
+      claimedFrom = { status: existing.status, error: existing.error || null, updated_at: existing.updated_at };
       await ytUpdateRow(env, id, { url: parsed.url, updated_at: at });
     }
   } else {
@@ -5463,6 +5466,25 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
       if (winner) return { ok: true, row: winner, reused: true };
     }
     id = inserted.id;
+    createdRow = true;
+  }
+
+  // The quota is spent HERE — after the row is secured, immediately before the
+  // fetch. Charging it earlier meant the paths that never reach YouTube (an
+  // account at its row cap, or a request that lost a race and is handed back
+  // someone else's row) still burned an hour's allowance, so a user could be
+  // refused a real transcription because of attempts that cost nothing.
+  const quota = await ytFetchQuota(env, email);
+  if (!quota.ok) {
+    if (createdRow) await ytDeleteTranscript(env, id).catch(() => {});
+    else if (claimedFrom) {
+      await ytUpdateRow(env, id, {
+        status: claimedFrom.status,
+        error: claimedFrom.error,
+        updated_at: claimedFrom.updated_at,
+      }).catch(() => {});
+    }
+    return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
   }
 
   let result;
