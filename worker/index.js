@@ -4878,11 +4878,6 @@ function parseJson3(data) {
   for (let i = 0; i < events.length; i++) {
     const ev = events[i];
     if (!ev) continue;
-    // Auto-generated tracks interleave an aAppend event between every real line
-    // whose only content is "\n" — they exist to make the on-screen text scroll.
-    // Keeping them doubles the segment count and puts a blank line between every
-    // sentence.
-    if (ev.aAppend) continue;
     const segs = ev.segs;
     if (!Array.isArray(segs) || !segs.length) continue;
     // One line is often split across several segs.
@@ -4895,6 +4890,17 @@ function parseJson3(data) {
     // positioning-only events, which have segs but no printable text.
     text = text.replace(/\s+/g, " ").trim();
     if (!text) continue;
+    // aAppend means "append to what is on screen", and auto-generated tracks
+    // interleave one between every real line whose only content is a newline —
+    // those vanish in the trim above, which is what stops the segment count
+    // doubling and a blank line landing between every sentence. But the flag
+    // describes rendering, not content: an append event CAN carry real words.
+    // Appending them to the previous line keeps that text without inventing a
+    // separate cue for it (and without duplicating it as one).
+    if (ev.aAppend) {
+      if (rows.length) rows[rows.length - 1].text += ` ${text}`;
+      continue;
+    }
     const startMs = Number(ev.tStartMs);
     if (!Number.isFinite(startMs) || startMs < 0) continue;
     const durMs = Number(ev.dDurationMs);
@@ -5228,6 +5234,42 @@ async function ytDeleteTranscript(env, id) {
     env.DB.prepare("DELETE FROM youtube_transcript_segments WHERE transcript_id = ?1").bind(id),
     env.DB.prepare("DELETE FROM youtube_transcripts WHERE transcript_id = ?1").bind(id),
   ]);
+}
+
+// Before transcripts lived in D1, this Worker kept them in KV: a record per
+// video under `yt:<owner>:<jobId>` and the transcript text under
+// `yttext:v1:<owner>:<jobId>`. That code is gone, but keys written while it was
+// deployed are not — and the job ids it used have no relation to a D1
+// transcript_id, so they can only be found by looking. Deleting a transcript
+// has to remove them too, or the UI reports the transcript deleted while a
+// complete copy of it stays in KV.
+//
+// Best-effort and bounded to the one account's prefix; only runs on delete.
+async function ytDeleteLegacyKvCopies(env, owner, videoId) {
+  if (!env.KV) return;
+  const prefix = `yt:${encodeURIComponent(normalizeEmail(owner))}:`;
+  try {
+    let cursor;
+    do {
+      const page = await env.KV.list({ prefix, cursor });
+      for (const key of page.keys) {
+        const raw = await env.KV.get(key.name);
+        if (!raw) continue;
+        let rec;
+        try {
+          rec = JSON.parse(raw);
+        } catch {
+          continue;
+        }
+        if (!rec || rec.videoId !== videoId) continue;
+        await env.KV.delete(key.name);
+        await env.KV.delete(`yttext:v1:${encodeURIComponent(normalizeEmail(owner))}:${rec.id}`);
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  } catch {
+    /* the D1 delete is the one that matters; this is cleanup of retired state */
+  }
 }
 
 // ── The transcript response shape ────────────────────────────────────────────
@@ -5812,6 +5854,7 @@ async function handleDeleteVideo(request, env) {
   }
   try {
     await ytDeleteTranscript(env, row.transcript_id);
+    await ytDeleteLegacyKvCopies(env, row.owner_email, row.video_id);
   } catch (err) {
     return json({ error: "Failed to remove that video", detail: String((err && err.message) || err) }, 500);
   }
