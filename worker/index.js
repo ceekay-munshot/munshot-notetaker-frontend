@@ -4897,8 +4897,13 @@ function parseJson3(data) {
     // describes rendering, not content: an append event CAN carry real words.
     // Appending them to the previous line keeps that text without inventing a
     // separate cue for it (and without duplicating it as one).
-    if (ev.aAppend) {
-      if (rows.length) rows[rows.length - 1].text += ` ${text}`;
+    //
+    // With nothing on screen yet there is no line to append to — a track can
+    // open with an append, or everything before it can have been positioning
+    // only. Fall through and let it become a cue of its own, which is what it
+    // renders as anyway; dropping it would lose the words outright.
+    if (ev.aAppend && rows.length) {
+      rows[rows.length - 1].text += ` ${text}`;
       continue;
     }
     const startMs = Number(ev.tStartMs);
@@ -5581,10 +5586,15 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
   }
   const completedAt = nowIso();
+  // A player response can come back with captions but without some of the
+  // optional metadata around them. Writing that absence through would blank a
+  // title, channel or duration the row already had — a forced refresh would
+  // "succeed" and leave the video showing its raw id. Only overwrite a field
+  // the fetch actually produced.
   await ytUpdateRow(env, id, {
-    title: result.title || null,
-    channel: result.channel || null,
-    duration_seconds: result.durationSeconds || null,
+    title: result.title || (existing && existing.title) || null,
+    channel: result.channel || (existing && existing.channel) || null,
+    duration_seconds: result.durationSeconds || (existing && existing.duration_seconds) || null,
     status: "completed",
     source: "captions",
     language: result.language || null,
