@@ -107,11 +107,21 @@ event's start, or +2s for the last), and one line is often split across several
 `youtube_transcript_segments` tables, which AWS also writes — this Worker never
 creates or alters them. Two rules follow from sharing:
 
-- `transcript_id` is allocated as `1_000_000_000 + Date.now()`. AWS uses small
-  Postgres serials, so the two id spaces can never collide.
+- `transcript_id` is allocated as `1_000_000_000 + Date.now()` plus a small
+  random offset. AWS uses small Postgres serials, so the two id spaces can never
+  collide; the offset is what stops concurrent inserts all starting from the
+  same candidate and walking forward in lockstep.
 - `user_id` is AWS's Postgres user id, which the Worker doesn't know, so
   Worker-origin rows store `0`. `owner_email` is set on **both** tables — that is
   what the dashboard filters on.
+
+A transcript up to 468 cues is written as **one atomic D1 batch**. Past that it
+commits in pieces, so for the duration the row holds a new prefix over an old
+suffix. On a forced refresh — the only case where the row was already
+`completed` — it is moved to `processing` first, which is the state every reader
+already handles, and an interrupted write leaves a stale claim the retry path
+rebuilds from scratch. There is no staging table to switch over instead: these
+are AWS's tables too.
 
 Two schema additions, both additive and created on demand. The first is
 `CREATE UNIQUE INDEX IF NOT EXISTS uq_yt_owner_video ON youtube_transcripts

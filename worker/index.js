@@ -5239,6 +5239,14 @@ function ytSegmentInsert(env, id, email, language, chunk) {
   ).bind(...binds);
 }
 
+// Does a replacement of this many cues go in as ONE atomic batch? Beyond this
+// it commits in pieces, and the row holds a mix of new and old cues until the
+// last one lands. Callers that had a working transcript need to know which of
+// the two they are about to do — see the staging in createYoutubeTranscript.
+function ytReplaceIsAtomic(count) {
+  return Math.ceil(count / YT_ROWS_PER_STATEMENT) + 1 <= YT_ATOMIC_MAX;
+}
+
 async function ytReplaceSegments(env, id, owner, language, segments) {
   const email = normalizeEmail(owner);
   const statements = [];
@@ -5249,7 +5257,7 @@ async function ytReplaceSegments(env, id, owner, language, segments) {
     "DELETE FROM youtube_transcript_segments WHERE transcript_id = ?1 AND segment_index >= ?2"
   ).bind(id, segments.length);
 
-  if (statements.length + 1 <= YT_ATOMIC_MAX) {
+  if (ytReplaceIsAtomic(segments.length)) {
     await env.DB.batch([...statements, trim]);
     return;
   }
@@ -5625,7 +5633,43 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   if (!(await ytRowById(env, id))) {
     return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
   }
-  await ytReplaceSegments(env, id, email, result.language, result.segments);
+  // A replacement too big for one atomic batch commits in pieces, so for its
+  // duration the row holds a new prefix over an old suffix. On a forced refresh
+  // the row is still `completed`, so a concurrent reader would be served that
+  // mix as a finished transcript — and if a later batch failed it would stay
+  // that way for good, with nothing marking it as broken.
+  //
+  // The tables are AWS's too, so there is no staging table or version column to
+  // switch over. What the row can say is that it is being written: `processing`
+  // is the state every reader already handles (the .txt route answers 409, the
+  // UI shows it as pending), and an interrupted write leaves a stale claim,
+  // which the retry path re-runs from scratch rather than leaving a half-old
+  // transcript to be read as whole. Below the threshold nothing changes — the
+  // single batch either lands or doesn't, and the old transcript survives it.
+  const staged = preserveOnFailure && !ytReplaceIsAtomic(result.segments.length);
+  if (staged) await ytUpdateRow(env, id, { status: "processing", updated_at: nowIso() });
+  try {
+    await ytReplaceSegments(env, id, email, result.language, result.segments);
+  } catch (err) {
+    if (!staged) throw err;
+    // The segments are already part new, part old: there is no transcript here
+    // to preserve any more, so say so rather than restoring `completed` over a
+    // mix. `failed` carries the reason to the page and is retried on its own
+    // cooldown, which rebuilds the whole thing.
+    await ytUpdateRow(env, id, {
+      status: "failed",
+      error: "The refresh was interrupted — the transcript will be rebuilt on the next attempt.",
+      updated_at: nowIso(),
+    });
+    const broken = await ytRowById(env, id);
+    return {
+      ok: true,
+      row: broken || null,
+      failed: true,
+      code: "REFRESH_INTERRUPTED",
+      error: "The refresh was interrupted — the transcript will be rebuilt on the next attempt.",
+    };
+  }
   // The lease is only honoured while it looks fresh, and a long fetch plus a
   // long chunked write can outlive it — so the row may have been deleted after
   // the check above and while these segments were going in. Clean up after
@@ -6363,6 +6407,8 @@ function timingSafeEqual(a, b) {
 // that can drift. Inert at runtime — Workers only ever invokes the default
 // export — and deliberately limited to the pure, binding-free chat internals.
 export {
+  parseJson3,
+  ytReplaceIsAtomic,
   buildChatRequest,
   buildWeeklyChatRequest,
   videoRowsFromText,
