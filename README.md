@@ -86,7 +86,39 @@ visits could otherwise fire authenticated GETs at it from an `<img>` tag, and
 each call spends three requests on the shared egress. As a POST it goes through
 the Origin check, and a short per-admin cooldown bounds it after that.
 
-**How a transcript is built.** `GET /watch?v=<id>` → extract
+**Where the transcript comes from.** YouTube blocks the egress of every cloud
+host we can run on — EC2's and Cloudflare's alike, measured against the deployed
+Worker. So the outbound leg goes through a provider whose IPs YouTube still
+answers. Only that leg is third-party; parsing, storage, ownership and the whole
+route contract are ours.
+
+| Order | Provider | Needs | Gives |
+| --- | --- | --- | --- |
+| 1 | [Supadata](https://supadata.ai) | `SUPADATA_API_KEY` secret | Per-cue offsets and durations in ms — the model here exactly |
+| 2 | [youtube-transcript.ai](https://youtube-transcript.ai) | nothing | Paragraph-level stamps, plus a title and duration |
+| 3 | Direct from YouTube | `YT_ALLOW_DIRECT=1` | The best source, when the egress is clean |
+
+With nothing configured the feature works on the keyless provider. Supadata's
+free tier is 100 requests/month with no card, and is used automatically the
+moment the secret exists — worth it, because paragraph stamps are roughly 8×
+coarser than per-cue ones and the transcript view and chat citations both point
+at timestamps.
+
+Direct is **off** by default, and deliberately: we have measured that it fails
+here, so leaving it in the chain would spend a doomed request on every fetch,
+and a bot-gated reply reads as "video unavailable" — which would overwrite a
+correct answer from a provider that did reach YouTube. Turn it on once the
+egress is clean and it returns as the last resort. Setting `YT_ORIGIN` instead
+means "fetch from YouTube yourself" and makes direct the only provider.
+
+Auto-generated captions arrive from the keyless provider with YouTube's
+rolling-window repetition intact — every phrase two or three times over, because
+joining the cues into prose has already destroyed the boundaries that make it
+removable. `ytCollapseRepeats` undoes it by collapsing immediately-repeated runs
+of three words or more; shorter windows would eat real speech ("no no no"), and
+a repeat that is not adjacent is someone genuinely saying the same thing twice.
+
+**How the direct path builds a transcript.** `GET /watch?v=<id>` → extract
 `ytInitialPlayerResponse` → read
 `captions.playerCaptionsTracklistRenderer.captionTracks[]` → pick a track →
 fetch `baseUrl + "&fmt=json3"` → parse. Track preference: **manual beats
