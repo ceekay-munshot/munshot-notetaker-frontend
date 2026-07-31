@@ -5454,6 +5454,12 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     // owns the fetch and the segment write, so return its row rather than
     // running the same pipeline against the same rows.
     if (inserted.atCap) {
+      // The capped INSERT ... SELECT writes nothing both when the account is
+      // genuinely full AND when a concurrent request for this same video just
+      // took the last slot. Look before blaming the cap: if the video now
+      // exists, that is the answer the caller wanted.
+      const winner = await ytRowByOwnerVideo(env, email, parsed.videoId);
+      if (winner) return { ok: true, row: winner, reused: true };
       return {
         ok: false,
         status: 400,
@@ -5476,8 +5482,14 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
   // refused a real transcription because of attempts that cost nothing.
   const quota = await ytFetchQuota(env, email);
   if (!quota.ok) {
-    if (createdRow) await ytDeleteTranscript(env, id).catch(() => {});
-    else if (claimedFrom) {
+    // A row this request created may ALREADY have been handed to a concurrent
+    // request for the same video, which lost the insert race and was told to
+    // reuse it. Deleting it would leave that caller holding an id that 404s, so
+    // the row stays and carries the reason instead — visible, explicable, and
+    // deletable — rather than vanishing under someone.
+    if (createdRow) {
+      await ytUpdateRow(env, id, { status: "failed", error: quota.error, updated_at: nowIso() }).catch(() => {});
+    } else if (claimedFrom) {
       await ytUpdateRow(env, id, {
         status: claimedFrom.status,
         error: claimedFrom.error,
