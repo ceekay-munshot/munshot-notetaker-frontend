@@ -128,11 +128,17 @@ destroyed by that: the segment rows stay where they are, and every failure below
 restores `completed` over them intact.
 
 A transcript up to 468 cues is written as **one atomic D1 batch**, so a failed
-write leaves the previous segments exactly as they were and the row simply goes
-back to `completed`. Past that it commits in pieces, and a failure part-way
-leaves a real mix — that row is marked `failed` with a message saying it will be
-rebuilt, rather than being handed back as though it were whole. There is no
-staging table to switch over instead: these are AWS's tables too.
+write leaves whatever was there exactly as it was: a refresh goes back to
+`completed` over its old segments, and a first attempt is marked `failed` with a
+try-again message. Past that it commits in pieces, and a failure part-way leaves
+a real mix — that row is marked `failed` saying it will be rebuilt, rather than
+being handed back as though it were whole. There is no staging table to switch
+over instead: these are AWS's tables too.
+
+Either way the row never keeps its claim after a failed write. Leaving it
+`processing` would answer 500 and then hand the same untouched row back to the
+next submission, so the page polls something nothing is writing, for a failure
+nobody was told about.
 
 Two schema additions, both additive and created on demand. The first is
 `CREATE UNIQUE INDEX IF NOT EXISTS uq_yt_owner_video ON youtube_transcripts

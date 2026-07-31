@@ -5673,23 +5673,28 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
         error: YT_MESSAGES.UPSTREAM_ERROR,
       };
     }
-    if (atomic) throw err;
-    // Several batches, and one of them didn't land: the segments are part new,
-    // part old. There is no transcript here to restore, so say so rather than
-    // marking it complete over a mix. `failed` carries the reason to the page
-    // and retries on its own cooldown, which rebuilds the whole thing.
-    await ytUpdateRow(env, id, {
-      status: "failed",
-      error: "The refresh was interrupted — the transcript will be rebuilt on the next attempt.",
-      updated_at: nowIso(),
-    });
+    // Every other case ends the same way: the row must not be left holding the
+    // claim. It is `processing` with a fresh timestamp, so rethrowing would
+    // answer 500 and leave a row that a resubmission inside the stale window is
+    // handed straight back — the page then polls a row nothing is writing, for
+    // a failure nobody was told about. Marking it failed says what happened and
+    // retries on the normal cooldown.
+    //
+    // Several batches with one of them not landing is the same outcome with a
+    // different reason: the segments are part new, part old, so there is
+    // nothing to restore and the whole thing has to be rebuilt.
+    const interrupted = !atomic;
+    const message = interrupted
+      ? "Saving this transcript was interrupted — it will be rebuilt on the next attempt."
+      : "Couldn't save this transcript — try again shortly.";
+    await ytUpdateRow(env, id, { status: "failed", error: message, updated_at: nowIso() });
     const broken = await ytRowById(env, id);
     return {
       ok: true,
       row: broken || null,
       failed: true,
-      code: "REFRESH_INTERRUPTED",
-      error: "The refresh was interrupted — the transcript will be rebuilt on the next attempt.",
+      code: interrupted ? "WRITE_INTERRUPTED" : "WRITE_FAILED",
+      error: message,
     };
   }
   // The lease is only honoured while it looks fresh, and a long fetch plus a
