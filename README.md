@@ -98,11 +98,18 @@ route contract are ours.
 | 2 | [youtube-transcript.ai](https://youtube-transcript.ai) | nothing | Paragraph-level stamps, plus a title and duration |
 | 3 | Direct from YouTube | `YT_ALLOW_DIRECT=1` | The best source, when the egress is clean |
 
-With nothing configured the feature works on the keyless provider. Supadata's
-free tier is 100 requests/month with no card, and is used automatically the
-moment the secret exists — worth it, because paragraph stamps are roughly 8×
-coarser than per-cue ones and the transcript view and chat citations both point
-at timestamps.
+**A key is effectively required.** The keyless provider rate-limits by IP, and a
+Worker shares its egress IPs with the rest of Cloudflare — so its bucket is
+spent by strangers and it answers with a sales pitch (HTTP 200, no less)
+regardless of our own volume. Measured on the deployed Worker, not assumed. A
+key gives us our own quota instead of one shared with a datacenter, which is the
+whole reason it helps; Supadata's free tier is 100 requests/month with no card,
+and is used automatically the moment the secret exists. It is also the better
+source anyway: paragraph stamps are roughly 8x coarser than per-cue ones, and
+the transcript view and chat citations both point at timestamps.
+
+The keyless provider stays as the fallback because it costs nothing to try and
+does work from an IP that has not been exhausted.
 
 Direct is **off** by default, and deliberately: we have measured that it fails
 here, so leaving it in the chain would spend a doomed request on every fetch,

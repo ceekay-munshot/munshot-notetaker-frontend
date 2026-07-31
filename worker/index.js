@@ -4649,6 +4649,10 @@ const YT_MESSAGES = {
   UPSTREAM_ERROR: "Temporarily unable to reach YouTube. Try again shortly.",
   BAD_VIDEO_ID: "That doesn't look like a YouTube video link.",
   UNAVAILABLE: "This video is unavailable.",
+  // Not "try again shortly": retrying is exactly what will not help. The free
+  // provider limits by IP, and this Worker shares its egress IPs with the rest
+  // of Cloudflare, so that bucket is spent by strangers no matter what we do.
+  PROVIDER_LIMIT: "The transcript service is over its free limit here. An API key needs to be configured.",
 };
 
 // Where YouTube lives. Overridable only by an operator (a var, not user input) so
@@ -5140,6 +5144,9 @@ async function ytProviderSupadata(env, videoId) {
     if (res.status === 404 || /no transcript|not found|unavailable/i.test(reason)) {
       return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
     }
+    if (res.status === 401 || res.status === 402 || res.status === 429 || /quota|limit|credit/i.test(reason)) {
+      return { ok: false, code: "PROVIDER_LIMIT", error: YT_MESSAGES.PROVIDER_LIMIT, detail };
+    }
     return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
   }
   const content = Array.isArray(body.content) ? body.content : null;
@@ -5211,6 +5218,9 @@ async function ytProviderKeyless(env, videoId) {
     if (/unavailable|private|removed|does not exist/i.test(reasonText)) {
       return { ok: false, code: "UNAVAILABLE", error: YT_MESSAGES.UNAVAILABLE, detail };
     }
+    if (res.status === 429 || /high volume|rate.?limit/i.test(body)) {
+      return { ok: false, code: "PROVIDER_LIMIT", error: YT_MESSAGES.PROVIDER_LIMIT, detail };
+    }
     return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
   }
 
@@ -5233,6 +5243,12 @@ async function ytProviderKeyless(env, videoId) {
   // shortage of cues in it is allowed to mean "this video has no captions".
   // Getting that wrong stores a permanent verdict over a transport failure and
   // tells the user to stop trying.
+  // Their rate limit is an HTTP 200 carrying a sales pitch, so it has to be
+  // recognised by what it says. Reporting it as a transport blip would tell the
+  // user to retry forever against a bucket they can never get back.
+  if (/calling this API at high volume|higher rate limits?|rate.?limit/i.test(body)) {
+    return { ok: false, code: "PROVIDER_LIMIT", error: YT_MESSAGES.PROVIDER_LIMIT, detail };
+  }
   const start = body.indexOf("## Transcript");
   if (start === -1 || !/^#\s*Transcript/m.test(body)) {
     return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
@@ -5268,7 +5284,18 @@ async function ytProviderKeyless(env, videoId) {
 // A definite answer about the VIDEO beats a transport failure: if one provider
 // says the video is private and another simply couldn't be reached, the user
 // should be told it is private rather than to keep retrying.
-const YT_ERROR_RANK = { NO_CAPTIONS: 3, IS_LIVE: 4, UNAVAILABLE: 4, BAD_VIDEO_ID: 4, BOT_GATED: 1, UPSTREAM_ERROR: 1 };
+const YT_ERROR_RANK = {
+  NO_CAPTIONS: 3,
+  IS_LIVE: 4,
+  UNAVAILABLE: 4,
+  BAD_VIDEO_ID: 4,
+  BOT_GATED: 1,
+  UPSTREAM_ERROR: 1,
+  // Above the transport failures, below anything about the video: it says
+  // something true and actionable about us, but a provider that actually
+  // reached YouTube still knows better about the video itself.
+  PROVIDER_LIMIT: 2,
+};
 
 async function fetchYoutubeTranscript(env, videoId) {
   const allowDirect = /^(1|true|yes)$/i.test(String((env && env.YT_ALLOW_DIRECT) || "").trim());
