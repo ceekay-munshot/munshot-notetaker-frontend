@@ -5351,6 +5351,23 @@ async function ensureQuotaTable(env) {
   ytQuotaTableReady = true;
 }
 
+// Hands a token back when the request that reserved it turns out not to need
+// one — it was handed an existing row, lost a race, or hit the row cap. Capped
+// at a full bucket so a refund can never mint allowance. Best-effort: a lost
+// refund costs that account one token, which the refill returns anyway.
+async function ytRefundQuota(env, email) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      "UPDATE worker_youtube_fetch_budget SET tokens = MIN(?2, tokens + 1) WHERE owner_email = ?1"
+    )
+      .bind(normalizeEmail(email), YT_FETCH_QUOTA)
+      .run();
+  } catch {
+    /* best-effort */
+  }
+}
+
 async function ytFetchQuota(env, email) {
   if (!env.DB) return { ok: true };
   const now = Date.now();
@@ -5415,18 +5432,22 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     }
   }
 
+  // Every reuse path above returned already, so this request intends to fetch.
+  // The token is reserved HERE — before any row exists — and handed back below
+  // on the paths that turn out not to fetch after all. Taking it first is what
+  // keeps a refusal from having to touch a row at all: nothing is created, so
+  // there is nothing to strand in `processing`, nothing to delete out from
+  // under a concurrent caller, and no invisible row left eating the account's
+  // capacity. The refund covers the cases the reservation can't foresee.
+  const quota = await ytFetchQuota(env, email);
+  if (!quota.ok) return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
+
   // A forced refresh of a transcript that already works must not destroy it: the
   // row keeps its completed state and segments until a replacement is in hand.
   const preserveOnFailure = !!existing && existing.status === "completed";
 
   const at = nowIso();
   let id;
-  // What to undo if the quota refuses this request below, once a row has been
-  // taken: a row this request created is removed, and one it claimed goes back
-  // to the state it was in. Without that, a refusal would strand a row in
-  // `processing` that nobody is writing.
-  let createdRow = false;
-  let claimedFrom = null;
   if (existing) {
     id = existing.transcript_id;
     if (!preserveOnFailure) {
@@ -5436,9 +5457,11 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
       const claimed = await ytClaimForRetry(env, id, new Date(Date.now() - YT_PROCESSING_STALE_MS).toISOString());
       if (!claimed) {
         const active = await ytRowById(env, id);
-        if (active) return { ok: true, row: active, reused: true };
+        if (active) {
+          await ytRefundQuota(env, email); // another writer owns the fetch
+          return { ok: true, row: active, reused: true };
+        }
       }
-      claimedFrom = { status: existing.status, error: existing.error || null, updated_at: existing.updated_at };
       await ytUpdateRow(env, id, { url: parsed.url, updated_at: at });
     }
   } else {
@@ -5459,6 +5482,7 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
       // took the last slot. Look before blaming the cap: if the video now
       // exists, that is the answer the caller wanted.
       const winner = await ytRowByOwnerVideo(env, email, parsed.videoId);
+      await ytRefundQuota(env, email); // neither branch below fetches anything
       if (winner) return { ok: true, row: winner, reused: true };
       return {
         ok: false,
@@ -5469,34 +5493,12 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     }
     if (inserted.existed) {
       const winner = await ytRowById(env, inserted.id);
-      if (winner) return { ok: true, row: winner, reused: true };
+      if (winner) {
+        await ytRefundQuota(env, email); // the winner owns the fetch
+        return { ok: true, row: winner, reused: true };
+      }
     }
     id = inserted.id;
-    createdRow = true;
-  }
-
-  // The quota is spent HERE — after the row is secured, immediately before the
-  // fetch. Charging it earlier meant the paths that never reach YouTube (an
-  // account at its row cap, or a request that lost a race and is handed back
-  // someone else's row) still burned an hour's allowance, so a user could be
-  // refused a real transcription because of attempts that cost nothing.
-  const quota = await ytFetchQuota(env, email);
-  if (!quota.ok) {
-    // A row this request created may ALREADY have been handed to a concurrent
-    // request for the same video, which lost the insert race and was told to
-    // reuse it. Deleting it would leave that caller holding an id that 404s, so
-    // the row stays and carries the reason instead — visible, explicable, and
-    // deletable — rather than vanishing under someone.
-    if (createdRow) {
-      await ytUpdateRow(env, id, { status: "failed", error: quota.error, updated_at: nowIso() }).catch(() => {});
-    } else if (claimedFrom) {
-      await ytUpdateRow(env, id, {
-        status: claimedFrom.status,
-        error: claimedFrom.error,
-        updated_at: claimedFrom.updated_at,
-      }).catch(() => {});
-    }
-    return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
   }
 
   let result;
@@ -5549,15 +5551,9 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
     updated_at: completedAt,
     completed_at: completedAt,
   });
-  // The cached summary was written from the OLD captions, so a replacement
-  // transcript must invalidate it or the brief silently describes stale content.
-  if (opts.force && env.KV) {
-    try {
-      await env.KV.delete(`${YT_SUMMARY_PREFIX}${parsed.videoId}`);
-    } catch {
-      /* best-effort */
-    }
-  }
+  // No cache invalidation needed on a refresh: the summary key carries a
+  // signature of the transcript, so replacement captions simply address a
+  // different entry, and unchanged captions keep (and share) the existing one.
   return { ok: true, row: await ytRowById(env, id) };
 }
 
@@ -5828,11 +5824,29 @@ async function handleDeleteVideo(request, env) {
 // secret, and a video is summarized ONCE — cached by video id, so every user who
 // transcribes the same video shares it.
 
-// Summaries are cached by VIDEO id, not transcript id: two accounts that
-// transcribe the same YouTube video share one summary, exactly as co-owners of a
-// meeting do, and we never pay to summarize the same video twice.
-function ytSummaryKey(row) {
-  return `${YT_SUMMARY_PREFIX}${String(row.video_id || row.transcript_id).trim()}`;
+// A cheap, stable signature of a string. Only needs to change when the text
+// changes — not to be cryptographic.
+function ytTextSignature(text) {
+  let h = 2166136261; // FNV-1a
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+// Summaries are shared by VIDEO, not by transcript row: two accounts that
+// transcribe the same video get one summary and we never pay to make it twice.
+//
+// But each account's transcript is independently refreshable, so "same video"
+// is not the same thing as "same words" — after one owner force-refreshes and
+// YouTube's captions have changed, a key of video id alone would serve the
+// other owner a summary that contradicts the transcript on their own page. The
+// key therefore carries a signature of the transcript itself: identical
+// captions still share, divergent ones no longer collide.
+function ytSummaryKey(row, transcript) {
+  const video = String(row.video_id || row.transcript_id).trim();
+  return `${YT_SUMMARY_PREFIX}${video}:${ytTextSignature(transcript || "")}`;
 }
 
 // The transcript as the model sees it: "[mm:ss] line", which gives the summary
@@ -5996,7 +6010,7 @@ async function handleVideoAi(request, env) {
   const model = env.OPENAI_MODEL || "gpt-4o";
 
   if (body.summarize) {
-    const cacheKey = ytSummaryKey(row);
+    const cacheKey = ytSummaryKey(row, transcript);
     const force = !!body.force;
     if (!force && env.KV) {
       try {
@@ -6044,7 +6058,7 @@ async function handleVideoAi(request, env) {
 
   let cachedSummary = "";
   try {
-    cachedSummary = ((await env.KV.get(ytSummaryKey(row))) || "").slice(0, 6000);
+    cachedSummary = ((await env.KV.get(ytSummaryKey(row, transcript))) || "").slice(0, 6000);
   } catch {
     /* optional context */
   }
