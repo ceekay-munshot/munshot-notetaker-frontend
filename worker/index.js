@@ -27,6 +27,9 @@ const RESET_CODE_TTL = 15 * 60; // password-reset code lifetime, seconds (15 min
 const RESET_MAX_ATTEMPTS = 5; // wrong-code tries before a reset code is burned
 const RESET_RESEND_COOLDOWN_MS = 60_000; // ignore a repeat "send code" within this window
 const RECURRENCES = ["once", "daily", "weekdays", "weekly"];
+// GET /youtube/<transcript_id> and /youtube/<transcript_id>.txt — the transcript
+// API contract this Worker took over from EC2.
+const YT_ROUTE_RE = /^\/youtube\/(\d+)(\.txt)?$/;
 
 export default {
   async fetch(request, env) {
@@ -44,7 +47,7 @@ export default {
       // script origin, whether the page is loaded standalone or embedded in
       // another site's iframe — so this holds in both cases. Requests with no
       // Origin header (curl, same-site top-level navigations) pass through.
-      if (pathname.startsWith("/api/") && method !== "GET" && method !== "OPTIONS" && method !== "HEAD") {
+      if ((pathname.startsWith("/api/") || pathname === "/youtube" || pathname.startsWith("/youtube/")) && method !== "GET" && method !== "OPTIONS" && method !== "HEAD") {
         const origin = request.headers.get("Origin");
         if (origin && origin !== url.origin) {
           return json({ error: "Cross-site request rejected" }, 403);
@@ -87,6 +90,20 @@ export default {
       if (method === "GET" && pathname === "/api/youtube/video") return handleGetVideo(request, env);
       if (method === "POST" && pathname === "/api/youtube/delete") return handleDeleteVideo(request, env);
       if (method === "POST" && pathname === "/api/youtube/ai") return handleVideoAi(request, env);
+      // The EC2 transcript API's own shape, served from here now (see the
+      // YouTube transcripts section): POST /youtube, GET /youtube/<id>,
+      // GET /youtube/<id>.txt. Callers written against that contract are
+      // unchanged; the email is taken from the session, never the payload.
+      if (method === "POST" && pathname === "/youtube") return handleTranscriptCreate(request, env);
+      // POST, not GET: see handleTranscriptProbe. A GET falls through to the
+      // 405 below, which is the honest answer for it.
+      if (method === "POST" && pathname === "/youtube/probe") return handleTranscriptProbe(request, env);
+      if (method === "GET" && YT_ROUTE_RE.test(pathname)) {
+        const [, transcriptId, asText] = YT_ROUTE_RE.exec(pathname);
+        return asText
+          ? handleTranscriptText(request, env, transcriptId)
+          : handleTranscriptGet(request, env, transcriptId);
+      }
       if (method === "GET" && pathname === "/api/tracking/directory") return handleTrackingDirectory(request, env);
       if (method === "GET" && pathname === "/api/debug/meetings-schema") return handleDebugMeetingsSchema(request, env);
       if (method === "GET" && pathname === "/api/tracking") return handleGetTracking(request, env);
@@ -100,6 +117,18 @@ export default {
       // always get JSON back).
       if (pathname === "/api" || pathname.startsWith("/api/")) {
         return json({ error: "Not found" }, 404);
+      }
+      // The transcript contract owns /youtube outright, for the same reason: a
+      // malformed id, a trailing slash, or the wrong method would otherwise fall
+      // through to the SPA and answer HTTP 200 with an HTML page, which a client
+      // parsing JSON reads as either success or a parse error rather than the
+      // 404/405 it actually is.
+      if (pathname === "/youtube" || pathname.startsWith("/youtube/")) {
+        const known =
+          pathname === "/youtube" || pathname === "/youtube/probe" || YT_ROUTE_RE.test(pathname);
+        return known
+          ? json({ error: "Method not allowed", code: "METHOD_NOT_ALLOWED" }, 405)
+          : json({ error: "Not found", code: "NOT_FOUND" }, 404);
       }
       // Everything else is the React SPA: serve the static asset if one matches,
       // otherwise fall back to index.html so client-side routes (e.g. /meetings/42)
@@ -4562,61 +4591,101 @@ async function runDueSchedules(env) {
   }
 }
 
-/* ------------------------------ YouTube videos ------------------------------ */
-// A second transcript source alongside meetings: paste a YouTube link, the bot
-// backend transcribes it, and the dashboard gives it the same treatment a
-// meeting gets — stored transcript, AI summary, and chat over it.
+/* --------------------- YouTube transcripts (home-grown) --------------------- */
+// This Worker owns YouTube transcripts end to end: it fetches the caption track
+// from YouTube itself, parses it, and stores it in D1. Nothing is proxied to the
+// transcript API on EC2 any more.
 //
-// Upstream contract (same host and same server-held X-API-Key as the notetaker,
-// so the key never reaches the browser):
-//   POST /public/youtube             {email, url}   -> 202 {id, status, video_id, …}
-//   GET  /public/youtube/<id>?email=…               -> that job's current state
-//   GET  /public/youtube/<id>.txt?email=…           -> the transcript as plain text
+// WHY the Worker and not the API: YouTube hard-blocks the EC2 egress IP. Every
+// request from there — a plain watch-page GET, not just the player API — comes
+// back "Sign in to confirm you're not a bot" with captionTracks stripped, and
+// every player client fails identically, so it is IP reputation rather than
+// tooling. Cloudflare's egress is not blocked, and this Worker already has D1
+// write access, so it is the natural owner.
 //
-// Upstream has no "list my videos" route, so every queued video is ALSO indexed
-// in this Worker's KV under `yt:<owner>:<id>` — that index is what an account's
-// Videos tab lists (admin scans every owner's). Ownership is the session email,
-// never the request body: a user only lists/reads/deletes their own records, and
-// every upstream call carries that same owner email.
+// The route contract below is deliberately the SAME shape the EC2 API returned,
+// so callers written against that API keep working unchanged.
+//
+// SCOPE: captions only. A video with no caption track cannot be transcribed here
+// at all — the ASR fallback needs the audio, which only the AWS side can push to
+// Deepgram, and that path is IP-blocked. Those are marked failed with a plain
+// explanation rather than left looking like they're still queued.
 
-const YT_PREFIX = "yt:"; // yt:<owner>:<id> → the video record
-const YT_TEXT_PREFIX = "yttext:v1:"; // cached transcript text, per owner+job
-const YT_SUMMARY_PREFIX = "ytsummary:v1:"; // cached AI summary, shared per video
+const YT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const YT_ACCEPT_LANGUAGE = "en-US,en;q=0.9";
+const YT_ID_RE = /^[A-Za-z0-9_-]{11}$/;
+// AWS writes these same tables using Postgres serial ids (currently ~150, growing
+// slowly). Worker-created rows live above this floor so the two id spaces can
+// never collide and overwrite each other's transcripts.
+const YT_ID_FLOOR = 1000000000;
+const YT_ID_ATTEMPTS = 25; // same-millisecond id collisions retry from the floor up
+// Every request in the same millisecond would otherwise start from the SAME
+// candidate and walk forward in lockstep, so N of them need N probes each and
+// the 26th fails outright — and the ids they claim push the collision into the
+// next millisecond too. A random offset spreads the starting points instead, so
+// the probe only ever handles the rare genuine clash. Well clear of AWS's small
+// Postgres serials either way, which is all the floor has to guarantee.
+const YT_ID_JITTER = 4096;
+const YT_SEGMENT_CHUNK = 100; // segment INSERTs per D1 batch
+// Bounds what one account can make us fetch and store: every submission is a
+// YouTube round trip plus a row and potentially thousands of segment rows.
 const MAX_VIDEOS_PER_USER = 300;
-const YT_REFRESH_BATCH = 12; // in-flight jobs refreshed per list call
-const YT_TERMINAL = new Set(["completed", "failed"]);
+// A row left "processing" by an interrupted request would otherwise look like
+// an active concurrent write forever, and the video would sit transcribing for
+// good. Past this age it is treated as orphaned and retried.
+const YT_PROCESSING_STALE_MS = 2 * 60 * 1000;
+// The public InnerTube web key, used only when the (bot-gated) watch page didn't
+// give us one to scrape. Not a secret — it ships in every youtube.com page.
+const YT_PUBLIC_INNERTUBE_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
+const YT_SUMMARY_PREFIX = "ytsummary:v1:";
 
-function ytPrefixFor(owner) {
-  return `${YT_PREFIX}${encodeURIComponent(normalizeEmail(owner))}:`;
+// Short, human error text — this renders straight into the customer's transcript
+// page, so it never carries a stack or a wall of library output.
+const YT_MESSAGES = {
+  NO_CAPTIONS: "This video has no captions available.",
+  IS_LIVE: "Video is a live stream; wait until it has ended.",
+  BOT_GATED: "Temporarily unable to reach YouTube. Try again shortly.",
+  UPSTREAM_ERROR: "Temporarily unable to reach YouTube. Try again shortly.",
+  BAD_VIDEO_ID: "That doesn't look like a YouTube video link.",
+  UNAVAILABLE: "This video is unavailable.",
+  // Not "try again shortly": retrying is exactly what will not help. The free
+  // provider limits by IP, and this Worker shares its egress IPs with the rest
+  // of Cloudflare, so that bucket is spent by strangers no matter what we do.
+  PROVIDER_LIMIT: "The transcript service is over its free limit here. An API key needs to be configured.",
+};
+
+// Where YouTube lives. Overridable only by an operator (a var, not user input) so
+// the fetch/parse path can be pointed at a fixture server in local testing; any
+// non-https value is ignored so it can never be turned into an open proxy.
+function ytOrigin(env) {
+  const raw = String((env && env.YT_ORIGIN) || "").trim().replace(/\/+$/, "");
+  return /^https:\/\/[^\s]+$/i.test(raw) || /^http:\/\/127\.0\.0\.1:\d+$/.test(raw) ? raw : "https://www.youtube.com";
 }
 
-function ytKey(owner, id) {
-  return `${ytPrefixFor(owner)}${id}`;
+function ytHeaders(extra) {
+  return {
+    "User-Agent": YT_UA,
+    "Accept-Language": YT_ACCEPT_LANGUAGE,
+    ...(extra || {}),
+  };
 }
 
-function ytTextKey(rec) {
-  return `${YT_TEXT_PREFIX}${encodeURIComponent(normalizeEmail(rec.owner))}:${rec.id}`;
-}
-
-// Summaries are cached by VIDEO id, not job id: two users who transcribe the same
-// YouTube video share one summary (exactly like co-owners of a meeting), and we
-// never pay to summarize the same video twice. Falls back to the owner+job key
-// when upstream didn't tell us the video id.
-function ytSummaryKey(rec) {
-  const vid = String(rec.videoId || "").trim();
-  return vid
-    ? `${YT_SUMMARY_PREFIX}${vid}`
-    : `${YT_SUMMARY_PREFIX}job:${encodeURIComponent(normalizeEmail(rec.owner))}:${rec.id}`;
+function safeJsonParse(text) {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
 }
 
 // The 11-character video id out of any YouTube URL shape (watch, youtu.be,
-// shorts, embed, live), or a bare id. Returns null for anything else, so a
-// non-YouTube link is rejected before we spend an upstream call on it.
+// shorts, embed, live) or a bare id. A non-YouTube host is REJECTED: the caller's
+// URL is never fetched as given, only a rebuilt watch URL for the id we parsed.
 function parseYoutubeUrl(input) {
   const raw = String(input || "").trim();
   if (!raw) return null;
-  const ID = /^[A-Za-z0-9_-]{11}$/;
-  if (ID.test(raw)) return { videoId: raw, url: `https://www.youtube.com/watch?v=${raw}` };
+  if (YT_ID_RE.test(raw)) return { videoId: raw, url: `https://www.youtube.com/watch?v=${raw}` };
   let u;
   try {
     u = new URL(/^https?:\/\//i.test(raw) ? raw : `https://${raw}`);
@@ -4634,452 +4703,1643 @@ function parseYoutubeUrl(input) {
       if (parts.length >= 2 && ["shorts", "embed", "live", "v"].includes(parts[0].toLowerCase())) id = parts[1];
     }
   } else {
-    return null;
+    return null; // never fetch a caller-supplied host
   }
   id = String(id || "").trim();
-  if (!ID.test(id)) return null;
+  if (!YT_ID_RE.test(id)) return null;
   return { videoId: id, url: `https://www.youtube.com/watch?v=${id}` };
 }
 
-// Upstream reports progress with its own vocabulary; collapse it to the four
-// states the dashboard renders. Anything unrecognised counts as "processing"
-// (still working) rather than silently reading as done.
-function normalizeVideoStatus(raw) {
-  const s = String(raw || "").trim().toLowerCase();
-  if (!s) return "queued";
-  if (["completed", "complete", "done", "success", "succeeded", "finished", "ready"].includes(s)) return "completed";
-  if (["failed", "failure", "error", "errored", "cancelled", "canceled"].includes(s)) return "failed";
-  if (["queued", "pending", "accepted", "waiting", "created", "new"].includes(s)) return "queued";
-  return "processing";
-}
+// ── Fetching the player response ─────────────────────────────────────────────
 
-// First non-empty string among the candidate keys — upstream field names aren't
-// guaranteed, so every read of its payload goes through these tolerant pickers.
-function pickString(data, keys) {
-  if (!data || typeof data !== "object") return "";
-  for (const k of keys) {
-    const v = data[k];
-    if (typeof v === "string" && v.trim()) return v.trim();
-    if (typeof v === "number" && Number.isFinite(v)) return String(v);
+// Pulls the first complete JSON object following `marker`, matching braces while
+// respecting string literals and escapes. A regex up to the next "};" breaks on
+// any brace inside a caption or title string, which real pages contain.
+function extractJsonAfter(html, marker) {
+  const at = html.indexOf(marker);
+  if (at === -1) return null;
+  const start = html.indexOf("{", at + marker.length);
+  if (start === -1) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < html.length; i++) {
+    const ch = html[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') inString = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) return safeJsonParse(html.slice(start, i + 1));
   }
-  return "";
+  return null;
 }
 
-function pickNumber(data, keys) {
-  if (!data || typeof data !== "object") return 0;
-  for (const k of keys) {
-    const n = Number(data[k]);
-    if (Number.isFinite(n) && n > 0) return Math.round(n);
+function playerResponseFromHtml(html) {
+  return extractJsonAfter(html, "ytInitialPlayerResponse");
+}
+
+function innertubeKeyFromHtml(html) {
+  const m = /"INNERTUBE_API_KEY":"([A-Za-z0-9_-]+)"/.exec(html || "");
+  return m ? m[1] : "";
+}
+
+function playabilityOf(player) {
+  const ps = (player && player.playabilityStatus) || {};
+  let reason = String(ps.reason || "");
+  if (!reason && ps.errorScreen) {
+    const r = ps.errorScreen.playerErrorMessageRenderer || ps.errorScreen.playerLegacyDesktopYpcTrailerRenderer || {};
+    reason = String((r.reason && (r.reason.simpleText || "")) || (r.subreason && r.subreason.simpleText) || "");
+  }
+  return { status: String(ps.status || ""), reason: reason.trim() };
+}
+
+// YouTube's anti-bot challenge, however it shows up: the interstitial HTML, or a
+// playability status carrying the "confirm you're not a bot" reason.
+function looksBotGated(reason, html) {
+  if (/not a bot|sign in to confirm/i.test(reason || "")) return true;
+  return /\/sorry\/index|captcha-form|<title>Sorry\.\.\./i.test(html || "");
+}
+
+// The InnerTube player API — the ONE fallback we allow when the watch page is
+// gated. Hammering YouTube beyond this is how Cloudflare's egress gets blocked
+// too, so there is no retry loop anywhere in this path.
+async function innertubePlayer(env, videoId, apiKey) {
+  const key = apiKey || YT_PUBLIC_INNERTUBE_KEY;
+  const res = await fetch(`${ytOrigin(env)}/youtubei/v1/player?key=${encodeURIComponent(key)}&prettyPrint=false`, {
+    method: "POST",
+    headers: ytHeaders({
+      "Content-Type": "application/json",
+      "X-YouTube-Client-Name": "1",
+      "X-YouTube-Client-Version": "2.20240401.00.00",
+      Origin: "https://www.youtube.com",
+    }),
+    body: JSON.stringify({
+      videoId,
+      context: {
+        client: { clientName: "WEB", clientVersion: "2.20240401.00.00", hl: "en", gl: "US" },
+      },
+      contentCheckOk: true,
+      racyCheckOk: true,
+    }),
+  });
+  if (!res.ok) return null;
+  return safeJsonParse(await res.text().catch(() => ""));
+}
+
+// The player response for a video: the watch page first, then a single InnerTube
+// fallback if that page is bot-gated or unparseable. Returns
+// { ok: true, player } or { ok: false, code, error }.
+async function fetchPlayerResponse(env, videoId) {
+  let html = "";
+  let player = null;
+  try {
+    const res = await fetch(`${ytOrigin(env)}/watch?v=${encodeURIComponent(videoId)}&hl=en&bpctr=9999999999&has_verified=1`, {
+      headers: ytHeaders({
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        // Skips the EU consent interstitial, which otherwise serves a page with
+        // no player response at all.
+        Cookie: "CONSENT=YES+1; SOCS=CAI",
+      }),
+    });
+    html = await res.text().catch(() => "");
+    if (res.ok) player = playerResponseFromHtml(html);
+  } catch {
+    /* network failure — the InnerTube fallback below still gets a turn */
+  }
+
+  const gatedPage = !player || looksBotGated(playabilityOf(player).reason, html);
+  if (gatedPage) {
+    let fallback = null;
+    try {
+      fallback = await innertubePlayer(env, videoId, innertubeKeyFromHtml(html));
+    } catch {
+      fallback = null;
+    }
+    if (fallback) {
+      const { reason } = playabilityOf(fallback);
+      // `degraded` records that the watch page was gated, so what came back is
+      // whatever YouTube is willing to tell a blocked IP — see the caller.
+      if (!looksBotGated(reason, "")) return { ok: true, player: fallback, degraded: true };
+    }
+    if (!player) return { ok: false, code: "BOT_GATED", error: YT_MESSAGES.BOT_GATED };
+    if (looksBotGated(playabilityOf(player).reason, html)) {
+      return { ok: false, code: "BOT_GATED", error: YT_MESSAGES.BOT_GATED };
+    }
+  }
+  if (!player) return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  return { ok: true, player };
+}
+
+// ── Choosing a caption track ─────────────────────────────────────────────────
+
+// Manual beats auto-generated (auto has no real punctuation model). Within a
+// kind: en, then en-US, then en-GB, then the video's own language, then the
+// shortest code — so a plain "hi" wins over machine-translated "hi-Latn".
+function captionTrackRank(track, videoLanguage) {
+  const code = String((track && track.languageCode) || "");
+  if (code === "en") return 0;
+  if (code === "en-US") return 1;
+  if (code === "en-GB") return 2;
+  if (videoLanguage && code === videoLanguage) return 3;
+  return 4;
+}
+
+function pickCaptionTrack(tracks, videoLanguage) {
+  let best = null;
+  let bestKey = null;
+  for (let i = 0; i < tracks.length; i++) {
+    const t = tracks[i];
+    if (!t || !t.baseUrl) continue;
+    const key = [
+      String(t.kind || "") === "asr" ? 1 : 0,
+      captionTrackRank(t, videoLanguage),
+      String(t.languageCode || "").length,
+      i,
+    ];
+    if (!bestKey || compareKeys(key, bestKey) < 0) {
+      best = t;
+      bestKey = key;
+    }
+  }
+  return best;
+}
+
+function compareKeys(a, b) {
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] - b[i];
   }
   return 0;
 }
 
-function safeJsonParse(text) {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
+function videoLanguageOf(player) {
+  const details = (player && player.videoDetails) || {};
+  const micro = (player && player.microformat && player.microformat.playerMicroformatRenderer) || {};
+  return String(details.defaultAudioLanguage || micro.defaultAudioLanguage || "").trim();
 }
 
-// A transcript embedded in the status payload, whatever shape it arrives in:
-// a plain string, or a list of segments with text (+ optional start seconds,
-// which we keep as "[mm:ss] " prefixes so the UI can show timestamps).
-function transcriptTextFromPayload(data) {
-  if (!data || typeof data !== "object") return "";
-  for (const key of ["transcript", "text", "transcript_text", "content", "captions"]) {
-    const v = data[key];
-    if (typeof v === "string" && v.trim()) return v.trim();
-    if (Array.isArray(v)) {
-      const joined = segmentsToText(v);
-      if (joined) return joined;
+// ── json3 parsing ────────────────────────────────────────────────────────────
+// Shape: { events: [ { tStartMs, dDurationMs, segs: [ { utf8 } ] } ] }. Single
+// pass, no per-event intermediate arrays — a 3-hour auto-caption track is
+// thousands of events and this runs inside the Worker's CPU budget.
+function parseJson3(data) {
+  const events = data && Array.isArray(data.events) ? data.events : [];
+  const rows = [];
+  for (let i = 0; i < events.length; i++) {
+    const ev = events[i];
+    if (!ev) continue;
+    const segs = ev.segs;
+    if (!Array.isArray(segs) || !segs.length) continue;
+    // One line is often split across several segs.
+    let text = "";
+    for (let k = 0; k < segs.length; k++) {
+      const seg = segs[k];
+      if (seg && typeof seg.utf8 === "string") text += seg.utf8;
     }
-  }
-  for (const key of ["segments", "chunks", "items", "results"]) {
-    if (Array.isArray(data[key])) {
-      const joined = segmentsToText(data[key]);
-      if (joined) return joined;
-    }
-  }
-  return "";
-}
-
-function segmentsToText(list) {
-  const lines = [];
-  for (const seg of list) {
-    if (typeof seg === "string") {
-      if (seg.trim()) lines.push(seg.trim());
+    // Collapses the newlines auto-captions carry inside a cue, and drops
+    // positioning-only events, which have segs but no printable text.
+    text = text.replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    // aAppend means "append to what is on screen", and auto-generated tracks
+    // interleave one between every real line whose only content is a newline —
+    // those vanish in the trim above, which is what stops the segment count
+    // doubling and a blank line landing between every sentence. But the flag
+    // describes rendering, not content: an append event CAN carry real words.
+    // Appending them to the previous line keeps that text without inventing a
+    // separate cue for it (and without duplicating it as one).
+    //
+    // With nothing on screen yet there is no line to append to — a track can
+    // open with an append, or everything before it can have been positioning
+    // only. Fall through and let it become a cue of its own, which is what it
+    // renders as anyway; dropping it would lose the words outright.
+    if (ev.aAppend && rows.length) {
+      const prev = rows[rows.length - 1];
+      prev.text += ` ${text}`;
+      // The append carries its own timing, and it is later than the line it
+      // joins. Taking only the text would leave the cue ending before half of
+      // its own words are spoken, so every timestamp link and citation into
+      // that stretch points at the wrong moment. Carry the append's end as a
+      // floor on the cue's, which only ever extends it.
+      const apStart = Number(ev.tStartMs);
+      if (Number.isFinite(apStart) && apStart >= 0) {
+        const apDur = Number(ev.dDurationMs);
+        const apEnd = apStart + (Number.isFinite(apDur) && apDur > 0 ? apDur : 0);
+        if (prev.minEndMs == null || apEnd > prev.minEndMs) prev.minEndMs = apEnd;
+      }
       continue;
     }
-    if (!seg || typeof seg !== "object") continue;
-    const text = pickString(seg, ["text", "content", "transcript", "caption"]);
-    if (!text) continue;
-    const startRaw = seg.start ?? seg.start_time ?? seg.startTime ?? seg.offset ?? seg.begin;
-    const start = Number(startRaw);
-    if (Number.isFinite(start) && start >= 0 && startRaw !== undefined && startRaw !== null && startRaw !== "") {
-      const t = Math.floor(start);
-      const mm = String(Math.floor(t / 60)).padStart(2, "0");
-      const ss = String(t % 60).padStart(2, "0");
-      lines.push(`[${mm}:${ss}] ${text}`);
-    } else {
-      lines.push(text);
-    }
+    const startMs = Number(ev.tStartMs);
+    if (!Number.isFinite(startMs) || startMs < 0) continue;
+    const durMs = Number(ev.dDurationMs);
+    rows.push({ startMs, durMs: Number.isFinite(durMs) && durMs > 0 ? durMs : null, minEndMs: null, text });
   }
-  return lines.join("\n").trim();
+  rows.sort((a, b) => a.startMs - b.startMs);
+
+  const segments = new Array(rows.length);
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    // dDurationMs is absent on some events: fall back to the next event's start,
+    // and for the last event to start + 2s. An append merged into this cue then
+    // raises the floor, so the cue covers the words it actually carries.
+    let endMs =
+      row.durMs != null ? row.startMs + row.durMs : i + 1 < rows.length ? rows[i + 1].startMs : row.startMs + 2000;
+    if (row.minEndMs != null && row.minEndMs > endMs) endMs = row.minEndMs;
+    segments[i] = {
+      index: i,
+      start: Math.round(row.startMs) / 1000,
+      end: Math.round(Math.max(endMs, row.startMs)) / 1000,
+      text: row.text,
+    };
+  }
+  return segments;
 }
 
-// Folds an upstream payload onto the stored record. Only fields upstream
-// actually reported are overwritten, so a later poll that omits (say) the title
-// never blanks one we already have.
-function mergeUpstreamVideo(rec, data) {
-  const next = { ...rec };
-  const videoId = pickString(data, ["video_id", "videoId", "youtube_id", "yt_id"]);
-  if (videoId) next.videoId = videoId;
-  const title = pickString(data, ["title", "video_title", "name"]);
-  if (title) next.title = title;
-  const channel = pickString(data, ["channel", "channel_title", "channel_name", "author", "uploader", "owner_channel"]);
-  if (channel) next.channel = channel;
-  const duration = pickNumber(data, ["duration", "duration_seconds", "durationSec", "length", "length_seconds"]);
-  if (duration) next.durationSec = duration;
-  const url = pickString(data, ["url", "video_url", "source_url"]);
-  if (url && !next.url) next.url = url;
-  const status = data && (data.status ?? data.state ?? data.job_status);
-  if (status !== undefined && status !== null && String(status).trim()) next.status = normalizeVideoStatus(status);
-  const error = pickString(data, ["error", "error_message", "detail", "message", "failure_reason"]);
-  if (next.status === "failed") next.error = error || next.error || "The transcription service could not process this video";
-  else if (error && next.status !== "completed") next.error = error;
-  else if (next.status === "completed") next.error = "";
-  next.updatedAt = Date.now();
-  return next;
+// Is this stream live RIGHT NOW? `isLiveContent` alone is not the answer — it
+// stays true for the VOD of a stream that has already ended, which we do want to
+// transcribe. The reliable signals are videoDetails.isLive (when present) and
+// the microformat's liveBroadcastDetails.isLiveNow; a broadcast with no
+// endTimestamp recorded has not finished either.
+function isLiveNow(player) {
+  const details = (player && player.videoDetails) || {};
+  if (details.isLive === true || details.isLiveNow === true) return true;
+  const micro = (player && player.microformat && player.microformat.playerMicroformatRenderer) || {};
+  const live = micro.liveBroadcastDetails || {};
+  if (live.isLiveNow === true) return true;
+  if (details.isLiveContent === true && live.startTimestamp && !live.endTimestamp) return true;
+  return false;
 }
 
-// Only the client-facing fields. `owner` IS included — the dashboard shows it in
-// the admin cross-user list, and for a normal user it's just their own address.
-function publicVideo(rec) {
+// Fetches and parses the best caption track for a video. Returns
+// { ok: true, title, channel, durationSeconds, language, isAutoGenerated, segments }
+// or { ok: false, code, error } with a message fit to show a customer.
+async function ytProviderDirect(env, videoId) {
+  const got = await fetchPlayerResponse(env, videoId);
+  if (!got.ok) return got;
+  const player = got.player;
+  // The watch page was bot-gated and this came from the fallback, so YouTube is
+  // already treating this egress as a bot. Verified against the deployed Worker:
+  // in that state it answers with the video's REAL title but UNPLAYABLE /
+  // "Video unavailable" and zero caption tracks — for videos that are perfectly
+  // available elsewhere. Reporting that as "unavailable" or "no captions" would
+  // blame the video for our own egress being blocked, so both read as gated.
+  const degraded = !!got.degraded;
+  const details = player.videoDetails || {};
+  const { status, reason } = playabilityOf(player);
+
+  if (isLiveNow(player)) {
+    return { ok: false, code: "IS_LIVE", error: YT_MESSAGES.IS_LIVE };
+  }
+  if (status && status !== "OK") {
+    if (degraded) return { ok: false, code: "BOT_GATED", error: YT_MESSAGES.BOT_GATED };
+    // Pass YouTube's own wording through for private / removed / age-gated.
+    return { ok: false, code: "UNAVAILABLE", error: reason || YT_MESSAGES.UNAVAILABLE };
+  }
+
+  const tracklist = player.captions && player.captions.playerCaptionsTracklistRenderer;
+  const tracks = (tracklist && Array.isArray(tracklist.captionTracks) && tracklist.captionTracks) || [];
+  if (!tracks.length) {
+    return degraded
+      ? { ok: false, code: "BOT_GATED", error: YT_MESSAGES.BOT_GATED }
+      : { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+  }
+
+  const track = pickCaptionTrack(tracks, videoLanguageOf(player));
+  if (!track) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+
+  let base = String(track.baseUrl || "");
+  if (base.startsWith("//")) base = `https:${base}`;
+  else if (base.startsWith("/")) base = `${ytOrigin(env)}${base}`;
+  const url = base + (base.includes("?") ? "&" : "?") + "fmt=json3";
+
+  let payload;
+  try {
+    const res = await fetch(url, { headers: ytHeaders({ Accept: "application/json" }) });
+    if (!res.ok) return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+    payload = safeJsonParse(await res.text().catch(() => ""));
+  } catch {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  }
+  // The player response already proved this track exists, so an empty or
+  // unparseable body is a failed fetch (an expired signed URL, or that endpoint
+  // being gated) — NOT a captionless video. Calling it NO_CAPTIONS would store a
+  // permanent "no captions available" and tell the user to stop retrying.
+  if (!payload || !Array.isArray(payload.events)) {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  }
+
+  const segments = parseJson3(payload);
+  if (!segments.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+
   return {
-    id: String(rec.id),
-    owner: rec.owner || "",
-    url: rec.url || "",
-    videoId: rec.videoId || "",
-    title: rec.title || "",
-    channel: rec.channel || "",
-    durationSec: rec.durationSec || 0,
-    status: rec.status || "queued",
-    error: rec.error || "",
-    createdAt: rec.createdAt || 0,
-    updatedAt: rec.updatedAt || 0,
-    hasTranscript: !!rec.hasTranscript,
+    ok: true,
+    title: String(details.title || ""),
+    channel: String(details.author || ""),
+    durationSeconds: Number(details.lengthSeconds) || 0,
+    language: String(track.languageCode || ""),
+    isAutoGenerated: String(track.kind || "") === "asr",
+    segments,
   };
 }
 
-// Every video record under a KV prefix, newest first. A bare YT_PREFIX scans all
-// owners (admin); `yt:<owner>:` scans one account.
-async function readVideos(env, prefix) {
+/* ------------------------- transcript providers ---------------------------- */
+// YouTube blocks the egress of every cloud host we can run on — EC2's and
+// Cloudflare's alike, verified against the deployed Worker. So the outbound leg
+// goes through somebody whose IPs YouTube still answers. Everything else in this
+// file is unchanged by that: a provider's only job is to return the same shape
+// ytProviderDirect does.
+//
+// Order, and why:
+//   1. Supadata, when SUPADATA_API_KEY is set. It returns per-cue offsets and
+//      durations in milliseconds, which is exactly the model here — no timing is
+//      invented or lost.
+//   2. youtube-transcript.ai, which needs no key at all, so the feature works
+//      with nothing configured. It costs accuracy: paragraph-level timestamps
+//      instead of per-cue, and auto-generated captions arrive with YouTube's
+//      rolling-window repetition still in them (see ytCollapseRepeats).
+//   3. Direct — only when an operator asks for it. It is the best source by far
+//      when it works, but we have measured that it does not: YouTube gates this
+//      egress. Leaving it in the chain would spend a doomed request on every
+//      single fetch, and a gated reply reads as "video unavailable", which would
+//      then overwrite a correct answer from a provider that DID reach YouTube.
+//      Set YT_ALLOW_DIRECT once the egress is clean (a proxy, or Cloudflare's
+//      reputation recovering) and it comes back as the last resort.
+//
+// An operator who sets YT_ORIGIN (tests, or a proxy with clean IPs) means "fetch
+// from YouTube yourself" — then that is the only provider used.
+
+function ytProviderOrigin(env, name, fallback) {
+  const raw = String((env && env[name]) || "").trim().replace(/\/+$/, "");
+  return /^https:\/\/[^\s]+$/i.test(raw) || /^http:\/\/127\.0\.0\.1:\d+$/.test(raw) ? raw : fallback;
+}
+
+// Auto-generated captions are a rolling window: YouTube re-sends the line on
+// screen with each new phrase appended, so a naive join repeats every phrase two
+// or three times ("hello giraffe how are you today why the hello giraffe how are
+// you today why the long neck..."). The json3 path never sees this because the
+// cue boundaries are intact there; a provider that hands back joined prose has
+// already lost them, so the repetition has to be undone by looking at it.
+//
+// Only immediate repeats of three or more words are collapsed: shorter windows
+// would eat real speech ("no no no", "very very"), and a repeat that is not
+// adjacent is someone genuinely saying the same thing twice.
+function ytCollapseRepeats(text) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
   const out = [];
-  let cursor;
-  do {
-    const page = await env.KV.list({ prefix, cursor });
-    for (const k of page.keys) {
-      const raw = await env.KV.get(k.name);
-      if (!raw) continue;
-      const rec = safeJsonParse(raw);
-      if (!rec || !rec.id) continue;
-      rec._key = k.name;
-      out.push(rec);
-    }
-    cursor = page.list_complete ? undefined : page.cursor;
-  } while (cursor);
-  out.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-  return out;
-}
-
-async function saveVideo(env, rec) {
-  const copy = { ...rec };
-  delete copy._key;
-  await env.KV.put(ytKey(copy.owner, copy.id), JSON.stringify(copy));
-}
-
-async function loadVideo(env, owner, id) {
-  const raw = await env.KV.get(ytKey(owner, id));
-  if (!raw) return null;
-  const rec = safeJsonParse(raw);
-  if (!rec || !rec.id) return null;
-  rec._key = ytKey(owner, id);
-  return rec;
-}
-
-// Resolves the record a request is about, enforcing ownership: a normal user is
-// pinned to their own session email; admin may name any owner (and, without one,
-// gets a scan so a link into another user's video still resolves).
-async function resolveVideoForSession(env, session, id, ownerParam) {
-  const jobId = String(id || "").trim();
-  if (!jobId) return null;
-  if (!session.isAdmin) return loadVideo(env, session.identity, jobId);
-  const owner = normalizeEmail(ownerParam || "");
-  if (owner) return loadVideo(env, owner, jobId);
-  const all = await readVideos(env, YT_PREFIX);
-  return all.find((r) => String(r.id) === jobId) || null;
-}
-
-async function ytUpstream(env, path, { method = "GET", body } = {}) {
-  const base = await resolveApiBase(env);
-  const headers = { "X-API-Key": env.API_KEY };
-  if (body) headers["Content-Type"] = "application/json";
-  return fetch(base + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
-}
-
-// Pulls the finished transcript ("/public/youtube/<id>.txt") and caches it in KV,
-// so the transcript view, the summary, and chat all read it without another
-// upstream round trip. Returns "" when it isn't available (yet).
-async function fetchVideoTranscript(env, rec) {
-  if (!env.API_KEY) return "";
-  let upstream;
-  try {
-    upstream = await ytUpstream(
-      env,
-      `/public/youtube/${encodeURIComponent(rec.id)}.txt?email=${encodeURIComponent(normalizeEmail(rec.owner))}`,
-    );
-  } catch {
-    return "";
-  }
-  if (!upstream.ok) return "";
-  const body = (await upstream.text().catch(() => "")).trim();
-  if (!body) return "";
-  // The .txt route is plain text, but tolerate a JSON body (some deployments
-  // wrap it) rather than storing "{...}" as if it were the transcript.
-  if (body.startsWith("{") || body.startsWith("[")) {
-    const data = safeJsonParse(body);
-    if (data) return transcriptTextFromPayload(Array.isArray(data) ? { segments: data } : data);
-  }
-  return body;
-}
-
-// The transcript for a record: the KV cache when we already have it, otherwise a
-// fetch (cached on the way out). Never throws.
-async function videoTranscriptText(env, rec) {
-  const key = ytTextKey(rec);
-  try {
-    const cached = await env.KV.get(key);
-    if (cached) return cached;
-  } catch {
-    /* KV hiccup — fall through and fetch */
-  }
-  if (rec.status !== "completed") return "";
-  const text = await fetchVideoTranscript(env, rec);
-  if (text) {
-    try {
-      await env.KV.put(key, text);
-      if (!rec.hasTranscript) await saveVideo(env, { ...rec, hasTranscript: true, transcriptChars: text.length });
-    } catch {
-      /* best-effort cache */
-    }
-  }
-  return text;
-}
-
-// Polls upstream for one in-flight job and persists whatever changed. Caches the
-// transcript as soon as the job completes, so opening the video is instant.
-// Returns the (possibly unchanged) record; never throws.
-async function refreshVideo(env, rec) {
-  if (!env.API_KEY || YT_TERMINAL.has(rec.status)) return rec;
-  let upstream;
-  try {
-    upstream = await ytUpstream(
-      env,
-      `/public/youtube/${encodeURIComponent(rec.id)}?email=${encodeURIComponent(normalizeEmail(rec.owner))}`,
-    );
-  } catch {
-    return rec; // transient network failure — keep the last known state
-  }
-  const text = await upstream.text().catch(() => "");
-  const data = safeJsonParse(text);
-  if (!upstream.ok) {
-    if (upstream.status === 404) {
-      // The job is gone upstream: stop showing it as forever-queued.
-      const next = { ...rec, status: "failed", error: "The transcription service no longer has this video", updatedAt: Date.now() };
-      await saveVideo(env, next).catch(() => {});
-      return next;
-    }
-    return rec;
-  }
-  const next = mergeUpstreamVideo(rec, data || {});
-  if (next.status === "completed" && !next.hasTranscript) {
-    const transcript = transcriptTextFromPayload(data || {}) || (await fetchVideoTranscript(env, next));
-    if (transcript) {
-      try {
-        await env.KV.put(ytTextKey(next), transcript);
-        next.hasTranscript = true;
-        next.transcriptChars = transcript.length;
-      } catch {
-        /* best-effort cache — the transcript is re-fetchable */
+  let i = 0;
+  while (i < words.length) {
+    let collapsed = false;
+    // Longest window first: matching "a b c" inside "a b c d a b c d" would
+    // leave the "d" stranded, so try the biggest repeat that fits.
+    const max = Math.min(14, out.length, words.length - i);
+    for (let k = max; k >= 3; k--) {
+      let same = true;
+      for (let j = 0; j < k; j++) {
+        if (out[out.length - k + j] !== words[i + j]) {
+          same = false;
+          break;
+        }
+      }
+      if (same) {
+        i += k;
+        collapsed = true;
+        break;
       }
     }
+    if (!collapsed) out.push(words[i++]);
   }
-  const changed = JSON.stringify(publicVideo(rec)) !== JSON.stringify(publicVideo(next));
-  if (changed) await saveVideo(env, next).catch(() => {});
-  next._key = rec._key;
-  return next;
+  return out.join(" ");
 }
 
-// Which in-flight records this list call should poll upstream. Refreshing every
-// one of them would be unbounded (a list call would fan out to one subrequest
-// per pending video), so it's capped — but a fixed "newest N" slice would starve
-// everything past the cap: with more pending jobs than the cap, the same newest
-// N are chosen every time (readVideos sorts newest-first), and an older job that
-// finished upstream could read as queued indefinitely behind a slow one. So the
-// window ROTATES: a per-scope cursor in KV advances by the batch size each call,
-// giving every pending record its turn within a few polls. The cursor is only
-// read/written when there are actually more pending records than the cap, so the
-// common case (a handful of videos) costs nothing extra and refreshes all of them.
-function ytCursorKey(scope) {
-  return `ytcursor:v1:${encodeURIComponent(scope)}`;
+// "[1:07]" / "[1:02:07]" -> seconds.
+function ytStampSeconds(stamp) {
+  const parts = String(stamp).split(":").map((p) => Number(p));
+  if (parts.some((p) => !Number.isFinite(p) || p < 0)) return null;
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return null;
 }
 
-async function pendingRefreshBatch(env, scope, pending) {
-  if (pending.length <= YT_REFRESH_BATCH) return pending;
-  let start = 0;
+// Supadata: { lang, content: [ { text, offset, duration, lang } ] }, all ms.
+async function ytProviderSupadata(env, videoId) {
+  const key = String((env && env.SUPADATA_API_KEY) || "").trim();
+  if (!key) return null; // not configured — not a failure, just not available
+  const origin = ytProviderOrigin(env, "SUPADATA_ORIGIN", "https://api.supadata.ai");
+  const url = `${origin}/v1/transcript?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`;
+  let res;
   try {
-    start = Number(await env.KV.get(ytCursorKey(scope))) || 0;
-  } catch {
-    /* KV hiccup — start from the top rather than skipping the refresh */
+    res = await fetch(url, { headers: { "x-api-key": key, Accept: "application/json" } });
+  } catch (err) {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail: `supadata threw: ${String((err && err.message) || err)}` };
   }
-  if (!Number.isFinite(start) || start < 0) start = 0;
-  start %= pending.length;
-  // Wrap around the end so the window is always full, even at the tail.
-  const batch = [];
-  for (let i = 0; i < YT_REFRESH_BATCH; i++) batch.push(pending[(start + i) % pending.length]);
+  const raw = await res.text().catch(() => "");
+  const body = safeJsonParse(raw) || {};
+  const detail = `supadata ${res.status} ${JSON.stringify(String(raw).slice(0, 120))}`;
+  if (!res.ok) {
+    // Their own wording for a video that genuinely has nothing to transcribe,
+    // so it is not retried forever as though it were a transport failure.
+    const reason = String(body.message || body.error || "");
+    if (res.status === 404 || /no transcript|not found|unavailable/i.test(reason)) {
+      return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
+    }
+    if (res.status === 401 || res.status === 402 || res.status === 429 || /quota|limit|credit/i.test(reason)) {
+      return { ok: false, code: "PROVIDER_LIMIT", error: YT_MESSAGES.PROVIDER_LIMIT, detail };
+    }
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
+  }
+  const content = Array.isArray(body.content) ? body.content : null;
+  if (!content) return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
+
+  const segments = [];
+  for (const cue of content) {
+    const text = String((cue && cue.text) || "").replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    const startMs = Number(cue.offset);
+    if (!Number.isFinite(startMs) || startMs < 0) continue;
+    const durMs = Number(cue.duration);
+    segments.push({
+      index: segments.length,
+      start: Math.round(startMs) / 1000,
+      end: Math.round(startMs + (Number.isFinite(durMs) && durMs > 0 ? durMs : 2000)) / 1000,
+      text,
+    });
+  }
+  if (!segments.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
+  segments.sort((a, b) => a.start - b.start);
+  segments.forEach((s, i) => {
+    s.index = i;
+  });
+  return {
+    ok: true,
+    // This endpoint returns the transcript only; the row keeps whatever title,
+    // channel and duration it already had rather than being blanked.
+    title: "",
+    channel: "",
+    durationSeconds: 0,
+    language: String(body.lang || ""),
+    isAutoGenerated: false,
+    segments,
+  };
+}
+
+// youtube-transcript.ai: markdown, keyless. A metadata header, then paragraphs
+// prefixed with [m:ss].
+async function ytProviderKeyless(env, videoId) {
+  const origin = ytProviderOrigin(env, "YT_TEXT_ORIGIN", "https://youtube-transcript.ai");
+  let res;
+  let body;
   try {
-    await env.KV.put(ytCursorKey(scope), String((start + YT_REFRESH_BATCH) % pending.length));
-  } catch {
-    /* best-effort — a lost cursor write just repeats this window once */
+    res = await fetch(`${origin}/transcript/${encodeURIComponent(videoId)}.txt`, {
+      // A bare datacenter request with no browser identity is what bot
+      // protection in front of a service like this exists to challenge, and a
+      // challenge comes back as HTTP 200 carrying HTML.
+      headers: { Accept: "text/markdown, text/plain;q=0.9, */*;q=0.8", "User-Agent": YT_UA },
+    });
+    body = await res.text().catch(() => "");
+  } catch (err) {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail: `keyless threw: ${String((err && err.message) || err)}` };
   }
-  return batch;
+  // What came back, in a form that can be read from the API response. No
+  // secrets pass through here — it is our own upstream's status line and the
+  // opening of its body — and without it a production failure is a guess.
+  const detail =
+    `keyless ${res.status} ${String(res.headers.get("content-type") || "")} ` +
+    `${body.length}b ${JSON.stringify(String(body).slice(0, 120))}`;
+  if (!res.ok) {
+    // It answers 404 with "Reason: {"error":"YouTube: ..."}" for both a missing
+    // video and one with captions turned off. Only the second is permanent.
+    const reason = /Reason:\s*(.*)/.exec(body || "");
+    const reasonText = reason ? reason[1] : "";
+    if (/no transcript|captions? (are )?disabled|no captions/i.test(reasonText)) {
+      return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
+    }
+    if (/unavailable|private|removed|does not exist/i.test(reasonText)) {
+      return { ok: false, code: "UNAVAILABLE", error: YT_MESSAGES.UNAVAILABLE, detail };
+    }
+    if (res.status === 429 || /high volume|rate.?limit/i.test(body)) {
+      return { ok: false, code: "PROVIDER_LIMIT", error: YT_MESSAGES.PROVIDER_LIMIT, detail };
+    }
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
+  }
+
+  const title = (/^#\s*Transcript:\s*(.+)$/m.exec(body) || [, ""])[1].trim();
+  const langLine = /^Language:\s*(.+)$/m.exec(body);
+  let language = "";
+  let durationSeconds = 0;
+  let isAutoGenerated = false;
+  if (langLine) {
+    const line = langLine[1];
+    language = (/^([A-Za-z-]+)/.exec(line) || [, ""])[1];
+    isAutoGenerated = /auto-generated/i.test(line);
+    const dur = /Duration:\s*([\d:]+)/.exec(line);
+    if (dur) durationSeconds = ytStampSeconds(dur[1]) || 0;
+  }
+
+  // Anything can answer 200. A challenge page, an interstitial or a rewritten
+  // error all arrive that way, and none of them say anything about the video —
+  // so the reply has to be recognisable as this service's own document before a
+  // shortage of cues in it is allowed to mean "this video has no captions".
+  // Getting that wrong stores a permanent verdict over a transport failure and
+  // tells the user to stop trying.
+  // Their rate limit is an HTTP 200 carrying a sales pitch, so it has to be
+  // recognised by what it says. Reporting it as a transport blip would tell the
+  // user to retry forever against a bucket they can never get back.
+  if (/calling this API at high volume|higher rate limits?|rate.?limit/i.test(body)) {
+    return { ok: false, code: "PROVIDER_LIMIT", error: YT_MESSAGES.PROVIDER_LIMIT, detail };
+  }
+  const start = body.indexOf("## Transcript");
+  if (start === -1 || !/^#\s*Transcript/m.test(body)) {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
+  }
+  const transcript = body.slice(start + "## Transcript".length);
+  const raw = [];
+  const re = /\[(\d+(?::\d+){1,2})\]\s*([^[]*)/g;
+  let m;
+  while ((m = re.exec(transcript)) !== null) {
+    const at = ytStampSeconds(m[1]);
+    if (at == null) continue;
+    let text = m[2].replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    if (isAutoGenerated) text = ytCollapseRepeats(text);
+    if (!text) continue;
+    raw.push({ start: at, text });
+  }
+  if (!raw.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
+
+  raw.sort((a, b) => a.start - b.start);
+  const segments = raw.map((row, i) => ({
+    index: i,
+    start: row.start,
+    // Paragraph-level stamps: a block runs until the next one begins. The last
+    // one runs to the video's end when we know it, and otherwise gets the same
+    // 2s tail the json3 path gives a final cue.
+    end: i + 1 < raw.length ? raw[i + 1].start : Math.max(durationSeconds || 0, row.start + 2),
+    text: row.text,
+  }));
+  return { ok: true, title, channel: "", durationSeconds, language, isAutoGenerated, segments };
+}
+
+// A definite answer about the VIDEO beats a transport failure: if one provider
+// says the video is private and another simply couldn't be reached, the user
+// should be told it is private rather than to keep retrying.
+const YT_ERROR_RANK = {
+  NO_CAPTIONS: 3,
+  IS_LIVE: 4,
+  UNAVAILABLE: 4,
+  BAD_VIDEO_ID: 4,
+  BOT_GATED: 1,
+  UPSTREAM_ERROR: 1,
+  // Above the transport failures, below anything about the video: it says
+  // something true and actionable about us, but a provider that actually
+  // reached YouTube still knows better about the video itself.
+  PROVIDER_LIMIT: 2,
+};
+
+async function fetchYoutubeTranscript(env, videoId) {
+  const allowDirect = /^(1|true|yes)$/i.test(String((env && env.YT_ALLOW_DIRECT) || "").trim());
+  const chain = String((env && env.YT_ORIGIN) || "").trim()
+    ? [ytProviderDirect]
+    : allowDirect
+      ? [ytProviderSupadata, ytProviderKeyless, ytProviderDirect]
+      : [ytProviderSupadata, ytProviderKeyless];
+
+  let best = null;
+  const tried = [];
+  for (const provider of chain) {
+    let out;
+    try {
+      out = await provider(env, videoId);
+    } catch {
+      out = { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+    }
+    if (!out) continue; // provider not configured
+    if (out.ok) return out;
+    // A live stream is the one answer worth stopping on: no provider can
+    // transcribe it, and asking the next one just spends another request.
+    if (out.code === "IS_LIVE") return out;
+    // (falls through to record what this provider said)
+    tried.push(out.detail || out.code);
+    if (!best || (YT_ERROR_RANK[out.code] || 0) > (YT_ERROR_RANK[best.code] || 0)) best = out;
+  }
+  // Every provider's answer, not just the winning error: with the chain, "could
+  // not reach YouTube" alone doesn't say WHICH hop failed or how, and that is
+  // the difference between a retry and a configuration change.
+  const detail = tried.join(" | ");
+  if (best) return { ...best, detail };
+  return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
+}
+
+/* ---------------------- transcripts: D1 storage layer ---------------------- */
+// The two tables are deployed and AWS writes them too, so this code NEVER
+// creates or alters them. The one addition is a unique index, which is additive
+// and idempotent, and backs the "one transcript per (owner, video)" rule.
+
+const YT_COLUMNS =
+  "transcript_id, user_id, owner_email, video_id, url, title, channel, duration_seconds, " +
+  "status, source, language, segment_count, error, created_at, updated_at, completed_at";
+
+let ytIndexReady = false;
+async function ensureYoutubeIndex(env) {
+  if (ytIndexReady || !env.DB) return;
+  try {
+    await env.DB.prepare(
+      "CREATE UNIQUE INDEX IF NOT EXISTS uq_yt_owner_video ON youtube_transcripts (owner_email, video_id)"
+    ).run();
+    ytIndexReady = true;
+  } catch {
+    // Creation fails if the table already holds a duplicate (owner, video) pair.
+    // Marking it ready anyway would quietly leave idempotency resting on the
+    // lookup alone, which two concurrent inserts can slip past — so the flag
+    // stays clear and the next request tries again. The lookup still runs
+    // meanwhile, so behaviour degrades rather than breaking.
+  }
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+async function ytRowByOwnerVideo(env, owner, videoId) {
+  // Ordered, not just LIMIT 1: if the unique index couldn't be created because
+  // the table already held duplicates for this pair, an unordered pick would
+  // resolve to a different row from one request to the next. Preferring a
+  // completed row, then the newest, at least makes the choice deterministic and
+  // useful while the duplicates remain.
+  const res = await env.DB.prepare(
+    `SELECT ${YT_COLUMNS} FROM youtube_transcripts WHERE owner_email = ?1 AND video_id = ?2 ` +
+      "ORDER BY (status = 'completed') DESC, transcript_id DESC LIMIT 1"
+  )
+    .bind(normalizeEmail(owner), videoId)
+    .all();
+  return (res.results && res.results[0]) || null;
+}
+
+async function ytRowById(env, id) {
+  const res = await env.DB.prepare(`SELECT ${YT_COLUMNS} FROM youtube_transcripts WHERE transcript_id = ?1 LIMIT 1`)
+    .bind(id)
+    .all();
+  return (res.results && res.results[0]) || null;
+}
+
+// Every transcript an account owns, newest first. `owner` null lists them all
+// (admin's cross-account view).
+async function ytRowsForOwner(env, owner) {
+  const sql = `SELECT ${YT_COLUMNS} FROM youtube_transcripts` + (owner ? " WHERE owner_email = ?1" : "") + " ORDER BY created_at DESC, transcript_id DESC";
+  const stmt = owner ? env.DB.prepare(sql).bind(normalizeEmail(owner)) : env.DB.prepare(sql);
+  const res = await stmt.all();
+  return res.results || [];
+}
+
+// Counting and then inserting is not atomic: a burst of concurrent submissions
+// from one account can all read a count below the cap and all insert. The cap
+// therefore lives INSIDE the insert — the row only materializes if the account
+// is still under it at the moment the statement runs.
+function ytInsertUnderCap(env, row) {
+  return env.DB.prepare(
+    "INSERT INTO youtube_transcripts " +
+      "(transcript_id, user_id, owner_email, video_id, url, title, channel, duration_seconds, " +
+      "status, source, language, segment_count, error, created_at, updated_at, completed_at) " +
+      "SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16 " +
+      "WHERE (SELECT COUNT(*) FROM youtube_transcripts WHERE owner_email = ?3) < ?17"
+  ).bind(
+    row.transcript_id,
+    0, // user_id is AWS's Postgres id, which this Worker doesn't know
+    row.owner_email,
+    row.video_id,
+    row.url,
+    row.title || null,
+    row.channel || null,
+    row.duration_seconds || null,
+    row.status,
+    row.source || null,
+    row.language || null,
+    row.segment_count || 0,
+    row.error || null,
+    row.created_at,
+    row.updated_at,
+    row.completed_at || null,
+    MAX_VIDEOS_PER_USER
+  );
+}
+
+async function ytSegmentRows(env, id) {
+  const res = await env.DB.prepare(
+    "SELECT segment_index, start_time, end_time, text, speaker, language FROM youtube_transcript_segments " +
+      "WHERE transcript_id = ?1 ORDER BY segment_index"
+  )
+    .bind(id)
+    .all();
+  return res.results || [];
+}
+
+// Allocates a transcript_id in the Worker's own range: the clock for ordering,
+// a random offset (see YT_ID_JITTER) so concurrent inserts don't all start from
+// the same candidate, and a bounded forward probe for the clash that survives
+// both. Ordering stays by created_at, which transcript_id only ever tie-breaks,
+// so the jitter costs nothing there.
+async function ytInsertRow(env, row) {
+  let candidate = YT_ID_FLOOR + Date.now() + Math.floor(Math.random() * YT_ID_JITTER);
+  for (let attempt = 0; attempt < YT_ID_ATTEMPTS; attempt++) {
+    try {
+      const res = await ytInsertUnderCap(env, { ...row, transcript_id: candidate }).run();
+      // No row written and no error: the capped INSERT ... SELECT matched
+      // nothing, i.e. the account is at its limit.
+      const changes = (res && res.meta && res.meta.changes) || 0;
+      if (!changes) return { id: 0, atCap: true };
+      return { id: candidate, existed: false };
+    } catch (err) {
+      const message = String((err && err.message) || err);
+      // A clash on (owner_email, video_id) means someone else just created the
+      // same transcript — hand back whatever now exists instead of duplicating.
+      if (/uq_yt_owner_video|owner_email/i.test(message)) {
+        const existing = await ytRowByOwnerVideo(env, row.owner_email, row.video_id);
+        // The caller must NOT go on to fetch and write segments for a row it
+        // didn't create — both requests would replace each other's segments.
+        if (existing) return { id: existing.transcript_id, existed: true };
+      }
+      if (!/UNIQUE|PRIMARY KEY|constraint/i.test(message)) throw err;
+      candidate++;
+    }
+  }
+  throw new Error("Could not allocate a transcript id");
+}
+
+// Claims a failed or stale row for THIS request before any fetching happens.
+// Two concurrent retries of the same row would otherwise both run the pipeline,
+// and a later failure could overwrite the row the other one just populated. The
+// claim is a conditional update: exactly one request can move the row out of the
+// state it was in, and the loser backs off and returns the active writer's row.
+// `allowCompleted` is for a forced refresh, which is the one case that starts
+// from a row that already works. Without it two concurrent force requests both
+// walk past the claim — the cooldown that is supposed to stop them lives in KV
+// and is eventually consistent — and then both fetch and both write the same
+// segment indexes, interleaving two transcripts and letting one request's
+// failure handling overwrite the other's success.
+async function ytClaimForRetry(env, id, staleBefore, allowCompleted = false) {
+  const res = await env.DB.prepare(
+    "UPDATE youtube_transcripts SET status = 'processing', error = NULL, updated_at = ?2 " +
+      "WHERE transcript_id = ?1 AND (status = 'failed' OR status = 'queued' OR " +
+      (allowCompleted ? "status = 'completed' OR " : "") +
+      "((status = 'processing') AND (updated_at IS NULL OR updated_at < ?3)))"
+  )
+    .bind(id, nowIso(), staleBefore)
+    .run();
+  return ((res && res.meta && res.meta.changes) || 0) > 0;
+}
+
+async function ytUpdateRow(env, id, fields) {
+  const keys = Object.keys(fields);
+  if (!keys.length) return;
+  const sets = keys.map((k, i) => `${k} = ?${i + 2}`).join(", ");
+  await env.DB.prepare(`UPDATE youtube_transcripts SET ${sets} WHERE transcript_id = ?1`)
+    .bind(id, ...keys.map((k) => fields[k]))
+    .run();
+}
+
+// Replaces a transcript's segments.
+//
+// Deleting everything and re-inserting would leave a window where the row is
+// still `completed` but has no segments — a concurrent reader (or a forced
+// refresh that fails partway) would see an empty or half-written transcript. So
+// nothing is deleted up front: each index is UPSERTed in place, and only the
+// tail left over from a longer previous transcript is removed at the end. A
+// reader during the write sees old-or-new text at every index, never a gap.
+//
+// When the whole replacement fits in one D1 batch it is sent as one, which is
+// atomic — no window at all. Longer transcripts (a 3-hour auto-caption track is
+// thousands of cues) are chunked, which is why the upsert ordering above
+// matters.
+// D1 caps bound parameters per query at 100, so each statement carries as many
+// whole rows as fit: 8 columns => 12 rows, 96 parameters. That matters because
+// every statement counts against D1's per-invocation query limit even inside a
+// batch — one statement per cue exhausted it partway through a multi-hour track
+// (thousands of cues), leaving the row stuck in `processing` and every retry
+// failing the same way. At 12 rows a statement, a 3-hour transcript is a few
+// hundred queries instead of a few thousand.
+const YT_ROWS_PER_STATEMENT = 12;
+const YT_ATOMIC_MAX = 40; // statements still sent as a single atomic batch
+
+function ytSegmentInsert(env, id, email, language, chunk) {
+  const values = [];
+  const binds = [];
+  for (let i = 0; i < chunk.length; i++) {
+    const base = i * 8;
+    values.push(`(?${base + 1}, ?${base + 2}, ?${base + 3}, ?${base + 4}, ?${base + 5}, ?${base + 6}, ?${base + 7}, ?${base + 8})`);
+    // speaker is NULL on the captions path — YouTube gives no diarization.
+    binds.push(id, chunk[i].index, chunk[i].start, chunk[i].end, chunk[i].text, null, language || null, email);
+  }
+  return env.DB.prepare(
+    "INSERT OR REPLACE INTO youtube_transcript_segments " +
+      "(transcript_id, segment_index, start_time, end_time, text, speaker, language, owner_email) VALUES " +
+      values.join(", ")
+  ).bind(...binds);
+}
+
+// Does a replacement of this many cues go in as ONE atomic batch? Beyond this
+// it commits in pieces, and the row holds a mix of new and old cues until the
+// last one lands. Callers that had a working transcript need to know which of
+// the two they are about to do — see the staging in createYoutubeTranscript.
+function ytReplaceIsAtomic(count) {
+  return Math.ceil(count / YT_ROWS_PER_STATEMENT) + 1 <= YT_ATOMIC_MAX;
+}
+
+async function ytReplaceSegments(env, id, owner, language, segments) {
+  const email = normalizeEmail(owner);
+  const statements = [];
+  for (let i = 0; i < segments.length; i += YT_ROWS_PER_STATEMENT) {
+    statements.push(ytSegmentInsert(env, id, email, language, segments.slice(i, i + YT_ROWS_PER_STATEMENT)));
+  }
+  const trim = env.DB.prepare(
+    "DELETE FROM youtube_transcript_segments WHERE transcript_id = ?1 AND segment_index >= ?2"
+  ).bind(id, segments.length);
+
+  if (ytReplaceIsAtomic(segments.length)) {
+    await env.DB.batch([...statements, trim]);
+    return;
+  }
+  for (let i = 0; i < statements.length; i += YT_SEGMENT_CHUNK) {
+    await env.DB.batch(statements.slice(i, i + YT_SEGMENT_CHUNK));
+  }
+  await trim.run();
+}
+
+async function ytDeleteTranscript(env, id) {
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM youtube_transcript_segments WHERE transcript_id = ?1").bind(id),
+    env.DB.prepare("DELETE FROM youtube_transcripts WHERE transcript_id = ?1").bind(id),
+  ]);
+}
+
+// Before transcripts lived in D1, this Worker kept them in KV: a record per
+// video under `yt:<owner>:<jobId>` and the transcript text under
+// `yttext:v1:<owner>:<jobId>`. That code is gone, but keys written while it was
+// deployed are not — and the job ids it used have no relation to a D1
+// transcript_id, so they can only be found by looking. Deleting a transcript
+// has to remove them too, or the UI reports the transcript deleted while a
+// complete copy of it stays in KV.
+//
+// Best-effort and bounded to the one account's prefix; only runs on delete.
+async function ytDeleteLegacyKvCopies(env, owner, videoId) {
+  if (!env.KV) return;
+  const prefix = `yt:${encodeURIComponent(normalizeEmail(owner))}:`;
+  try {
+    let cursor;
+    do {
+      const page = await env.KV.list({ prefix, cursor });
+      for (const key of page.keys) {
+        const raw = await env.KV.get(key.name);
+        if (!raw) continue;
+        let rec;
+        try {
+          rec = JSON.parse(raw);
+        } catch {
+          continue;
+        }
+        if (!rec || rec.videoId !== videoId) continue;
+        await env.KV.delete(key.name);
+        await env.KV.delete(`yttext:v1:${encodeURIComponent(normalizeEmail(owner))}:${rec.id}`);
+      }
+      cursor = page.list_complete ? undefined : page.cursor;
+    } while (cursor);
+  } catch {
+    /* the D1 delete is the one that matters; this is cleanup of retired state */
+  }
+}
+
+// ── The transcript response shape ────────────────────────────────────────────
+// Deliberately identical to what the EC2 API returned, so callers written
+// against that contract keep working.
+
+function ytSegmentPayload(rows) {
+  return rows.map((r) => ({
+    index: Number(r.segment_index),
+    start: Number(r.start_time) || 0,
+    end: Number(r.end_time) || 0,
+    text: String(r.text || ""),
+    speaker: r.speaker || null,
+    language: r.language || null,
+  }));
+}
+
+function ytTranscriptText(segments) {
+  return segments.map((s) => s.text).join("\n");
+}
+
+function transcriptPayload(row, segmentRows) {
+  const segments = segmentRows ? ytSegmentPayload(segmentRows) : [];
+  const done = row.status === "completed";
+  return {
+    id: row.transcript_id,
+    video_id: row.video_id,
+    url: row.url,
+    title: row.title || null,
+    channel: row.channel || null,
+    duration_seconds: row.duration_seconds != null ? Number(row.duration_seconds) : null,
+    status: row.status,
+    source: row.source || null,
+    language: row.language || null,
+    segment_count: Number(row.segment_count) || 0,
+    error: row.error || null,
+    created_at: row.created_at || null,
+    completed_at: row.completed_at || null,
+    text: done && segments.length ? ytTranscriptText(segments) : null,
+    segments,
+  };
+}
+
+/* ------------------- transcripts: create / fetch / store ------------------- */
+
+// Creates (or returns) the transcript for one video under one account, doing the
+// YouTube fetch + parse + store inline.
+//
+// Every limit below applies to every caller. There is no admin exemption: both
+// create routes refuse admin accounts outright (a transcript belongs to the user
+// who added it, and an admin has no account of their own to own one), so an
+// exemption here could never fire and only read as though it did. Repairing a
+// user's transcript as an admin would need its own owner-scoped route. Captions are a metadata fetch plus one
+// text download, so this stays well inside the request budget.
+//
+// Idempotent per (owner, video): re-posting a URL already transcribed for that
+// account returns the existing row untouched. A previously FAILED row retries,
+// and force=true re-fetches regardless.
+// One forced refetch per account per window. KV is eventually consistent, which
+// is fine here: the point is to stop a loop, not to be exact to the second.
+const YT_FORCE_COOLDOWN_MS = 5 * 60 * 1000;
+// The same window for retrying a row that already failed. With the 300-row cap,
+// this bounds one account to roughly one YouTube request a second even if it
+// tries to loop over every row it owns.
+const YT_RETRY_COOLDOWN_MS = 5 * 60 * 1000;
+// The diagnostic probe's window (see ytProbeCooldown). Seconds, not minutes:
+// it is run by hand to answer one question, and the point is only to stop it
+// being looped.
+const YT_PROBE_COOLDOWN_MS = 20 * 1000;
+
+async function ytForceCooldown(env, email) {
+  if (!env.KV) return { ok: true };
+  const key = `ytforce:${encodeURIComponent(email)}`;
+  try {
+    const last = Number(await env.KV.get(key)) || 0;
+    const waited = Date.now() - last;
+    if (last && waited < YT_FORCE_COOLDOWN_MS) {
+      const mins = Math.max(1, Math.ceil((YT_FORCE_COOLDOWN_MS - waited) / 60000));
+      return { ok: false, error: `Too many refreshes — try again in about ${mins} minute${mins === 1 ? "" : "s"}.` };
+    }
+    await env.KV.put(key, String(Date.now()), { expirationTtl: Math.ceil(YT_FORCE_COOLDOWN_MS / 1000) * 2 });
+  } catch {
+    /* KV hiccup — don't block a legitimate refresh on the rate limiter */
+  }
+  return { ok: true };
+}
+
+// The diagnostic probe's own limiter. It is admin-only and writes nothing, but
+// each call still spends three requests on the shared egress outside every
+// per-account allowance — so without this an admin holding the page open on a
+// refresh, or a script looping it, is indistinguishable from the abuse the rest
+// of these limits exist to prevent. Short: it is a thing you run by hand and
+// read, not a monitor to poll.
+async function ytProbeCooldown(env, email) {
+  if (!env.KV) return { ok: true };
+  const key = `ytprobe:${encodeURIComponent(normalizeEmail(email))}`;
+  try {
+    const last = Number(await env.KV.get(key)) || 0;
+    const waited = Date.now() - last;
+    if (last && waited < YT_PROBE_COOLDOWN_MS) {
+      const secs = Math.max(1, Math.ceil((YT_PROBE_COOLDOWN_MS - waited) / 1000));
+      return { ok: false, error: `Probed too recently — try again in about ${secs} second${secs === 1 ? "" : "s"}.` };
+    }
+    await env.KV.put(key, String(Date.now()), { expirationTtl: 60 });
+  } catch {
+    /* KV hiccup — a diagnostic that can't reach its limiter still runs */
+  }
+  return { ok: true };
+}
+
+// A per-account ceiling on how many videos it can actually make us FETCH in an
+// hour, independent of what it currently owns. The row cap alone doesn't bound
+// this: deleting a transcript frees its slot AND removes the only record of
+// prior work, so add-delete-add (or rotating video ids) would refetch forever
+// and bot-gate the shared egress. Generous for real use — nobody transcribes 30
+// videos an hour by hand — and it is the backstop the row-keyed limits can't be.
+//
+// The reservation is a single D1 statement, not a KV read-modify-write: KV is
+// eventually consistent and the read/write pair is not atomic, so a burst of
+// concurrent submissions could all observe the same count, all pass, and all hit
+// YouTube — defeating the one safeguard that exists to keep the shared egress
+// off YouTube's bad list. SQLite's upsert does the whole thing in one go: the
+// row is inserted or incremented, and the WHERE on the update means a request
+// over the limit changes nothing and is refused.
+const YT_FETCH_QUOTA = 30;
+const YT_FETCH_WINDOW_MS = 60 * 60 * 1000;
+
+// This table is OURS and additive — it is not one of the two transcript tables
+// AWS shares, and nothing else reads it. Created on demand so no migration step
+// is needed.
+//
+// It is a token bucket, not an hourly counter. Fixed epoch-hour buckets reset on
+// the clock, so an account could spend its whole allowance just before the
+// boundary and the whole of the next one just after — 60 fetches in seconds,
+// which is exactly the burst the limit exists to prevent. Tokens refill
+// continuously at quota-per-window, so the ceiling holds no matter where the
+// requests fall.
+let ytQuotaTableReady = false;
+async function ensureQuotaTable(env) {
+  if (ytQuotaTableReady) return;
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS worker_youtube_fetch_budget (" +
+      "owner_email TEXT PRIMARY KEY, tokens REAL NOT NULL, updated_ms INTEGER NOT NULL)"
+  ).run();
+  // The fixed-window table this replaced, from one deploy earlier. Ours, and
+  // only ever held rate-limit counters.
+  await env.DB.prepare("DROP TABLE IF EXISTS worker_youtube_fetch_quota").run().catch(() => {});
+  ytQuotaTableReady = true;
+}
+
+// Hands a token back when the request that reserved it turns out not to need
+// one — it was handed an existing row, lost a race, or hit the row cap. Capped
+// at a full bucket so a refund can never mint allowance. Best-effort: a lost
+// refund costs that account one token, which the refill returns anyway.
+async function ytRefundQuota(env, email) {
+  if (!env.DB) return;
+  try {
+    await env.DB.prepare(
+      "UPDATE worker_youtube_fetch_budget SET tokens = MIN(?2, tokens + 1) WHERE owner_email = ?1"
+    )
+      .bind(normalizeEmail(email), YT_FETCH_QUOTA)
+      .run();
+  } catch {
+    /* best-effort */
+  }
+}
+
+async function ytFetchQuota(env, email) {
+  if (!env.DB) return { ok: true };
+  const now = Date.now();
+  try {
+    await ensureQuotaTable(env);
+    // One statement does refill, spend and refusal together, so the read and the
+    // write can't be split by a concurrent request. MIN() caps the refill at a
+    // full bucket; the WHERE refuses anyone without a whole token to spend.
+    const refill = "MIN(?2, tokens + CAST(?3 - updated_ms AS REAL) * ?2 / ?4)";
+    const res = await env.DB.prepare(
+      "INSERT INTO worker_youtube_fetch_budget (owner_email, tokens, updated_ms) VALUES (?1, ?2 - 1, ?3) " +
+        `ON CONFLICT(owner_email) DO UPDATE SET tokens = ${refill} - 1, updated_ms = ?3 WHERE ${refill} >= 1`
+    )
+      .bind(normalizeEmail(email), YT_FETCH_QUOTA, now, YT_FETCH_WINDOW_MS)
+      .run();
+    if (!((res && res.meta && res.meta.changes) || 0)) {
+      return { ok: false, error: `You've transcribed ${YT_FETCH_QUOTA} videos in the past hour — try again later.` };
+    }
+  } catch {
+    /* D1 hiccup — don't block a legitimate transcription on the limiter */
+  }
+  return { ok: true };
+}
+
+async function createYoutubeTranscript(env, owner, input, opts = {}) {
+  if (!env.DB) return { ok: false, status: 503, code: "UPSTREAM_ERROR", error: "Transcripts database is not connected yet" };
+  const parsed = parseYoutubeUrl(input);
+  if (!parsed) return { ok: false, status: 400, code: "BAD_VIDEO_ID", error: YT_MESSAGES.BAD_VIDEO_ID };
+
+  const email = normalizeEmail(owner);
+  await ensureYoutubeIndex(env);
+
+  // `force` deliberately skips both the reuse check and the per-account cap, so
+  // without a limit one account could sit on a single video and re-fetch it in a
+  // loop — hammering the shared egress (the exact thing that gets us bot-gated)
+  // and rewriting every segment row each time. One forced refetch per account
+  // per cooldown window; admins, who use it to repair a bad transcript, skip it.
+  if (opts.force) {
+    const gate = await ytForceCooldown(env, email);
+    if (!gate.ok) return { ok: false, status: 429, code: "TOO_MANY_REFRESHES", error: gate.error };
+  }
+
+  const existing = await ytRowByOwnerVideo(env, email, parsed.videoId);
+  if (existing && !opts.force) {
+    if (existing.status === "completed") return { ok: true, row: existing, reused: true };
+    // A failed row retries — but not on demand, without limit. Re-posting the
+    // same failing video (no captions, unavailable, live, bot-gated) reran the
+    // whole fetch every time while occupying just one of the account's rows, so
+    // one account could hammer the shared egress indefinitely. Hold it for the
+    // same window a forced refresh uses; the row is handed back meanwhile,
+    // carrying the reason it failed.
+    if (existing.status === "failed") {
+      const since = Date.now() - (Date.parse(existing.updated_at || existing.created_at || "") || 0);
+      if (since < YT_RETRY_COOLDOWN_MS) return { ok: true, row: existing, reused: true, failed: true, error: existing.error };
+    }
+    // A row another request is actively writing is handed back as-is; one left
+    // behind by an interrupted request is retried below rather than pinning the
+    // video in "transcribing" forever.
+    if (existing.status === "processing" || existing.status === "queued") {
+      const age = Date.now() - (Date.parse(existing.updated_at || existing.created_at || "") || 0);
+      if (age < YT_PROCESSING_STALE_MS) return { ok: true, row: existing, reused: true };
+    }
+  }
+
+  // Every reuse path above returned already, so this request intends to fetch.
+  // The token is reserved HERE — before any row exists — and handed back below
+  // on the paths that turn out not to fetch after all. Taking it first is what
+  // keeps a refusal from having to touch a row at all: nothing is created, so
+  // there is nothing to strand in `processing`, nothing to delete out from
+  // under a concurrent caller, and no invisible row left eating the account's
+  // capacity. The refund covers the cases the reservation can't foresee.
+  const quota = await ytFetchQuota(env, email);
+  if (!quota.ok) return { ok: false, status: 429, code: "RATE_LIMITED", error: quota.error };
+
+  // A forced refresh of a transcript that already works must not destroy it: the
+  // row keeps its completed state and segments until a replacement is in hand.
+  const preserveOnFailure = !!existing && existing.status === "completed";
+
+  const at = nowIso();
+  let id;
+  if (existing) {
+    id = existing.transcript_id;
+    // Take the row before fetching. Losing this means another request is
+    // already transcribing it, so back off and return its row rather than
+    // running the same pipeline twice and racing to write the result.
+    //
+    // A completed row is claimed too, on a forced refresh — see
+    // ytClaimForRetry. That does mean a refresh shows as being written rather
+    // than serving the old text for those few seconds, which is the price of
+    // there being exactly one writer. Nothing is destroyed by it: the old
+    // segments stay where they are, and any failure below puts the row back to
+    // `completed` over them.
+    const claimed = await ytClaimForRetry(
+      env,
+      id,
+      new Date(Date.now() - YT_PROCESSING_STALE_MS).toISOString(),
+      preserveOnFailure
+    );
+    if (!claimed) {
+      const active = await ytRowById(env, id);
+      if (active) {
+        await ytRefundQuota(env, email); // another writer owns the fetch
+        return { ok: true, row: active, reused: true };
+      }
+    }
+    await ytUpdateRow(env, id, { url: parsed.url, updated_at: at });
+  } else {
+    const inserted = await ytInsertRow(env, {
+      owner_email: email,
+      video_id: parsed.videoId,
+      url: parsed.url,
+      status: "processing",
+      created_at: at,
+      updated_at: at,
+    });
+    // Lost the race to a concurrent request for the same video: that request
+    // owns the fetch and the segment write, so return its row rather than
+    // running the same pipeline against the same rows.
+    if (inserted.atCap) {
+      // The capped INSERT ... SELECT writes nothing both when the account is
+      // genuinely full AND when a concurrent request for this same video just
+      // took the last slot. Look before blaming the cap: if the video now
+      // exists, that is the answer the caller wanted.
+      const winner = await ytRowByOwnerVideo(env, email, parsed.videoId);
+      await ytRefundQuota(env, email); // neither branch below fetches anything
+      if (winner) return { ok: true, row: winner, reused: true };
+      return {
+        ok: false,
+        status: 400,
+        code: "LIMIT_REACHED",
+        error: `You can keep up to ${MAX_VIDEOS_PER_USER} videos — delete one first`,
+      };
+    }
+    if (inserted.existed) {
+      const winner = await ytRowById(env, inserted.id);
+      if (winner) {
+        await ytRefundQuota(env, email); // the winner owns the fetch
+        return { ok: true, row: winner, reused: true };
+      }
+    }
+    id = inserted.id;
+  }
+
+  let result;
+  try {
+    result = await fetchYoutubeTranscript(env, parsed.videoId);
+  } catch (err) {
+    result = { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail: String((err && err.message) || err) };
+  }
+
+  if (!result.ok) {
+    if (preserveOnFailure) {
+      // Keep the working transcript; report why the refresh didn't happen. The
+      // claim above moved the row to `processing` and nothing has touched its
+      // segments, so putting the status back restores it exactly as it was.
+      await ytUpdateRow(env, id, { status: "completed", error: null, updated_at: nowIso() });
+      const kept = await ytRowById(env, id);
+      return { ok: true, row: kept || existing, refreshFailed: true, code: result.code, error: result.error, detail: result.detail };
+    }
+    await ytUpdateRow(env, id, { status: "failed", error: result.error || YT_MESSAGES.UPSTREAM_ERROR, updated_at: nowIso() });
+    const row = await ytRowById(env, id);
+    return { ok: true, row: row || null, failed: true, code: result.code, error: result.error, detail: result.detail };
+  }
+
+  // The row can still have been deleted while this request was fetching — a
+  // stale claim is deletable by design. Writing segments for a parent that no
+  // longer exists would leave rows nothing can reach or clean up.
+  if (!(await ytRowById(env, id))) {
+    return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
+  }
+  // The row is `processing` by now either way — it was claimed before the fetch
+  // — so no reader is being served a half-written transcript as a finished one.
+  // What is left to decide is how a failed write recovers, and that depends on
+  // whether the replacement was one atomic batch.
+  const atomic = ytReplaceIsAtomic(result.segments.length);
+  try {
+    await ytReplaceSegments(env, id, email, result.language, result.segments);
+  } catch (err) {
+    // One batch: it either landed or it didn't, so the old segments are exactly
+    // as they were and the row can go straight back to serving them.
+    if (atomic && preserveOnFailure) {
+      await ytUpdateRow(env, id, { status: "completed", error: null, updated_at: nowIso() });
+      const kept = await ytRowById(env, id);
+      return {
+        ok: true,
+        row: kept || existing,
+        refreshFailed: true,
+        code: "UPSTREAM_ERROR",
+        error: YT_MESSAGES.UPSTREAM_ERROR,
+      };
+    }
+    // Every other case ends the same way: the row must not be left holding the
+    // claim. It is `processing` with a fresh timestamp, so rethrowing would
+    // answer 500 and leave a row that a resubmission inside the stale window is
+    // handed straight back — the page then polls a row nothing is writing, for
+    // a failure nobody was told about. Marking it failed says what happened and
+    // retries on the normal cooldown.
+    //
+    // Several batches with one of them not landing is the same outcome with a
+    // different reason: the segments are part new, part old, so there is
+    // nothing to restore and the whole thing has to be rebuilt.
+    const interrupted = !atomic;
+    const message = interrupted
+      ? "Saving this transcript was interrupted — it will be rebuilt on the next attempt."
+      : "Couldn't save this transcript — try again shortly.";
+    await ytUpdateRow(env, id, { status: "failed", error: message, updated_at: nowIso() });
+    const broken = await ytRowById(env, id);
+    return {
+      ok: true,
+      row: broken || null,
+      failed: true,
+      code: interrupted ? "WRITE_INTERRUPTED" : "WRITE_FAILED",
+      error: message,
+    };
+  }
+  // The lease is only honoured while it looks fresh, and a long fetch plus a
+  // long chunked write can outlive it — so the row may have been deleted after
+  // the check above and while these segments were going in. Clean up after
+  // ourselves rather than leaving rows no parent can reach.
+  if (!(await ytRowById(env, id))) {
+    await env.DB.prepare("DELETE FROM youtube_transcript_segments WHERE transcript_id = ?1")
+      .bind(id)
+      .run()
+      .catch(() => {});
+    return { ok: false, status: 404, code: "NOT_FOUND", error: "That video was removed while it was being transcribed" };
+  }
+  const completedAt = nowIso();
+  // A player response can come back with captions but without some of the
+  // optional metadata around them. Writing that absence through would blank a
+  // title, channel or duration the row already had — a forced refresh would
+  // "succeed" and leave the video showing its raw id. Only overwrite a field
+  // the fetch actually produced.
+  await ytUpdateRow(env, id, {
+    title: result.title || (existing && existing.title) || null,
+    channel: result.channel || (existing && existing.channel) || null,
+    duration_seconds: result.durationSeconds || (existing && existing.duration_seconds) || null,
+    status: "completed",
+    source: "captions",
+    language: result.language || null,
+    segment_count: result.segments.length,
+    error: null,
+    updated_at: completedAt,
+    completed_at: completedAt,
+  });
+  // No cache invalidation needed on a refresh: the summary key carries a
+  // signature of the transcript, so replacement captions simply address a
+  // different entry, and unchanged captions keep (and share) the existing one.
+  return { ok: true, row: await ytRowById(env, id) };
+}
+
+// Resolves a transcript for a caller, enforcing ownership. A row belonging to
+// someone else answers 404 rather than 403 — a 403 would confirm the id exists.
+// Admin is this dashboard's own operator role and sees every account's.
+async function ytRowForSession(env, session, id) {
+  const numeric = Number(id);
+  if (!Number.isFinite(numeric)) return null;
+  const row = await ytRowById(env, numeric);
+  if (!row) return null;
+  if (session.isAdmin) return row;
+  return normalizeEmail(row.owner_email) === normalizeEmail(session.identity) ? row : null;
+}
+
+/* --------------------------- transcript routes ---------------------------- */
+// The EC2 API's shape, served from here. `email` is ALWAYS the session's — an
+// email in the body or query string is ignored, since trusting it would let any
+// caller read or write another customer's transcripts.
+
+async function handleTranscriptCreate(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (session.isAdmin) return json({ error: "Admin accounts can't add videos — sign in as a user" }, 403);
+
+  const body = await request.json().catch(() => ({}));
+  const result = await createYoutubeTranscript(env, session.identity, body.url, { force: !!body.force });
+  if (!result.ok) return json({ error: result.error, code: result.code }, result.status || 400);
+  if (!result.row) return json({ error: YT_MESSAGES.UPSTREAM_ERROR, code: "UPSTREAM_ERROR" }, 502);
+  const segments = result.row.status === "completed" ? await ytSegmentRows(env, result.row.transcript_id) : [];
+  const payload = transcriptPayload(result.row, segments);
+  // A forced refresh that failed deliberately keeps the old transcript, which
+  // would otherwise come back as a plain 202 — indistinguishable from freshly
+  // fetched captions. Say so, so the caller knows what it is holding.
+  // Not stored on the row — the row keeps the short human message. This is for
+  // whoever is looking at why it failed right now.
+  if (result.detail) payload.detail = result.detail;
+  if (result.refreshFailed) {
+    payload.refresh_failed = true;
+    payload.refresh_error = result.error || YT_MESSAGES.UPSTREAM_ERROR;
+    payload.code = result.code || "UPSTREAM_ERROR";
+  }
+  return json(payload, 202);
+}
+
+async function handleTranscriptGet(request, env, id) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+  const row = await ytRowForSession(env, session, id);
+  if (!row) return json({ error: "Not found", code: "NOT_FOUND" }, 404);
+  const segments = row.status === "completed" ? await ytSegmentRows(env, row.transcript_id) : [];
+  return json(transcriptPayload(row, segments));
+}
+
+async function handleTranscriptText(request, env, id) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
+  const row = await ytRowForSession(env, session, id);
+  if (!row) return json({ error: "Not found", code: "NOT_FOUND" }, 404);
+  if (row.status === "failed") return json({ error: row.error || YT_MESSAGES.UPSTREAM_ERROR, code: "FAILED" }, 409);
+  if (row.status !== "completed") return json({ error: "This transcript is still being written", code: "PENDING" }, 409);
+  const segments = ytSegmentPayload(await ytSegmentRows(env, row.transcript_id));
+  return new Response(ytTranscriptText(segments), {
+    headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "private, no-store" },
+  });
+}
+
+
+// POST /youtube/probe?v=<id> — read-only diagnostics for the YouTube path.
+// Writes nothing. This exists because the whole design rests on Cloudflare's
+// egress not being bot-gated the way EC2's is, and that can change under us: it
+// reports exactly what each hop returns so a failure can be told apart from a
+// genuinely unavailable video, and so the egress can be monitored over time.
+// The extra client probes here are deliberate and manual — the transcript path
+// itself still makes at most one InnerTube call.
+//
+// POST for a route that reads nothing, deliberately. The session cookie is
+// SameSite=None (this app is embedded cross-site), so where third-party cookies
+// are still allowed a page an admin merely VISITS can fire authenticated GETs
+// at us from an <img> or <iframe> — and each one spends three requests on the
+// shared egress. As a POST it goes through the Origin check in the fetch
+// handler, which no cross-site form or tag can satisfy. The cooldown below then
+// bounds it even for a legitimate admin, since nothing else does.
+async function handleTranscriptProbe(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+  // Admin only. Each call spends three requests on the shared Cloudflare egress
+  // without touching any per-account allowance, so leaving it open to every
+  // signed-in account would let one of them hammer the egress until YouTube
+  // bot-gates it — which disables transcription for everyone.
+  if (!session.isAdmin) return json({ error: "Forbidden" }, 403);
+  const url = new URL(request.url);
+  const videoId = String(url.searchParams.get("v") || "aircAruvnKk").trim();
+  if (!YT_ID_RE.test(videoId)) return json({ error: YT_MESSAGES.BAD_VIDEO_ID, code: "BAD_VIDEO_ID" }, 400);
+  const gate = await ytProbeCooldown(env, session.identity);
+  if (!gate.ok) return json({ error: gate.error, code: "TOO_MANY_PROBES" }, 429);
+
+  const out = { videoId, watch: {}, innertube: {} };
+
+  try {
+    const res = await fetch(`${ytOrigin(env)}/watch?v=${encodeURIComponent(videoId)}&hl=en&bpctr=9999999999&has_verified=1`, {
+      headers: ytHeaders({
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        Cookie: "CONSENT=YES+1; SOCS=CAI",
+      }),
+    });
+    const html = await res.text().catch(() => "");
+    const player = res.ok ? playerResponseFromHtml(html) : null;
+    const play = playabilityOf(player);
+    const tracks =
+      (player && player.captions && player.captions.playerCaptionsTracklistRenderer &&
+        player.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+    out.watch = {
+      status: res.status,
+      bytes: html.length,
+      botGated: looksBotGated(play.reason, html),
+      hasPlayerResponse: !!player,
+      playability: play.status || null,
+      reason: play.reason || null,
+      captionTracks: tracks.length,
+      languages: tracks.map((t) => `${t.languageCode}${String(t.kind || "") === "asr" ? " (asr)" : ""}`),
+      hasInnertubeKey: !!innertubeKeyFromHtml(html),
+    };
+  } catch (err) {
+    out.watch = { error: String((err && err.message) || err) };
+  }
+
+  // Both InnerTube clients, so a failure tells us WHICH one Cloudflare can still
+  // use rather than just that the fallback didn't work.
+  for (const client of ["WEB", "ANDROID"]) {
+    try {
+      const body =
+        client === "ANDROID"
+          ? { videoId, context: { client: { clientName: "ANDROID", clientVersion: "19.09.37", androidSdkVersion: 30, hl: "en", gl: "US" } } }
+          : { videoId, context: { client: { clientName: "WEB", clientVersion: "2.20240401.00.00", hl: "en", gl: "US" } } };
+      const res = await fetch(`${ytOrigin(env)}/youtubei/v1/player?key=${YT_PUBLIC_INNERTUBE_KEY}&prettyPrint=false`, {
+        method: "POST",
+        headers: ytHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify(body),
+      });
+      const data = safeJsonParse(await res.text().catch(() => "")) || {};
+      const play = playabilityOf(data);
+      const tracks =
+        (data.captions && data.captions.playerCaptionsTracklistRenderer &&
+          data.captions.playerCaptionsTracklistRenderer.captionTracks) || [];
+      out.innertube[client] = {
+        status: res.status,
+        playability: play.status || null,
+        reason: play.reason || null,
+        botGated: looksBotGated(play.reason, ""),
+        captionTracks: tracks.length,
+        title: (data.videoDetails && data.videoDetails.title) || null,
+      };
+    } catch (err) {
+      out.innertube[client] = { error: String((err && err.message) || err) };
+    }
+  }
+
+  // The providers are where a transcript actually comes from now, so a probe
+  // that only reported the direct path would be reporting the one hop we
+  // already know is blocked. What matters for each: did it answer, and does
+  // what it returned actually look like its own payload — a challenge page or
+  // an interstitial answers 200 with HTML and would otherwise be mistaken for
+  // a verdict about the video.
+  out.providers = {};
+  const keylessOrigin = ytProviderOrigin(env, "YT_TEXT_ORIGIN", "https://youtube-transcript.ai");
+  try {
+    const res = await fetch(`${keylessOrigin}/transcript/${encodeURIComponent(videoId)}.txt`, {
+      headers: { Accept: "text/markdown, text/plain;q=0.9, */*;q=0.8", "User-Agent": YT_UA },
+    });
+    const text = await res.text().catch(() => "");
+    out.providers.keyless = {
+      status: res.status,
+      contentType: res.headers.get("content-type"),
+      bytes: text.length,
+      looksLikeTranscript: /^#\s*Transcript/m.test(text) && text.includes("## Transcript"),
+      cues: (text.match(/\[\d+(?::\d+){1,2}\]/g) || []).length,
+      head: text.slice(0, 200),
+    };
+  } catch (err) {
+    out.providers.keyless = { error: String((err && err.message) || err) };
+  }
+
+  if (String((env && env.SUPADATA_API_KEY) || "").trim()) {
+    const supaOrigin = ytProviderOrigin(env, "SUPADATA_ORIGIN", "https://api.supadata.ai");
+    try {
+      const res = await fetch(
+        `${supaOrigin}/v1/transcript?url=${encodeURIComponent(`https://www.youtube.com/watch?v=${videoId}`)}`,
+        { headers: { "x-api-key": String(env.SUPADATA_API_KEY).trim(), Accept: "application/json" } }
+      );
+      const text = await res.text().catch(() => "");
+      const data = safeJsonParse(text) || {};
+      out.providers.supadata = {
+        status: res.status,
+        cues: Array.isArray(data.content) ? data.content.length : null,
+        lang: data.lang || null,
+        // Their error wording, never the key.
+        head: res.ok ? undefined : text.slice(0, 200),
+      };
+    } catch (err) {
+      out.providers.supadata = { error: String((err && err.message) || err) };
+    }
+  } else {
+    out.providers.supadata = { configured: false };
+  }
+
+  return json({ ok: true, probe: out });
+}
+
+/* ------------------------- the dashboard's Videos tab ------------------------- */
+// The same transcripts, shaped for the SPA. These routes are what the Videos tab
+// calls; they read and write the D1 tables above, so the dashboard and any
+// caller using the EC2-shaped contract are looking at exactly one store.
+
+// Only the client-facing fields. `owner` IS included — the dashboard shows it in
+// the admin cross-account list, and for a normal user it's just their own address.
+function publicVideo(row) {
+  return {
+    id: String(row.transcript_id),
+    owner: row.owner_email || "",
+    url: row.url || "",
+    videoId: row.video_id || "",
+    title: row.title || "",
+    channel: row.channel || "",
+    durationSec: Number(row.duration_seconds) || 0,
+    status: row.status || "queued",
+    error: row.error || "",
+    createdAt: Date.parse(row.created_at || "") || 0,
+    updatedAt: Date.parse(row.updated_at || row.created_at || "") || 0,
+    hasTranscript: (Number(row.segment_count) || 0) > 0,
+  };
 }
 
 // GET /api/youtube — the signed-in user's videos (admin: everyone's, or one
-// user's with ?email=). In-flight jobs are refreshed inline so the list is live
-// and the client only has to re-poll this one route.
+// user's with ?email=).
 async function handleListVideos(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
   const url = new URL(request.url);
   const filter = normalizeEmail(url.searchParams.get("email") || "");
-  // Which set of records this call is listing — also the rotation cursor's key,
-  // so admin's cross-account view and a user's own list rotate independently.
-  const scope = session.isAdmin ? (filter ? `admin:${filter}` : "admin:all") : normalizeEmail(session.identity);
-
-  let records;
+  const owner = session.isAdmin ? filter || null : normalizeEmail(session.identity);
   try {
-    records = session.isAdmin
-      ? await readVideos(env, filter ? ytPrefixFor(filter) : YT_PREFIX)
-      : await readVideos(env, ytPrefixFor(session.identity));
+    const rows = await ytRowsForOwner(env, owner);
+    return json({ ok: true, admin: !!session.isAdmin, videos: rows.map(publicVideo) });
   } catch (err) {
     return json({ error: "Failed to load your videos", detail: String((err && err.message) || err) }, 500);
   }
-
-  const pending = records.filter((r) => !YT_TERMINAL.has(r.status));
-  const batch = await pendingRefreshBatch(env, scope, pending);
-  if (batch.length) {
-    const fresh = await Promise.all(batch.map((r) => refreshVideo(env, r).catch(() => r)));
-    const byKey = new Map(fresh.map((r) => [r._key, r]));
-    records = records.map((r) => byKey.get(r._key) || r);
-  }
-  return json({ ok: true, admin: !!session.isAdmin, videos: records.map(publicVideo) });
 }
 
-// POST /api/youtube {url} — queue a YouTube video for transcription. The owner
-// is always the session email (that's who the transcript belongs to upstream).
+// POST /api/youtube {url} — transcribe a YouTube video for the signed-in
+// account. The owner is always the session email.
 async function handleCreateVideo(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
   if (session.isAdmin) return json({ error: "Admin accounts can't add videos — sign in as a user" }, 403);
-  if (!env.API_KEY) return json({ error: "Server is missing the API_KEY secret" }, 500);
 
   const body = await request.json().catch(() => ({}));
-  const parsed = parseYoutubeUrl(body.url);
-  if (!parsed) return json({ error: "Enter a valid YouTube video link" }, 400);
-  const owner = normalizeEmail(session.identity);
-
-  const existing = await readVideos(env, ytPrefixFor(owner)).catch(() => []);
-  // Re-adding a video you already have hands back the one you have, instead of
-  // paying for a second transcription of the same thing. This is checked BEFORE
-  // the capacity limit: re-adding claims no new slot, so a full list must still
-  // resolve to the record it already holds rather than a "delete one first".
-  const already = existing.find((r) => r.videoId === parsed.videoId && r.status !== "failed");
-  if (already) return json({ ok: true, video: publicVideo(already), duplicate: true });
-  if (existing.length >= MAX_VIDEOS_PER_USER) {
-    return json({ error: `You can keep up to ${MAX_VIDEOS_PER_USER} videos — delete one first` }, 400);
-  }
-
-  let upstream, text;
+  let result;
   try {
-    upstream = await ytUpstream(env, "/public/youtube", { method: "POST", body: { email: owner, url: parsed.url } });
-    text = await upstream.text();
+    result = await createYoutubeTranscript(env, session.identity, body.url, { force: !!body.force });
   } catch (err) {
-    return json({ error: "Failed to reach the transcription service", detail: String((err && err.message) || err) }, 502);
+    return json({ error: "Failed to transcribe that video", detail: String((err && err.message) || err) }, 500);
   }
-  const data = safeJsonParse(text) || {};
-  if (!upstream.ok) {
-    const detail = pickString(data, ["detail", "error", "message"]) || `Upstream returned ${upstream.status}`;
-    if (upstream.status === 401 || upstream.status === 403) {
-      return json({ error: "The transcription service rejected this request — the server's API key may need renewing", detail }, 503);
-    }
-    return json({ error: "The transcription service could not accept that video", detail }, 502);
-  }
-  const id = pickString(data, ["id", "job_id", "jobId", "transcript_id", "task_id"]);
-  if (!id) {
-    return json({ error: "The transcription service didn't return a job id", detail: String(text || "").slice(0, 300) }, 502);
-  }
-
-  const now = Date.now();
-  const rec = mergeUpstreamVideo(
+  if (!result.ok) return json({ error: result.error, code: result.code }, result.status || 400);
+  if (!result.row) return json({ error: YT_MESSAGES.UPSTREAM_ERROR, code: "UPSTREAM_ERROR" }, 502);
+  // Transcription runs inline, so its outcome is already known here. The row is
+  // returned either way (a failed video belongs in the list, with its reason),
+  // but `failed` tells the client not to report this as a success.
+  return json(
     {
-      id,
-      owner,
-      url: parsed.url,
-      videoId: parsed.videoId,
-      title: "",
-      channel: "",
-      durationSec: 0,
-      status: "queued",
-      error: "",
-      createdAt: now,
-      updatedAt: now,
-      hasTranscript: false,
+      ok: true,
+      video: publicVideo(result.row),
+      duplicate: !!result.reused,
+      failed: !!result.failed,
+      refreshFailed: !!result.refreshFailed,
+      error: result.error || null,
+      code: result.code || null,
     },
-    data,
+    result.reused ? 200 : 202,
   );
-  try {
-    await saveVideo(env, rec);
-  } catch (err) {
-    return json({ error: "Queued the video but couldn't save it to your list", detail: String((err && err.message) || err) }, 500);
-  }
-  return json({ ok: true, video: publicVideo(rec) }, 202);
 }
 
-// GET /api/youtube/video?id=…&owner=… — one video plus its transcript text.
+// GET /api/youtube/video?id=…&owner=… — one video, its transcript segments, and
+// the plain-text rendering the summary/chat paths use.
 async function handleGetVideo(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
   const url = new URL(request.url);
-  let rec = await resolveVideoForSession(env, session, url.searchParams.get("id"), url.searchParams.get("owner"));
-  if (!rec) return json({ error: "Not found" }, 404);
-  if (!YT_TERMINAL.has(rec.status)) rec = await refreshVideo(env, rec);
-  const transcript = await videoTranscriptText(env, rec).catch(() => "");
-  return json({ ok: true, video: publicVideo(rec), transcript });
+  const row = await ytRowForSession(env, session, url.searchParams.get("id"));
+  if (!row) return json({ error: "Not found" }, 404);
+  const segments = row.status === "completed" ? ytSegmentPayload(await ytSegmentRows(env, row.transcript_id)) : [];
+  return json({ ok: true, video: publicVideo(row), segments, transcript: ytTranscriptText(segments) });
 }
 
-// POST /api/youtube/delete {id, owner?} — drop a video from the account's list
-// (and its cached transcript). The upstream job isn't touched.
+// POST /api/youtube/delete {id} — drop a transcript and its segments.
 async function handleDeleteVideo(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
   const body = await request.json().catch(() => ({}));
-  const rec = await resolveVideoForSession(env, session, body.id, body.owner);
-  if (!rec) return json({ error: "Not found" }, 404);
+  const row = await ytRowForSession(env, session, body.id);
+  if (!row) return json({ error: "Not found" }, 404);
+  // Deleting a row another request is actively writing would leave that writer
+  // to finish into a parent that no longer exists — orphaned segments, and a
+  // 500 for the request that was doing real work. A row only counts as held
+  // while its claim is fresh, so one abandoned by an interrupted request is
+  // still removable.
+  if (row.status === "processing" || row.status === "queued") {
+    const age = Date.now() - (Date.parse(row.updated_at || row.created_at || "") || 0);
+    if (age < YT_PROCESSING_STALE_MS) {
+      return json({ error: "This video is still being transcribed — try again in a moment", code: "IN_PROGRESS" }, 409);
+    }
+  }
   try {
-    await env.KV.delete(ytKey(rec.owner, rec.id));
-    await env.KV.delete(ytTextKey(rec));
+    await ytDeleteTranscript(env, row.transcript_id);
+    await ytDeleteLegacyKvCopies(env, row.owner_email, row.video_id);
   } catch (err) {
     return json({ error: "Failed to remove that video", detail: String((err && err.message) || err) }, 500);
   }
@@ -5091,6 +6351,44 @@ async function handleDeleteVideo(request, env) {
 // server-side under the caller's own ownership, the OpenAI key stays a Worker
 // secret, and a video is summarized ONCE — cached by video id, so every user who
 // transcribes the same video shares it.
+
+// A cheap, stable signature of a string. Only needs to change when the text
+// changes — not to be cryptographic.
+function ytTextSignature(text) {
+  let h = 2166136261; // FNV-1a
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+// Summaries are shared by VIDEO, not by transcript row: two accounts that
+// transcribe the same video get one summary and we never pay to make it twice.
+//
+// But each account's transcript is independently refreshable, so "same video"
+// is not the same thing as "same words" — after one owner force-refreshes and
+// YouTube's captions have changed, a key of video id alone would serve the
+// other owner a summary that contradicts the transcript on their own page. The
+// key therefore carries a signature of the transcript itself: identical
+// captions still share, divergent ones no longer collide.
+function ytSummaryKey(row, transcript) {
+  const video = String(row.video_id || row.transcript_id).trim();
+  return `${YT_SUMMARY_PREFIX}${video}:${ytTextSignature(transcript || "")}`;
+}
+
+// The transcript as the model sees it: "[mm:ss] line", which gives the summary
+// and chat something to anchor timings to.
+function ytTranscriptForModel(segments) {
+  const lines = new Array(segments.length);
+  for (let i = 0; i < segments.length; i++) {
+    const t = Math.max(0, Math.floor(segments[i].start));
+    const mm = String(Math.floor(t / 60)).padStart(2, "0");
+    const ss = String(t % 60).padStart(2, "0");
+    lines[i] = `[${mm}:${ss}] ${segments[i].text}`;
+  }
+  return lines.join("\n");
+}
 
 const VIDEO_CAVEAT =
   "Work ONLY from the transcript — never invent facts, numbers, names, or claims. " +
@@ -5109,7 +6407,7 @@ function buildVideoText(text) {
   return full.slice(0, head) + "\n…[transcript truncated]…\n" + full.slice(full.length - tail);
 }
 
-// A short display title for a video upstream gave no name for. Best-effort —
+// A short display title for a video YouTube gave no name for. Best-effort —
 // "" on any failure, so the UI falls back to the video id.
 async function generateVideoTitle(text, apiKey, model) {
   const transcript = buildVideoText(text).slice(0, 6000);
@@ -5219,51 +6517,53 @@ async function generateVideoSummary(text, apiKey, model, meta = {}) {
   return md.trim();
 }
 
-// POST /api/youtube/ai {id, owner?, summarize?, force?, messages?}
+// POST /api/youtube/ai {id, summarize?, force?, messages?}
 async function handleVideoAi(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
   const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
+  if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
 
   const body = await request.json().catch(() => ({}));
-  let rec = await resolveVideoForSession(env, session, body.id, body.owner);
-  if (!rec) return json({ error: "Not found" }, 404);
-  if (!YT_TERMINAL.has(rec.status)) rec = await refreshVideo(env, rec);
-  if (rec.status === "failed") return json({ error: rec.error || "That video failed to transcribe" }, 409);
-  if (rec.status !== "completed") return json({ error: "This video is still being transcribed" }, 409);
+  const row = await ytRowForSession(env, session, body.id);
+  if (!row) return json({ error: "Not found" }, 404);
+  if (row.status === "failed") return json({ error: row.error || "That video failed to transcribe" }, 409);
+  if (row.status !== "completed") return json({ error: "This video is still being transcribed" }, 409);
 
-  const transcript = await videoTranscriptText(env, rec).catch(() => "");
-  if (!transcript) return json({ error: "No transcript found for that video yet" }, 404);
+  const segments = ytSegmentPayload(await ytSegmentRows(env, row.transcript_id));
+  if (!segments.length) return json({ error: "No transcript found for that video yet" }, 404);
+  const transcript = ytTranscriptForModel(segments);
 
   const model = env.OPENAI_MODEL || "gpt-4o";
 
   if (body.summarize) {
-    const cacheKey = ytSummaryKey(rec);
+    const cacheKey = ytSummaryKey(row, transcript);
     const force = !!body.force;
-    if (!force) {
+    if (!force && env.KV) {
       try {
         const cached = await env.KV.get(cacheKey);
-        if (cached) return json({ ok: true, reply: cached, title: rec.title || undefined, cached: true });
+        if (cached) return json({ ok: true, reply: cached, title: row.title || undefined, cached: true });
       } catch {
         /* KV hiccup — generate fresh */
       }
     }
     try {
-      // The summary and (only when upstream gave the video no name) a short
+      // The summary and (only when YouTube gave the video no name) a short
       // display title are minted together; a title failure never sinks the summary.
       const [reply, title] = await Promise.all([
-        generateVideoSummary(transcript, apiKey, model, { title: rec.title, channel: rec.channel }),
-        rec.title ? Promise.resolve(rec.title) : generateVideoTitle(transcript, apiKey, model).catch(() => ""),
+        generateVideoSummary(transcript, apiKey, model, { title: row.title, channel: row.channel }),
+        row.title ? Promise.resolve(row.title) : generateVideoTitle(transcript, apiKey, model).catch(() => ""),
       ]);
-      try {
-        await env.KV.put(cacheKey, reply);
-      } catch {
-        /* best-effort cache — still return what we just generated */
+      if (env.KV) {
+        try {
+          await env.KV.put(cacheKey, reply);
+        } catch {
+          /* best-effort cache — still return what we just generated */
+        }
       }
-      if (title && title !== rec.title) {
-        rec.title = title;
-        await saveVideo(env, rec).catch(() => {});
+      if (title && title !== row.title) {
+        await ytUpdateRow(env, row.transcript_id, { title, updated_at: nowIso() }).catch(() => {});
       }
       return json({ ok: true, reply, title: title || undefined });
     } catch (err) {
@@ -5286,7 +6586,7 @@ async function handleVideoAi(request, env) {
 
   let cachedSummary = "";
   try {
-    cachedSummary = ((await env.KV.get(ytSummaryKey(rec))) || "").slice(0, 6000);
+    cachedSummary = ((await env.KV.get(ytSummaryKey(row, transcript))) || "").slice(0, 6000);
   } catch {
     /* optional context */
   }
@@ -5294,13 +6594,17 @@ async function handleVideoAi(request, env) {
   let built;
   try {
     built = await buildChatRequest({
-      rows: videoRowsFromText(transcript),
+      // Straight from the stored segments: each carries its real start time, so
+      // the pipeline's citations point at the actual moment. videoRowsFromText
+      // exists to recover that from a flat transcript — unnecessary here, where
+      // the timings were never flattened in the first place.
+      rows: segments.map((seg) => ({ start_time: seg.start, speaker: "", text: seg.text })),
       history,
       apiKey,
       model,
       planModel: env.OPENAI_FAST_MODEL || model,
-      title: rec.title || "",
-      channel: rec.channel || "",
+      title: row.title || "",
+      channel: row.channel || "",
       summary: cachedSummary,
       kind: "video",
       seedPrompt:
@@ -5472,6 +6776,10 @@ function timingSafeEqual(a, b) {
 // that can drift. Inert at runtime — Workers only ever invokes the default
 // export — and deliberately limited to the pure, binding-free chat internals.
 export {
+  parseJson3,
+  ytReplaceIsAtomic,
+  ytCollapseRepeats,
+  ytStampSeconds,
   buildChatRequest,
   buildWeeklyChatRequest,
   videoRowsFromText,
@@ -5486,5 +6794,8 @@ export {
   fuzzyScore,
   soundKey,
   openaiChat,
-  CHAT_SYSTEM_PROMPT,
 };
+// CHAT_SYSTEM_PROMPT is deliberately NOT exported. A module Worker treats every
+// named export as a potential entrypoint, so workerd rejects one that isn't a
+// function — "Incorrect type for map entry 'CHAT_SYSTEM_PROMPT'" — and the
+// Worker fails to boot under `wrangler dev`. Nothing imported it anyway.

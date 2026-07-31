@@ -1,12 +1,12 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // YouTube video ⇄ UI-model mapping.
 //
-// The second transcript source alongside meetings. A video is a job on the bot
-// backend (queued → transcribed) that this Worker indexes per owner; the UI
-// shows it with the same transcript / summary / chat surface a meeting gets, so
-// this module maps a VideoRecord onto the existing Episode + Podcast shapes and
-// parses the transcript text into the TranscriptSegment list those components
-// already render.
+// The second transcript source alongside meetings. The Worker fetches a video's
+// captions from YouTube itself and stores them in D1, so the UI can show it with
+// the same transcript / summary / chat surface a meeting gets. This module maps
+// a VideoRecord onto the existing Episode + Podcast shapes, and turns stored
+// segments (or, as a fallback, raw transcript text) into the TranscriptSegment
+// list those components already render.
 // ─────────────────────────────────────────────────────────────────────────────
 
 import type { Episode, Podcast, ProcessingStatus, TranscriptSegment } from './types'
@@ -16,9 +16,9 @@ export type VideoStatus = 'queued' | 'processing' | 'completed' | 'failed'
 
 /** A video as the Worker stores and returns it (GET /api/youtube). */
 export interface VideoRecord {
-  /** The upstream job id — unique per owner. */
+  /** The transcript id — the D1 primary key, as a string. */
   id: string
-  /** The account that queued it (and owns the transcript). */
+  /** The account that added it (and owns the transcript). */
   owner: string
   url: string
   /** The 11-character YouTube id, when known. */
@@ -31,6 +31,61 @@ export interface VideoRecord {
   createdAt: number
   updatedAt: number
   hasTranscript?: boolean
+}
+
+/** One stored transcript line, exactly as the Worker holds it in D1 — already
+ *  timed, so the UI never has to infer timings from text. `speaker` is null on
+ *  the captions path (YouTube gives no diarization). */
+export interface StoredSegment {
+  index: number
+  start: number
+  end: number
+  text: string
+  speaker: string | null
+  language: string | null
+}
+
+/** Stored segments → the shape the transcript view renders.
+ *
+ *  Caption cues are 3–8 words each, so a long video is thousands of them. Kept
+ *  one-to-one they read terribly AND render as thousands of DOM rows, which is
+ *  what makes a multi-hour transcript sluggish. Adjacent cues are merged into
+ *  paragraph-sized blocks carrying the first cue's timestamp — the same shape
+ *  the flat-text parser produces, so both paths render identically. A change of
+ *  speaker always starts a new block (unused on the captions path, which has no
+ *  diarization, but correct if a source ever provides it). */
+export function segmentsFromStored(stored: StoredSegment[]): TranscriptSegment[] {
+  const out: TranscriptSegment[] = []
+  let buffer = ''
+  let start = 0
+  let speaker: string | null = null
+
+  const flush = () => {
+    const text = buffer.trim()
+    if (!text) return
+    out.push({
+      id: String(out.length),
+      speaker: speaker || 'Transcript',
+      role: 'guest',
+      timestamp: stampFor(start),
+      text,
+    })
+    buffer = ''
+  }
+
+  for (const seg of stored) {
+    const text = (seg.text || '').trim()
+    if (!text) continue
+    if (buffer && seg.speaker !== speaker) flush()
+    if (!buffer) {
+      start = seg.start
+      speaker = seg.speaker ?? null
+    }
+    buffer = buffer ? `${buffer} ${text}` : text
+    if (buffer.length >= BLOCK_CHARS || (buffer.length > BLOCK_CHARS / 2 && /[.!?]["')\]]?$/.test(text))) flush()
+  }
+  flush()
+  return out
 }
 
 /** True while the backend is still working on it — the UI polls in this state. */

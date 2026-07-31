@@ -7,11 +7,11 @@ import { useAuth } from './Auth'
 // The Videos tab's data layer: every YouTube video the signed-in account has
 // queued (admin: every account's), loaded from GET /api/youtube.
 //
-// A queued video is transcribed by the backend over the following minutes, so
-// the list polls itself while anything is still in flight — the Worker refreshes
-// in-flight jobs on each list call, so one poll of one route keeps the whole
-// tab live. Polling stops the moment everything is settled (and while the tab is
-// hidden), so an idle dashboard costs nothing.
+// The Worker fetches and stores a video's captions inline, so a video is
+// normally already completed by the time the POST returns. The polling below is
+// the safety net for anything left in flight (a row another tab is still
+// writing): it runs only while something is actually pending, and only while
+// this tab is visible, so an idle dashboard costs nothing.
 
 const POLL_MS = 8000
 
@@ -25,9 +25,11 @@ interface VideosData {
   error: string | null
   videoByHandle: (handle: string) => VideoRecord | undefined
   refresh: () => Promise<void>
-  /** Queue a YouTube link. Resolves with the record (existing one if already
-   *  added); rejects with the server's message so the form can show it. */
-  addVideo: (url: string) => Promise<VideoRecord>
+  /** Transcribe a YouTube link. Resolves with the stored record — which may
+   *  already be `failed`, since transcription runs inline, so the caller must
+   *  check `failed`/`error` rather than assuming success. Rejects with the
+   *  server's message when the request itself is refused. */
+  addVideo: (url: string) => Promise<{ video: VideoRecord; failed: boolean; error: string }>
   removeVideo: (video: VideoRecord) => Promise<void>
   /** Fold a fresher copy of one video (e.g. from the detail view) into the list. */
   applyVideo: (video: VideoRecord) => void
@@ -53,6 +55,9 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   // changed is dropped instead of showing the previous account's videos.
   const identityRef = useRef(email)
   identityRef.current = email
+  // Admin's list legitimately spans every account; a normal session's does not.
+  const adminSessionRef = useRef(false)
+  adminSessionRef.current = authed && state.isAdmin
 
   const load = useCallback(async (opts?: { quiet?: boolean }) => {
     const issuedFor = identityRef.current
@@ -115,6 +120,13 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   )
 
   const applyVideo = useCallback((video: VideoRecord) => {
+    // Never fold a record from another account into this account's list. Every
+    // caller here writes after an await (add, restore-after-failed-delete, the
+    // detail view's refresh), and the provider stays mounted across an identity
+    // switch — so without this an in-flight response for account A could land in
+    // account B's freshly-cleared list and expose A's video.
+    const current = identityRef.current
+    if (!adminSessionRef.current && video.owner.toLowerCase() !== current.toLowerCase()) return
     setVideos((prev) => {
       const i = prev.findIndex((v) => v.id === video.id && v.owner === video.owner)
       if (i !== -1) {
@@ -129,24 +141,29 @@ export function VideosProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const addVideo = useCallback(async (url: string) => {
-    const { video } = await api.addVideo(url)
+    const issuedFor = identityRef.current
+    const { video, failed, error } = await api.addVideo(url)
+    if (identityRef.current !== issuedFor) return { video, failed, error } // the account changed mid-flight
     // Show it immediately — KV list is eventually consistent, so re-listing right
     // after the write can miss the new key (the same reason schedules are added
     // optimistically rather than re-listed).
     applyVideo(video)
     setError(null)
-    return video
+    return { video, failed, error }
   }, [applyVideo])
 
   // Never rejects: a failed delete puts the row back and reports why, so the
   // row can't just vanish and silently reappear on the next poll.
   const removeVideo = useCallback(async (video: VideoRecord) => {
+    const issuedFor = identityRef.current
     setVideos((prev) => prev.filter((v) => !(v.id === video.id && v.owner === video.owner))) // optimistic
     try {
       await api.deleteVideo(video.id, video.owner)
+      if (identityRef.current !== issuedFor) return // the account changed mid-flight
       setError(null)
       await load({ quiet: true })
     } catch (err) {
+      if (identityRef.current !== issuedFor) return
       applyVideo(video) // put it back where it was
       setError((err as Error)?.message || 'Could not remove that video.')
     }

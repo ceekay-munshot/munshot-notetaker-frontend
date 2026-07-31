@@ -17,6 +17,8 @@ import {
   videoTitle,
   videoToEpisode,
   videoWatchUrl,
+  segmentsFromStored,
+  type StoredSegment,
   type VideoRecord,
 } from '../lib/videos'
 import type { Summary, TranscriptSegment } from '../lib/types'
@@ -41,6 +43,7 @@ export default function VideoDetail() {
   // The list's copy renders instantly on a click-through; the detail fetch (which
   // also carries the transcript) refines it.
   const [video, setVideo] = useState<VideoRecord | undefined>(() => (handle ? videoByHandle(handle) : undefined))
+  const [stored, setStored] = useState<StoredSegment[]>([])
   const [transcriptText, setTranscriptText] = useState('')
   const [loadError, setLoadError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -62,6 +65,7 @@ export default function VideoDetail() {
       const data = await fetchVideo(ref.id, ref.owner || undefined)
       setVideo(data.video)
       applyVideo(data.video)
+      setStored(data.segments)
       setTranscriptText(data.transcript)
       setLoadError(null)
     } catch (err) {
@@ -75,6 +79,7 @@ export default function VideoDetail() {
     setLoading(true)
     setSummary(undefined)
     setSummaryError(null)
+    setStored([])
     setTranscriptText('')
     summarized.current = ''
     void load()
@@ -90,7 +95,12 @@ export default function VideoDetail() {
     return () => window.clearInterval(timer)
   }, [pending, load])
 
-  const segments = useMemo(() => parseVideoTranscript(transcriptText), [transcriptText])
+  // The Worker stores real per-line timings, so use those; parsing the flat text
+  // is only the fallback for a transcript stored before segments were returned.
+  const segments = useMemo(
+    () => (stored.length ? segmentsFromStored(stored) : parseVideoTranscript(transcriptText)),
+    [stored, transcriptText],
+  )
 
   const runSummary = useCallback(
     async (opts?: { force?: boolean }) => {
@@ -678,7 +688,7 @@ function FailedPanel({ video, onRemove }: { video: VideoRecord; onRemove: () => 
         disabled={busy}
         className="press mt-1 inline-flex items-center gap-2 rounded-lg border border-outline-variant bg-surface px-4 py-2.5 text-metadata font-semibold text-on-surface hover:bg-surface-container-low disabled:opacity-50"
       >
-        <Icon name="delete" size={18} /> Remove from my videos
+        <Icon name="delete" size={18} /> Delete this transcript
       </button>
     </div>
   )
