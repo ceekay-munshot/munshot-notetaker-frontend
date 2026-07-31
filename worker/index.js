@@ -5127,21 +5127,23 @@ async function ytProviderSupadata(env, videoId) {
   let res;
   try {
     res = await fetch(url, { headers: { "x-api-key": key, Accept: "application/json" } });
-  } catch {
-    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  } catch (err) {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail: `supadata threw: ${String((err && err.message) || err)}` };
   }
-  const body = safeJsonParse(await res.text().catch(() => "")) || {};
+  const raw = await res.text().catch(() => "");
+  const body = safeJsonParse(raw) || {};
+  const detail = `supadata ${res.status} ${JSON.stringify(String(raw).slice(0, 120))}`;
   if (!res.ok) {
     // Their own wording for a video that genuinely has nothing to transcribe,
     // so it is not retried forever as though it were a transport failure.
     const reason = String(body.message || body.error || "");
     if (res.status === 404 || /no transcript|not found|unavailable/i.test(reason)) {
-      return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+      return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
     }
-    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
   }
   const content = Array.isArray(body.content) ? body.content : null;
-  if (!content) return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  if (!content) return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
 
   const segments = [];
   for (const cue of content) {
@@ -5157,7 +5159,7 @@ async function ytProviderSupadata(env, videoId) {
       text,
     });
   }
-  if (!segments.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+  if (!segments.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
   segments.sort((a, b) => a.start - b.start);
   segments.forEach((s, i) => {
     s.index = i;
@@ -5189,21 +5191,27 @@ async function ytProviderKeyless(env, videoId) {
       headers: { Accept: "text/markdown, text/plain;q=0.9, */*;q=0.8", "User-Agent": YT_UA },
     });
     body = await res.text().catch(() => "");
-  } catch {
-    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  } catch (err) {
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail: `keyless threw: ${String((err && err.message) || err)}` };
   }
+  // What came back, in a form that can be read from the API response. No
+  // secrets pass through here — it is our own upstream's status line and the
+  // opening of its body — and without it a production failure is a guess.
+  const detail =
+    `keyless ${res.status} ${String(res.headers.get("content-type") || "")} ` +
+    `${body.length}b ${JSON.stringify(String(body).slice(0, 120))}`;
   if (!res.ok) {
     // It answers 404 with "Reason: {"error":"YouTube: ..."}" for both a missing
     // video and one with captions turned off. Only the second is permanent.
     const reason = /Reason:\s*(.*)/.exec(body || "");
-    const detail = reason ? reason[1] : "";
-    if (/no transcript|captions? (are )?disabled|no captions/i.test(detail)) {
-      return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+    const reasonText = reason ? reason[1] : "";
+    if (/no transcript|captions? (are )?disabled|no captions/i.test(reasonText)) {
+      return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
     }
-    if (/unavailable|private|removed|does not exist/i.test(detail)) {
-      return { ok: false, code: "UNAVAILABLE", error: YT_MESSAGES.UNAVAILABLE };
+    if (/unavailable|private|removed|does not exist/i.test(reasonText)) {
+      return { ok: false, code: "UNAVAILABLE", error: YT_MESSAGES.UNAVAILABLE, detail };
     }
-    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
   }
 
   const title = (/^#\s*Transcript:\s*(.+)$/m.exec(body) || [, ""])[1].trim();
@@ -5227,7 +5235,7 @@ async function ytProviderKeyless(env, videoId) {
   // tells the user to stop trying.
   const start = body.indexOf("## Transcript");
   if (start === -1 || !/^#\s*Transcript/m.test(body)) {
-    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+    return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
   }
   const transcript = body.slice(start + "## Transcript".length);
   const raw = [];
@@ -5242,7 +5250,7 @@ async function ytProviderKeyless(env, videoId) {
     if (!text) continue;
     raw.push({ start: at, text });
   }
-  if (!raw.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS };
+  if (!raw.length) return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
 
   raw.sort((a, b) => a.start - b.start);
   const segments = raw.map((row, i) => ({
@@ -5271,6 +5279,7 @@ async function fetchYoutubeTranscript(env, videoId) {
       : [ytProviderSupadata, ytProviderKeyless];
 
   let best = null;
+  const tried = [];
   for (const provider of chain) {
     let out;
     try {
@@ -5283,9 +5292,16 @@ async function fetchYoutubeTranscript(env, videoId) {
     // A live stream is the one answer worth stopping on: no provider can
     // transcribe it, and asking the next one just spends another request.
     if (out.code === "IS_LIVE") return out;
+    // (falls through to record what this provider said)
+    tried.push(out.detail || out.code);
     if (!best || (YT_ERROR_RANK[out.code] || 0) > (YT_ERROR_RANK[best.code] || 0)) best = out;
   }
-  return best || { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR };
+  // Every provider's answer, not just the winning error: with the chain, "could
+  // not reach YouTube" alone doesn't say WHICH hop failed or how, and that is
+  // the difference between a retry and a configuration change.
+  const detail = tried.join(" | ");
+  if (best) return { ...best, detail };
+  return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
 }
 
 /* ---------------------- transcripts: D1 storage layer ---------------------- */
@@ -5887,11 +5903,11 @@ async function createYoutubeTranscript(env, owner, input, opts = {}) {
       // segments, so putting the status back restores it exactly as it was.
       await ytUpdateRow(env, id, { status: "completed", error: null, updated_at: nowIso() });
       const kept = await ytRowById(env, id);
-      return { ok: true, row: kept || existing, refreshFailed: true, code: result.code, error: result.error };
+      return { ok: true, row: kept || existing, refreshFailed: true, code: result.code, error: result.error, detail: result.detail };
     }
     await ytUpdateRow(env, id, { status: "failed", error: result.error || YT_MESSAGES.UPSTREAM_ERROR, updated_at: nowIso() });
     const row = await ytRowById(env, id);
-    return { ok: true, row: row || null, failed: true, code: result.code, error: result.error };
+    return { ok: true, row: row || null, failed: true, code: result.code, error: result.error, detail: result.detail };
   }
 
   // The row can still have been deleted while this request was fetching — a
@@ -6011,6 +6027,9 @@ async function handleTranscriptCreate(request, env) {
   // A forced refresh that failed deliberately keeps the old transcript, which
   // would otherwise come back as a plain 202 — indistinguishable from freshly
   // fetched captions. Say so, so the caller knows what it is holding.
+  // Not stored on the row — the row keeps the short human message. This is for
+  // whoever is looking at why it failed right now.
+  if (result.detail) payload.detail = result.detail;
   if (result.refreshFailed) {
     payload.refresh_failed = true;
     payload.refresh_error = result.error || YT_MESSAGES.UPSTREAM_ERROR;
