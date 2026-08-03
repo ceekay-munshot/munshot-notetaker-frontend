@@ -16,13 +16,30 @@ import { decodeHostToken, isExpired } from '../lib/hostToken'
 export type AuthState =
   | { status: 'loading' }
   | { status: 'anon'; codeRequired: boolean }
-  | { status: 'authed'; email: string; isAdmin: boolean; hostManaged: boolean }
+  | {
+      status: 'authed'
+      email: string
+      isAdmin: boolean
+      hostManaged: boolean
+      /** Organisation id from the host token. Carried for visibility only —
+       *  nothing in the app or the Worker scopes anything by it. */
+      orgId: string | null
+      /** Why the host JWT could not be exchanged for a Worker session cookie,
+       *  or null when there was nothing to exchange / it succeeded. NON-NULL
+       *  MEANS THE UI IS SIGNED IN BUT THE API IS NOT: every /api/* call will
+       *  401, so the dashboard would otherwise render empty with no explanation.
+       *  Surfaced by <SessionNotice>. */
+      hostSessionError: string | null
+    }
 
 interface AuthApi {
   state: AuthState
   signIn: (email: string, password: string) => Promise<void>
   signUp: (email: string, password: string, code?: string) => Promise<void>
   signOut: () => Promise<void>
+  /** Re-attempt a failed host-token exchange (the failed token is otherwise
+   *  remembered and not retried, so nothing would recover on its own). */
+  retryHostSession: () => void
 }
 
 const Ctx = createContext<AuthApi | null>(null)
@@ -50,12 +67,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const loggedTokenRef = useRef(false)
   const exchangedTokenRef = useRef<string | null>(null)
   const hostManagedRef = useRef(false)
+  const hostSessionErrorRef = useRef<string | null>(null)
+  const [retryTick, setRetryTick] = useState(0)
 
   const refresh = useCallback(async () => {
     try {
       const me = await api.getMe()
       if (me.authenticated) {
-        setState({ status: 'authed', email: me.email || '', isAdmin: !!me.isAdmin, hostManaged: false })
+        setState({
+          status: 'authed',
+          email: me.email || '',
+          isAdmin: !!me.isAdmin,
+          hostManaged: false,
+          orgId: me.orgId ?? null,
+          hostSessionError: null,
+        })
       } else {
         setState({ status: 'anon', codeRequired: !!me.codeRequired })
       }
@@ -64,6 +90,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } finally {
       resolvedOnceRef.current = true
     }
+  }, [])
+
+  const retryHostSession = useCallback(() => {
+    exchangedTokenRef.current = null
+    setRetryTick((n) => n + 1)
   }, [])
 
   useEffect(() => {
@@ -83,14 +114,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // calls succeed from inside the host iframe (see api.hostLogin / the
         // Worker's handleHostLogin — the token's signature isn't verified
         // there either; see the caveat on that route). Only once per distinct
-        // token. A failed exchange still lets the UI proceed — data calls
-        // will 401 and the app's existing empty-state handling covers it,
-        // same as a slow/failed /api/me probe today.
+        // token.
+        //
+        // A failed exchange still lets the UI proceed — but it is NOT harmless
+        // and must not be swallowed: without the cookie every /api/* call 401s,
+        // so the dashboard renders signed-in and completely empty (no meetings,
+        // no search, no summaries) with nothing on screen to say why. Keep the
+        // reason so <SessionNotice> can state it, and so retryHostSession() has
+        // something to clear.
+        // Held in a ref, not read off `state`: this effect must not depend on
+        // the state it sets, or every resolution would re-trigger it.
         if (exchangedTokenRef.current !== session.token) {
           exchangedTokenRef.current = session.token
           try {
             await api.hostLogin(session.token)
+            hostSessionErrorRef.current = null
           } catch (err) {
+            hostSessionErrorRef.current =
+              err instanceof api.ApiError ? err.message : 'The Munshot host session could not be established.'
             console.error('[dashboard] host session exchange failed', err)
           }
         }
@@ -103,12 +144,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           email: claims.email ?? session.email ?? '',
           isAdmin: false,
           hostManaged: true,
+          orgId: claims.orgId ?? session.orgId ?? null,
+          hostSessionError: hostSessionErrorRef.current,
         })
         return
       }
 
       loggedTokenRef.current = false
       exchangedTokenRef.current = null
+      hostSessionErrorRef.current = null
 
       // The host token disappeared after we'd established a host session
       // (a host-side logout) — clear the Worker's own cookie too, so a
@@ -141,7 +185,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       cancelled = true
       if (timer) clearTimeout(timer)
     }
-  }, [session.token, session.email, refresh])
+  }, [session.token, session.email, session.orgId, refresh, retryTick])
 
   const signIn = useCallback(
     async (email: string, password: string) => {
@@ -168,7 +212,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, [refresh])
 
-  return <Ctx.Provider value={{ state, signIn, signUp, signOut }}>{children}</Ctx.Provider>
+  return (
+    <Ctx.Provider value={{ state, signIn, signUp, signOut, retryHostSession }}>{children}</Ctx.Provider>
+  )
 }
 
 export function useAuth(): AuthApi {

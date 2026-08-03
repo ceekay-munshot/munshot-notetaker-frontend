@@ -1,4 +1,11 @@
 import { bedrockModelConfig, bedrockChat, bedrockJson } from "./bedrock.js";
+import {
+  EMAIL_CLAIMS,
+  claimNames,
+  decodeJwtPayload,
+  readEmailClaim,
+  readOrgIdClaim,
+} from "../src/lib/hostClaims.js";
 
 // Munshot Notetaker — Cloudflare Worker
 // - KV-backed logins (one user = one `user:<email>` key)
@@ -108,6 +115,7 @@ export default {
       }
       if (method === "GET" && pathname === "/api/tracking/directory") return handleTrackingDirectory(request, env);
       if (method === "GET" && pathname === "/api/debug/meetings-schema") return handleDebugMeetingsSchema(request, env);
+      if (method === "GET" && pathname === "/api/debug/whoami") return handleWhoami(request, env);
       if (method === "GET" && pathname === "/api/tracking") return handleGetTracking(request, env);
       if (method === "POST" && pathname === "/api/tracking") return handleSaveTracking(request, env);
       if (method === "POST" && pathname === "/api/weekly/tracking") return handleWeeklyTracking(request, env);
@@ -168,6 +176,9 @@ async function handleMe(request, env) {
     authenticated: true,
     email: session.identity,
     isAdmin: !!session.isAdmin,
+    // Carried purely so the address and org this session is actually keyed on
+    // are observable from the client. Nothing authorizes on orgId.
+    orgId: session.orgId || null,
     codeRequired: !!env.SIGNUP_CODE,
   });
 }
@@ -278,31 +289,38 @@ async function handleLogin(request, env) {
 // payload.
 async function handleHostLogin(request, env) {
   const body = await request.json().catch(() => ({}));
-  const claims = decodeJwtPayloadUnverified(body.token);
-  if (!claims || !isValidEmail(String(claims.email || ""))) {
-    return json({ error: "Invalid host token" }, 400);
+  const claims = decodeJwtPayload(body.token);
+  if (!claims) {
+    return json({ error: "Host token isn't a readable JWT", code: "TOKEN_UNREADABLE" }, 400);
+  }
+
+  // Read the email through the SHARED reader (src/lib/hostClaims.js), so the
+  // address this mints a session for is byte-for-byte the one the UI decided to
+  // display. When no claim carries a usable address, say so specifically and
+  // name the claims the token DID carry — a generic "Invalid host token" here is
+  // what turned this failure into an unexplained empty dashboard, since the SPA
+  // proceeds without a cookie and every later call just 401s. Claim NAMES only,
+  // never values.
+  const rawEmail = readEmailClaim(claims);
+  if (!rawEmail) {
+    return json(
+      {
+        error: "Host token carries no usable email claim",
+        code: "NO_EMAIL_CLAIM",
+        lookedFor: [...EMAIL_CLAIMS, "sub"],
+        claimsSeen: claimNames(claims),
+      },
+      400,
+    );
   }
   if (typeof claims.exp === "number" && Date.now() >= claims.exp * 1000) {
-    return json({ error: "Host token expired" }, 401);
+    return json({ error: "Host token expired", code: "TOKEN_EXPIRED" }, 401);
   }
 
-  const email = normalizeEmail(claims.email);
-  const cookie = await createSession(env, email);
-  return json({ ok: true, email }, 200, { "Set-Cookie": cookie });
-}
-
-// Decodes a JWT payload WITHOUT verifying its signature. Only handleHostLogin
-// uses this — see the security caveat there.
-function decodeJwtPayloadUnverified(token) {
-  const parts = String(token || "").split(".");
-  if (parts.length !== 3) return null;
-  try {
-    const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-    const padded = base64 + "=".repeat((4 - (base64.length % 4)) % 4);
-    return JSON.parse(atob(padded));
-  } catch {
-    return null;
-  }
+  const email = normalizeEmail(rawEmail);
+  const orgId = readOrgIdClaim(claims);
+  const cookie = await createSession(env, email, orgId);
+  return json({ ok: true, email, orgId }, 200, { "Set-Cookie": cookie });
 }
 
 // KV key holding a pending password-reset code for an email (hashed, TTL'd).
@@ -835,6 +853,155 @@ async function handleDebugMeetingsSchema(request, env) {
   }
   out.resolvedNames = await d1MeetingNames(env, out.sampleTranscriptionMeetingIds);
   return json(out);
+}
+
+// GET /api/debug/whoami — answers "why does this account see no meetings?" for
+// whoever is calling, without needing D1 console access.
+//
+// Meeting visibility is decided by ONE thing: exact equality between the
+// session's email and an owner_email row (meeting_owners, or legacy
+// transcriptions.owner_email) — see handleTranscripts. Nothing is scoped by
+// orgId. So when a user who was demonstrably in a meeting sees nothing, the
+// answer is almost always that this session is keyed to a different string than
+// the one the meeting is filed under: a work address vs a personal one, or a
+// Gmail alias (normalizeEmail only trims and lower-cases, so "a.b@gmail.com",
+// "ab+x@gmail.com" and "ab@gmail.com" are three different owners here).
+//
+// This reports the session's resolved identity, how many meetings each branch
+// of the visibility rule matches, and any NEAR-MISS owner addresses — which is
+// what turns "I see nothing" into "my meetings are under my other address".
+// Near-miss addresses are ALWAYS masked: enough to recognise your own address
+// or your own domain, never enough to enumerate the directory. (Admins take the
+// early return below and have /api/admin/users for the unmasked list.)
+async function handleWhoami(request, env) {
+  const session = await getSession(request, env);
+  if (!session) return json({ error: "Not authenticated" }, 401);
+
+  const email = normalizeEmail(session.identity);
+  const out = {
+    email,
+    orgId: session.orgId || null,
+    isAdmin: !!session.isAdmin,
+    // Nothing in this Worker filters on orgId; it is reported so an "is it an
+    // org mismatch?" question is answerable from data rather than from source.
+    orgScopingEnabled: false,
+    meetings: { viaMeetingOwners: null, viaLegacyOwnerEmail: null, visible: null },
+    similarOwners: [],
+    verdict: "",
+  };
+
+  if (!env.DB) {
+    out.verdict = "Transcripts database isn't connected, so no meeting can load for anyone.";
+    return json(out);
+  }
+  if (session.isAdmin) {
+    out.verdict = "Admin session — every meeting is visible regardless of owner_email.";
+    return json(out);
+  }
+
+  const countOf = async (sql) => {
+    try {
+      const res = await env.DB.prepare(sql).bind(email).all();
+      return Number((res.results && res.results[0] && res.results[0].n) || 0);
+    } catch {
+      return null; // table not present yet (e.g. meeting_owners) — report as unknown, not zero
+    }
+  };
+
+  out.meetings.viaMeetingOwners = await countOf(
+    "SELECT COUNT(DISTINCT meeting_id) AS n FROM meeting_owners WHERE owner_email = ?1"
+  );
+  out.meetings.viaLegacyOwnerEmail = await countOf(
+    "SELECT COUNT(DISTINCT meeting_id) AS n FROM transcriptions WHERE owner_email = ?1"
+  );
+  out.meetings.visible = await countOf(
+    "SELECT COUNT(DISTINCT meeting_id) AS n FROM transcriptions " +
+    "WHERE meeting_id IN (SELECT meeting_id FROM meeting_owners WHERE owner_email = ?1) " +
+    "OR owner_email = ?1"
+  );
+
+  // null (not 0) means the query failed — meeting_owners may not exist yet.
+  // "Couldn't read it" and "it's empty" lead to opposite conclusions, so never
+  // let the first read as the second.
+  if (out.meetings.visible === null) {
+    out.verdict =
+      "Couldn't read the transcripts tables, so visibility can't be determined. " +
+      "This is a backend/schema problem, not an account one.";
+    return json(out);
+  }
+  if (out.meetings.visible > 0) {
+    out.verdict = `This session can see ${out.meetings.visible} meeting(s).`;
+    return json(out);
+  }
+
+  // Nothing visible — look for an owner address this one was probably meant to be.
+  const near = await findSimilarOwners(env, email, 10);
+  out.similarOwners = near.map(maskEmail);
+  out.verdict = near.length
+    ? `No meetings are filed under "${email}", but ${near.length} similar address(es) do own meetings. ` +
+      "This session is most likely keyed to a different address than the calendar invite used."
+    : `No meetings are filed under "${email}" via meeting_owners or legacy owner_email. ` +
+      "Being a participant is not enough — the backend must have mirrored this exact address into meeting_owners.";
+  return json(out);
+}
+
+/** Owner addresses that look like they could be the caller's: same domain, or
+ *  the same local part once Gmail-style dots/+tags are folded away. Bounded so a
+ *  large directory can't blow the Worker's CPU/subrequest budget. */
+async function findSimilarOwners(env, email, limit) {
+  let rows = [];
+  try {
+    const res = await env.DB.prepare(
+      "SELECT DISTINCT owner_email FROM meeting_owners WHERE owner_email IS NOT NULL AND owner_email != '' " +
+      "UNION SELECT DISTINCT owner_email FROM transcriptions WHERE owner_email IS NOT NULL AND owner_email != '' " +
+      "LIMIT 2000"
+    ).all();
+    rows = (res && res.results) || [];
+  } catch {
+    return [];
+  }
+
+  const domain = emailDomain(email);
+  const localKey = emailLocalKey(email);
+  const out = [];
+  const seen = new Set();
+  for (const row of rows) {
+    const candidate = normalizeEmail(row && row.owner_email);
+    if (!candidate || candidate === email || seen.has(candidate)) continue;
+    if (emailLocalKey(candidate) === localKey || emailDomain(candidate) === domain) {
+      seen.add(candidate);
+      out.push(candidate);
+      if (out.length >= limit) break;
+    }
+  }
+  return out;
+}
+
+function emailDomain(email) {
+  const at = String(email || "").indexOf("@");
+  return at < 0 ? "" : String(email).slice(at + 1);
+}
+
+/** Local part with +tags and dots folded away — "n.v.az+work@x" → "nvaz". Used
+ *  ONLY to spot near-misses for diagnostics; visibility itself stays exact-match. */
+function emailLocalKey(email) {
+  const at = String(email || "").indexOf("@");
+  const local = at < 0 ? String(email || "") : String(email).slice(0, at);
+  return local.split("+")[0].replace(/\./g, "");
+}
+
+/** "naval@munshot.com" → "n***l@munshot.com". Keeps the domain (that is the
+ *  diagnostic signal) and just enough of the local part to recognise your own. */
+function maskEmail(email) {
+  const at = String(email || "").indexOf("@");
+  if (at < 1) return "***";
+  const local = String(email).slice(0, at);
+  const domain = String(email).slice(at);
+  if (local.length === 1) return `${local}${domain}`;
+  const head = local[0];
+  const tail = local.length > 2 ? local[local.length - 1] : "";
+  const stars = "*".repeat(Math.max(1, local.length - (tail ? 2 : 1)));
+  return `${head}${stars}${tail}${domain}`;
 }
 
 // Fetches the real title for the meetings in these rows, as a { meeting_id: title }
@@ -6674,9 +6841,14 @@ function adminUsername(env) {
   return env.ADMIN_USERNAME || "ADMIN";
 }
 
-async function createSession(env, email) {
+// Stores the session as the bare email string (as it always has, which keeps KV
+// values human-debuggable) unless there is an orgId to carry, in which case it
+// stores {email, orgId}. Both shapes are read back by getSession; the JSON form
+// never carries an `admin` key, so it can't be mistaken for an admin session.
+async function createSession(env, email, orgId) {
   const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, "");
-  await env.KV.put(`session:${token}`, email, { expirationTtl: SESSION_TTL });
+  const value = orgId ? JSON.stringify({ email, orgId: String(orgId) }) : email;
+  await env.KV.put(`session:${token}`, value, { expirationTtl: SESSION_TTL });
   return sessionCookie(token);
 }
 
@@ -6686,10 +6858,13 @@ async function createAdminSession(env, name) {
   return sessionCookie(token);
 }
 
-// Resolves the current session to { isAdmin, identity }. Admin sessions are
-// stored as JSON ({admin:true,...}); user sessions are the plain email string.
-// A user's session value is always their own email, so it can never be parsed
-// into an admin marker.
+// Resolves the current session to { isAdmin, identity, orgId }. Admin sessions
+// are stored as JSON ({admin:true,...}); user sessions are either the plain
+// email string (password logins, and every session minted before host sessions
+// carried an orgId) or {email, orgId} from a host-token exchange. An email can
+// never contain '{', so a plain-string session is never parsed as JSON, and the
+// JSON user shape is only ever written by createSession — so neither form can
+// be coaxed into producing an admin marker.
 async function getSession(request, env) {
   const token = parseCookies(request)[COOKIE_NAME];
   if (!token) return null;
@@ -6698,12 +6873,15 @@ async function getSession(request, env) {
   if (value.charCodeAt(0) === 123 /* '{' */) {
     try {
       const o = JSON.parse(value);
-      if (o && o.admin) return { isAdmin: true, identity: o.name || "ADMIN" };
+      if (o && o.admin) return { isAdmin: true, identity: o.name || "ADMIN", orgId: null };
+      if (o && typeof o.email === "string" && o.email) {
+        return { isAdmin: false, identity: o.email, orgId: o.orgId ? String(o.orgId) : null };
+      }
     } catch {
       /* fall through to user */
     }
   }
-  return { isAdmin: false, identity: value };
+  return { isAdmin: false, identity: value, orgId: null };
 }
 
 // SameSite=None (which requires Secure) so the cookie still works when this
@@ -6839,6 +7017,16 @@ export {
   fuzzyScore,
   soundKey,
   openaiChat,
+  // Session identity (scripts/session-identity.test.mjs). Not "binding-free"
+  // like the rest of this list — createSession/getSession take an env and are
+  // exercised against a fake KV — but they are the pair that decides WHICH
+  // email every /api/* visibility check runs as, and they now have to read two
+  // stored shapes (bare email, and {email,orgId}) without ever letting one turn
+  // into an admin session. That invariant is worth pinning down in a test.
+  createSession,
+  getSession,
+  emailLocalKey,
+  maskEmail,
 };
 // CHAT_SYSTEM_PROMPT is deliberately NOT exported. A module Worker treats every
 // named export as a potential entrypoint, so workerd rejects one that isn't a
