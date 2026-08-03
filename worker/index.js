@@ -1,3 +1,5 @@
+import { bedrockModelConfig, bedrockChat, bedrockJson } from "./bedrock.js";
+
 // Munshot Notetaker — Cloudflare Worker
 // - KV-backed logins (one user = one `user:<email>` key)
 // - KV-backed sessions via HttpOnly cookie
@@ -1017,7 +1019,19 @@ const TRANSCRIPT_CAVEAT =
   "especially in proper nouns (people, companies, products, tools, clients): infer the most likely intended " +
   "spelling from context and use it consistently. Translate everything into clear, professional English.";
 
+// Every apiKey/model pair the handlers below resolve from OPENAI_API_KEY /
+// OPENAI_MODEL is routed through here before being handed to openaiChat /
+// openaiJson. LLM_PROVIDER defaults to "openai" — every existing deployment
+// is unaffected until someone sets it to "claude" — at which point the
+// returned `model` becomes the Bedrock marker object openaiChat/openaiJson
+// key off below, and `apiKey` becomes the temp_claude_token Worker secret.
+function withLlmProvider(env, apiKey, model) {
+  if ((env.LLM_PROVIDER || "openai") !== "claude") return { apiKey, model };
+  return { apiKey: env.temp_claude_token, model: bedrockModelConfig(env) };
+}
+
 async function openaiChat(apiKey, model, messages, maxTokens, temperature = 0.2) {
+  if (model && model.bedrock) return bedrockChat(apiKey, model, messages, maxTokens, temperature);
   const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
@@ -2029,7 +2043,7 @@ function handleVersion() {
 async function handleAiChat(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  let apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
   if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
 
@@ -2069,7 +2083,8 @@ async function handleAiChat(request, env) {
   const rows = (res && res.results) || [];
   if (!rows.length) return json({ error: "No transcript found for that meeting yet" }, 404);
 
-  const model = env.OPENAI_MODEL || "gpt-4o";
+  let model = env.OPENAI_MODEL || "gpt-4o";
+  ({ apiKey, model } = withLlmProvider(env, apiKey, model));
   // A summary request runs the richer multi-call pipeline (overview + decisions,
   // then detailed per-person notes) for far more depth than a single call.
   if (summarize) {
@@ -2179,7 +2194,7 @@ async function handleAiChat(request, env) {
       history,
       apiKey,
       model,
-      planModel: env.OPENAI_FAST_MODEL || model,
+      planModel: model && model.bedrock ? model : env.OPENAI_FAST_MODEL || model,
       title: meetingTitle,
       summary: cachedSummary,
     });
@@ -2188,27 +2203,35 @@ async function handleAiChat(request, env) {
   }
   const messages = built.messages;
 
-  let upstream;
-  try {
-    upstream = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-      // Low temperature: this is a question answered from evidence, not a piece
-      // of writing. The token budget is generous enough that a per-person recap
-      // (what the empty-chat seed asks for) can finish instead of being cut off
-      // mid-person, which the old 700 regularly did.
-      body: JSON.stringify({ model, messages, temperature: 0.2, max_tokens: 1600 }),
-    });
-  } catch (err) {
-    return json({ error: "Failed to reach the AI service", detail: String((err && err.message) || err) }, 502);
+  let reply;
+  if (model && model.bedrock) {
+    try {
+      reply = await bedrockChat(apiKey, model, messages, 1600, 0.2);
+    } catch (err) {
+      return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
+    }
+  } else {
+    let upstream;
+    try {
+      upstream = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        // Low temperature: this is a question answered from evidence, not a piece
+        // of writing. The token budget is generous enough that a per-person recap
+        // (what the empty-chat seed asks for) can finish instead of being cut off
+        // mid-person, which the old 700 regularly did.
+        body: JSON.stringify({ model, messages, temperature: 0.2, max_tokens: 1600 }),
+      });
+    } catch (err) {
+      return json({ error: "Failed to reach the AI service", detail: String((err && err.message) || err) }, 502);
+    }
+    const data = await upstream.json().catch(() => ({}));
+    if (!upstream.ok) {
+      const detail = (data && data.error && data.error.message) || `HTTP ${upstream.status}`;
+      return json({ error: "AI request failed", detail }, 502);
+    }
+    reply = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
   }
-  const data = await upstream.json().catch(() => ({}));
-  if (!upstream.ok) {
-    const detail = (data && data.error && data.error.message) || `HTTP ${upstream.status}`;
-    return json({ error: "AI request failed", detail }, 502);
-  }
-  const reply =
-    data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
   // `debug: true` returns everything the pipeline decided along the way — what
   // the question resolved to, what the readers found, exactly how much of the
   // transcript reached the model. It is the difference between "the answer looks
@@ -2289,7 +2312,7 @@ function buildMultiMeetingText(rows, maxChars = 42000) {
 async function handleWeeklyPeople(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  let apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
   if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
 
@@ -2353,7 +2376,8 @@ async function handleWeeklyPeople(request, env) {
     return json({ ok: true, people, cached: true });
   }
 
-  const model = env.OPENAI_MODEL || "gpt-4o";
+  let model = env.OPENAI_MODEL || "gpt-4o";
+  ({ apiKey, model } = withLlmProvider(env, apiKey, model));
   try {
     const priorItemsByName = {};
     for (const p of Object.values(state.peopleByKey)) {
@@ -2685,6 +2709,7 @@ function weeklyScopeEmail(session) {
 // returns the parsed object (or {} on unparseable output). Used by the weekly
 // synthesis, which needs structured overview / themes / questions back.
 async function openaiJson(apiKey, model, messages, maxTokens) {
+  if (model && model.bedrock) return bedrockJson(apiKey, model, messages, maxTokens);
   const upstream = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
@@ -2822,7 +2847,7 @@ async function synthesizeWeekly(sources, range, apiKey, model) {
 async function handleWeeklySummary(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  let apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
   if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
   if (!env.KV) return json({ error: "Storage is not connected yet" }, 503);
@@ -2835,6 +2860,8 @@ async function handleWeeklySummary(request, env) {
 
   const scopeEmail = weeklyScopeEmail(session);
   const cacheKey = weeklySummaryKey(scopeEmail, week);
+  let model = env.OPENAI_MODEL || "gpt-4o";
+  ({ apiKey, model } = withLlmProvider(env, apiKey, model));
 
   // Once a week's summary exists for this user it is served as-is — never
   // regenerated on a normal visit. Only an explicit Refresh (force) rebuilds it.
@@ -2854,7 +2881,7 @@ async function handleWeeklySummary(request, env) {
 
   let ai;
   try {
-    ai = await synthesizeWeekly(sources, range, apiKey, env.OPENAI_MODEL || "gpt-4o");
+    ai = await synthesizeWeekly(sources, range, apiKey, model);
   } catch (err) {
     return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
   }
@@ -3154,7 +3181,7 @@ async function buildWeeklyChatRequest({ transcripts, sources, master, history, a
 async function handleWeeklyChat(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  let apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
   if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
   if (!env.KV) return json({ error: "Storage is not connected yet" }, 503);
@@ -3172,7 +3199,8 @@ async function handleWeeklyChat(request, env) {
   } catch {
     /* master is optional extra grounding */
   }
-  const model = env.OPENAI_MODEL || "gpt-4o";
+  let model = env.OPENAI_MODEL || "gpt-4o";
+  ({ apiKey, model } = withLlmProvider(env, apiKey, model));
   // Transcripts are extra grounding on top of the summaries, so a load failure
   // degrades the answer rather than blocking it.
   let transcripts = [];
@@ -3203,7 +3231,7 @@ async function handleWeeklyChat(request, env) {
       history,
       apiKey,
       model,
-      planModel: env.OPENAI_FAST_MODEL || model,
+      planModel: model && model.bedrock ? model : env.OPENAI_FAST_MODEL || model,
     });
   } catch (err) {
     return json({ error: "AI request failed", detail: String((err && err.message) || err) }, 502);
@@ -3555,7 +3583,7 @@ async function rollupForPerson(env, name, prior, apiKey, model, now) {
 // the previous tick — this needs only an integer COUNT(*), never a parse of
 // created_at (whose exact format is owned by an external, unmirrored backend).
 async function runAutoSummaries(env) {
-  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  let apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey || !env.DB || !env.KV) return;
   if (!(await acquireLock(env, SUMMARY_LOCK_KEY))) return;
   try {
@@ -3590,7 +3618,8 @@ async function runAutoSummaries(env) {
     await env.KV.put(SUMMARY_SNAPSHOT_KEY, JSON.stringify(nextSnapshot));
     if (!settledUnsummarized.length) return;
 
-    const model = env.OPENAI_MODEL || "gpt-4o";
+    let model = env.OPENAI_MODEL || "gpt-4o";
+    ({ apiKey, model } = withLlmProvider(env, apiKey, model));
     for (const meetingId of settledUnsummarized.slice(0, AUTO_SUMMARY_BATCH)) {
       if (!(await withinDailyBudget(env, 1))) break;
       try {
@@ -3634,7 +3663,7 @@ async function runAutoSummaries(env) {
 // person's latest stored record — including ones skipped this tick by the
 // budget cap — so the external API never regresses to older data.
 async function runTrackingRollups(env) {
-  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  let apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey || !env.DB || !env.KV) return;
   const selection = await readTrackingSelection(env);
   if (!selection.names.length) return;
@@ -3661,7 +3690,8 @@ async function runTrackingRollups(env) {
     const throttleElapsed = now - (watermark.lastRegenAt || 0) >= TRACKING_REGEN_INTERVAL_MS;
     if (!dataChanged && !throttleElapsed) return;
 
-    const model = env.OPENAI_MODEL || "gpt-4o";
+    let model = env.OPENAI_MODEL || "gpt-4o";
+    ({ apiKey, model } = withLlmProvider(env, apiKey, model));
     for (const name of selection.names) {
       const slug = slugifyName(name);
       if (!slug) continue;
@@ -6521,7 +6551,7 @@ async function generateVideoSummary(text, apiKey, model, meta = {}) {
 async function handleVideoAi(request, env) {
   const session = await getSession(request, env);
   if (!session) return json({ error: "Not authenticated" }, 401);
-  const apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
+  let apiKey = env.OPENAI_API_KEY || env.OPEN_AI_API_KEY;
   if (!apiKey) return json({ error: "AI isn't configured (set the OPENAI_API_KEY secret)" }, 503);
   if (!env.DB) return json({ error: "Transcripts database is not connected yet" }, 503);
 
@@ -6535,7 +6565,8 @@ async function handleVideoAi(request, env) {
   if (!segments.length) return json({ error: "No transcript found for that video yet" }, 404);
   const transcript = ytTranscriptForModel(segments);
 
-  const model = env.OPENAI_MODEL || "gpt-4o";
+  let model = env.OPENAI_MODEL || "gpt-4o";
+  ({ apiKey, model } = withLlmProvider(env, apiKey, model));
 
   if (body.summarize) {
     const cacheKey = ytSummaryKey(row, transcript);
@@ -6602,7 +6633,7 @@ async function handleVideoAi(request, env) {
       history,
       apiKey,
       model,
-      planModel: env.OPENAI_FAST_MODEL || model,
+      planModel: model && model.bedrock ? model : env.OPENAI_FAST_MODEL || model,
       title: row.title || "",
       channel: row.channel || "",
       summary: cachedSummary,
