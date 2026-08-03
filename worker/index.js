@@ -4682,7 +4682,12 @@ const YT_MESSAGES = {
   // Not "try again shortly": retrying is exactly what will not help. The free
   // provider limits by IP, and this Worker shares its egress IPs with the rest
   // of Cloudflare, so that bucket is spent by strangers no matter what we do.
-  PROVIDER_LIMIT: "The transcript service is over its free limit here. An API key needs to be configured.",
+  PROVIDER_LIMIT: "The transcript service is over its free limit. A transcript API key needs to be configured.",
+  // Told apart from the above on purpose. Once a key IS set, "an API key needs
+  // to be configured" tells whoever reads it to do the thing they already did —
+  // and on the free tier this is the message they will see most.
+  PROVIDER_QUOTA: "The transcript service has used up its quota. The transcript API key needs more credit.",
+  PROVIDER_AUTH: "The transcript API key was rejected. It needs checking.",
 };
 
 // Where YouTube lives. Overridable only by an operator (a var, not user input) so
@@ -5174,8 +5179,13 @@ async function ytProviderSupadata(env, videoId) {
     if (res.status === 404 || /no transcript|not found|unavailable/i.test(reason)) {
       return { ok: false, code: "NO_CAPTIONS", error: YT_MESSAGES.NO_CAPTIONS, detail };
     }
-    if (res.status === 401 || res.status === 402 || res.status === 429 || /quota|limit|credit/i.test(reason)) {
-      return { ok: false, code: "PROVIDER_LIMIT", error: YT_MESSAGES.PROVIDER_LIMIT, detail };
+    // A rejected key and a spent one need different answers: one is a typo in
+    // the secret, the other is a plan that ran out.
+    if (res.status === 401 || res.status === 403 || /invalid|unauthor/i.test(reason)) {
+      return { ok: false, code: "PROVIDER_AUTH", error: YT_MESSAGES.PROVIDER_AUTH, detail };
+    }
+    if (res.status === 402 || res.status === 429 || /quota|limit|credit/i.test(reason)) {
+      return { ok: false, code: "PROVIDER_QUOTA", error: YT_MESSAGES.PROVIDER_QUOTA, detail };
     }
     return { ok: false, code: "UPSTREAM_ERROR", error: YT_MESSAGES.UPSTREAM_ERROR, detail };
   }
@@ -5321,10 +5331,14 @@ const YT_ERROR_RANK = {
   BAD_VIDEO_ID: 4,
   BOT_GATED: 1,
   UPSTREAM_ERROR: 1,
-  // Above the transport failures, below anything about the video: it says
+  // Above the transport failures, below anything about the video: they say
   // something true and actionable about us, but a provider that actually
-  // reached YouTube still knows better about the video itself.
+  // reached YouTube still knows better about the video itself. A configured
+  // key's own problem outranks the shared free tier being spent, because it is
+  // the one whoever set it up can actually do something about.
   PROVIDER_LIMIT: 2,
+  PROVIDER_QUOTA: 2.5,
+  PROVIDER_AUTH: 2.5,
 };
 
 async function fetchYoutubeTranscript(env, videoId) {

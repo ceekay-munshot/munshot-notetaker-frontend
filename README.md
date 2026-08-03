@@ -111,6 +111,11 @@ the transcript view and chat citations both point at timestamps.
 The keyless provider stays as the fallback because it costs nothing to try and
 does work from an IP that has not been exhausted.
 
+Three different things get three different messages, because they need three
+different responses: no key configured, a key that ran out of credit, and a key
+that was rejected. On a free tier the middle one is what people will see most,
+and telling them to configure a key they already configured helps nobody.
+
 Direct is **off** by default, and deliberately: we have measured that it fails
 here, so leaving it in the chain would spend a doomed request on every fetch,
 and a bot-gated reply reads as "video unavailable" — which would overwrite a
