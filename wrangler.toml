@@ -69,6 +69,15 @@ id = "759a21557c7d4e118296479f9b4c50a6"
 #                        `Authorization: Bearer <key>` (or `X-API-Key: <key>`);
 #                        the endpoint returns 503 until this is set.
 #
+#     LLM_PROVIDER       (optional var, not secret; defaults to "openai") set to
+#                        "claude" to route every AI call above through AWS
+#                        Bedrock instead (see worker/bedrock.js). OpenAI stays
+#                        the default for every deployment that doesn't set this.
+#     temp_claude_token  (required only when LLM_PROVIDER="claude") a Bedrock
+#                        bearer API key.
+#     BEDROCK_MODEL_ID   (optional, defaults to "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+#     BEDROCK_REGION     (optional, defaults to "us-east-1")
+#
 # The auto-summary + people-tracking cron passes (runAutoSummaries /
 # runTrackingRollups, wired into `scheduled` in worker/index.js) run OpenAI
 # calls every minute in the background. Each detailed summary alone fires
