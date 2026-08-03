@@ -7,13 +7,25 @@
 //
 //   • lead prose      — the opening classification sentence (no header)
 //   • a SECTION        — a lone **Section Title** (e.g. "Discussion by Person")
-//   • a titled block   — **Header** then prose paragraphs and/or "- " bullets,
+//   • a titled block   — a header then prose paragraphs and/or "- " bullets,
 //                        where the header is either a top-level section
 //                        ("Meeting Summary") or a sub-header (a person's name,
 //                        "For Neha:", "General Team Requirement")
 //
+// A header is written EITHER as a lone **Bold** line or as an ATX "## Heading".
+// The model emits both — it is writing Markdown, not our house dialect — and a
+// parser that knew only the bold form left the hashes on screen as literal text
+// ("## Dashboard Features Demonstrated"), because nothing downstream strips a
+// character the parser never claimed.
+//
 // Bullets may open with a bold thematic label — "- **Data Correction:** …" — which
 // we split out so renderers can weight the label without re-parsing Markdown.
+//
+// `nodes` keeps paragraphs, bullets and mid-block headings in the order they
+// were written. The older `paras`/`bullets` arrays are still exposed for the
+// export renderers, but they are two filtered passes over one block, so reading
+// them re-orders the content: every bullet lands after every paragraph, however
+// the author interleaved them. Prefer `nodes` (or `groupSummaryNodes`).
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** The top-level section titles — rendered a notch larger / with a rule, so the
@@ -40,12 +52,32 @@ export interface SummaryBullet {
   text: string
 }
 
+/** One line of a block, in the order it was written. */
+export type SummaryNode =
+  | { kind: 'para'; text: string }
+  | { kind: 'heading'; text: string; level: number | null }
+  /** `ordered` is true for "1." / "1)" markers, so a numbered list doesn't
+   *  render as anonymous dots and lose its sequence. */
+  | { kind: 'bullet'; text: string; ordered: boolean }
+
+/** Consecutive bullets folded into one list, ready to render. */
+export type SummaryGroup =
+  | { kind: 'para'; text: string }
+  | { kind: 'heading'; text: string; level: number | null }
+  | { kind: 'list'; ordered: boolean; items: string[] }
+
 export interface ParsedSummaryBlock {
-  /** The block's leading **Bold** header, if it has one. */
+  /** The block's leading header — a lone **Bold** line or an ATX "## Heading" —
+   *  with the markers removed, if it has one. */
   header: string | null
+  /** Hash count for an ATX header ("## X" → 2); null for a **Bold** header. */
+  headerLevel: number | null
   /** True when `header` is a top-level section (vs a person / owner sub-header). */
   isSection: boolean
-  /** Prose paragraph lines that aren't bullets (after any header). */
+  /** Everything after the header, in document order. */
+  nodes: SummaryNode[]
+  /** Non-bullet lines (after any header). Kept for the export renderers; see the
+   *  ordering caveat in the header comment — new code should read `nodes`. */
   paras: string[]
   /** Bullet lines with the list marker stripped — inline **bold** (incl. any
    *  leading "**Label:**") is left intact, so inline renderers bold it for free.
@@ -54,8 +86,29 @@ export interface ParsedSummaryBlock {
 }
 
 const BULLET_RE = /^([-*•]|\d+[.)])\s+/
+// "## Title", with the optional closing hashes ATX allows ("## Title ##"). The
+// space is required, so "#1 priority" stays prose.
+const ATX_RE = /^(#{1,6})\s+(.+?)\s*#*$/
+const BOLD_LINE_RE = /^\*\*(.+?)\*\*$/
 const isBulletLine = (l: string) => BULLET_RE.test(l)
 const stripBulletMarker = (l: string) => l.replace(BULLET_RE, '')
+
+/** A header line in either accepted spelling, or null. The returned text is
+ *  marker-free: renderers print it as-is, so a "## **Title**" that kept its
+ *  asterisks would show them literally. */
+function readHeadingLine(line: string): { text: string; level: number | null } | null {
+  const atx = ATX_RE.exec(line)
+  if (atx) {
+    const text = atx[2].trim().replace(BOLD_LINE_RE, '$1').trim()
+    return text ? { text, level: atx[1].length } : null
+  }
+  const bold = BOLD_LINE_RE.exec(line)
+  if (bold) {
+    const text = bold[1].trim()
+    return text ? { text, level: null } : null
+  }
+  return null
+}
 
 /** Pull a leading "**Label:**" (or "**Label** —") off a bullet into {label, text}. */
 export function splitBulletLabel(line: string): SummaryBullet {
@@ -75,17 +128,48 @@ export function parseSummaryBlock(block: string): ParsedSummaryBlock {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
-  const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
-  const header = headMatch ? headMatch[1].trim() : null
-  const rest = header ? lines.slice(1) : lines
-  const bullets = rest.filter(isBulletLine).map(stripBulletMarker)
-  const paras = rest.filter((l) => !isBulletLine(l))
+
+  // A bullet is checked first: "- ## not a heading" is a bullet whose text
+  // happens to start with hashes, not a heading.
+  const head = lines[0] && !isBulletLine(lines[0]) ? readHeadingLine(lines[0]) : null
+  const rest = head ? lines.slice(1) : lines
+
+  const nodes: SummaryNode[] = rest.map((line): SummaryNode => {
+    const marker = BULLET_RE.exec(line)
+    if (marker) {
+      return { kind: 'bullet', text: stripBulletMarker(line), ordered: /\d/.test(marker[1]) }
+    }
+    const heading = readHeadingLine(line)
+    return heading ? { kind: 'heading', ...heading } : { kind: 'para', text: line }
+  })
+
+  const header = head ? head.text : null
   return {
     header,
+    headerLevel: head ? head.level : null,
     isSection: header != null && SUMMARY_SECTION_TITLES.has(header),
-    paras,
-    bullets,
+    nodes,
+    // A mid-block heading lands in `paras` for the export renderers — as its
+    // text, never as raw "## text".
+    paras: nodes.filter((n) => n.kind !== 'bullet').map((n) => n.text),
+    bullets: nodes.filter((n) => n.kind === 'bullet').map((n) => n.text),
   }
+}
+
+/** Fold consecutive bullets of the same kind into one list, leaving paragraphs
+ *  and headings where they were. What a renderer actually wants to walk. */
+export function groupSummaryNodes(nodes: SummaryNode[]): SummaryGroup[] {
+  const out: SummaryGroup[] = []
+  for (const node of nodes) {
+    if (node.kind !== 'bullet') {
+      out.push(node)
+      continue
+    }
+    const last = out[out.length - 1]
+    if (last && last.kind === 'list' && last.ordered === node.ordered) last.items.push(node.text)
+    else out.push({ kind: 'list', ordered: node.ordered, items: [node.text] })
+  }
+  return out
 }
 
 /** Split a full summary (raw markdown or already-split blocks) into parsed blocks. */

@@ -3,17 +3,18 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Munshot Notetaker — a React dashboard (meetings intelligence) served by a Cloudflare Worker that handles auth, transcripts, scheduling, calendar, and the meeting assistant.",
+  "description": "Munshot Notetaker \u2014 a React dashboard (meetings intelligence) served by a Cloudflare Worker that handles auth, transcripts, scheduling, calendar, and the meeting assistant.",
   "scripts": {
+    "build": "tsc --noEmit && vite build",
+    "deploy": "npm run build && wrangler deploy",
     "dev": "vite",
     "dev:worker": "wrangler dev",
-    "build": "tsc --noEmit && vite build",
-    "typecheck": "tsc --noEmit",
-    "test": "npm run test:chat && npm run test:session",
-    "test:chat": "node scripts/chat-pipeline.test.mjs",
-    "test:session": "node scripts/session-identity.test.mjs",
     "preview": "vite preview",
-    "deploy": "npm run build && wrangler deploy"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run test:chat && npm run test:session && npm run test:format",
+    "test:chat": "node scripts/chat-pipeline.test.mjs",
+    "test:format": "node scripts/summary-format.test.mjs",
+    "test:session": "node scripts/session-identity.test.mjs"
   },
   "dependencies": {
     "html-to-image": "^1.11.13",

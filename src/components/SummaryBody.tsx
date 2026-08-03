@@ -1,7 +1,8 @@
 import { useMemo } from 'react'
+import type { ReactNode } from 'react'
 import { RichText } from './RichText'
 import { Icon } from './Icon'
-import { parseSummaryBlock } from '../lib/summaryFormat'
+import { groupSummaryNodes, parseSummaryBlock } from '../lib/summaryFormat'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // The two renderers for AI-written prose, shared by every surface that shows it
@@ -18,7 +19,7 @@ export function SummaryBody({ blocks, terms }: { blocks: string[]; terms: string
   return (
     <div className="space-y-4">
       {blocks.map((block, i) => {
-        const { header, isSection, paras, bullets } = parseSummaryBlock(block)
+        const { header, isSection, nodes } = parseSummaryBlock(block)
         const lead = i === 0
         return (
           <div key={i} className={isSection && i > 0 ? 'border-t border-outline-variant pt-4' : undefined}>
@@ -28,34 +29,61 @@ export function SummaryBody({ blocks, terms }: { blocks: string[]; terms: string
               ) : (
                 <h4 className="mb-1.5 mt-1 text-[15px] font-semibold text-on-surface">{header}</h4>
               ))}
-            {paras.map((p, j) => (
-              <p
-                key={`p${j}`}
-                className={
-                  lead
-                    ? 'text-body-lg leading-relaxed text-on-surface'
-                    : 'text-body-md leading-relaxed text-on-surface-variant'
-                }
-              >
-                <RichText text={p} terms={terms} />
-              </p>
-            ))}
-            {bullets.length > 0 && (
-              <ul className="mt-1.5 space-y-1.5">
-                {bullets.map((b, j) => (
-                  <li key={`b${j}`} className="flex gap-2.5 text-body-md leading-relaxed text-on-surface-variant">
-                    <span className="mt-[9px] h-1.5 w-1.5 shrink-0 rounded-full bg-primary/50" />
-                    <span className="min-w-0">
-                      <RichText text={b} terms={terms} />
-                    </span>
-                  </li>
-                ))}
-              </ul>
+            {groupSummaryNodes(nodes).map((group, j) =>
+              group.kind === 'heading' ? (
+                <h4 key={j} className="mb-1.5 mt-3 text-[15px] font-semibold text-on-surface">
+                  {group.text}
+                </h4>
+              ) : group.kind === 'para' ? (
+                <p
+                  key={j}
+                  className={
+                    lead
+                      ? 'text-body-lg leading-relaxed text-on-surface'
+                      : 'text-body-md leading-relaxed text-on-surface-variant'
+                  }
+                >
+                  <RichText text={group.text} terms={terms} />
+                </p>
+              ) : (
+                <List key={j} ordered={group.ordered} className="mt-1.5 space-y-1.5">
+                  {group.items.map((b, n) => (
+                    <li key={n} className="flex gap-2.5 text-body-md leading-relaxed text-on-surface-variant">
+                      <Marker ordered={group.ordered} index={n} className="mt-[9px] h-1.5 w-1.5 bg-primary/50" />
+                      <span className="min-w-0">
+                        <RichText text={b} terms={terms} />
+                      </span>
+                    </li>
+                  ))}
+                </List>
+              ),
             )}
           </div>
         )
       })}
     </div>
+  )
+}
+
+/** <ol> when the source was numbered, <ul> otherwise — so a ranked or sequenced
+ *  list doesn't quietly become an unordered one. */
+function List({
+  ordered,
+  className,
+  children,
+}: {
+  ordered: boolean
+  className?: string
+  children: ReactNode
+}) {
+  return ordered ? <ol className={className}>{children}</ol> : <ul className={className}>{children}</ul>
+}
+
+/** The dot, or the original number when the list was numbered. */
+function Marker({ ordered, index, className }: { ordered: boolean; index: number; className?: string }) {
+  if (!ordered) return <span className={`shrink-0 rounded-full ${className ?? ''}`} />
+  return (
+    <span className="mt-px shrink-0 text-[13px] font-semibold tabular-nums text-primary/70">{index + 1}.</span>
   )
 }
 
@@ -116,19 +144,19 @@ function AnswerLine({ text, terms, onCite }: { text: string; terms: string[]; on
   )
 }
 
-/** A chat answer — the same light markdown (bold **headers**, "- " bullets,
- *  paragraphs) at a compact, uniform chat size. */
+/** A chat answer — the same light markdown as the summaries (**bold** or "## "
+ *  headers, "- " and "1." lists, paragraphs) at a compact, uniform chat size.
+ *  Parsed by the shared parseSummaryBlock rather than a private copy, so the
+ *  chat can't fall behind on syntax the summary already handles. */
 export function ChatAnswer({
   text,
-  terms,
+  terms = [],
   onCite,
 }: {
   text: string
-  terms: string[]
+  terms?: string[]
   onCite?: (sec: number) => void
 }) {
-  const isBullet = (l: string) => /^([-*•]|\d+[.)])\s+/.test(l)
-  const stripBullet = (l: string) => l.replace(/^([-*•]|\d+[.)])\s+/, '')
   const blocks = text
     .split(/\n{2,}/)
     .map((b) => b.trim())
@@ -137,34 +165,31 @@ export function ChatAnswer({
   return (
     <div className="space-y-2.5 text-[14px] leading-relaxed text-on-surface">
       {blocks.map((block, i) => {
-        const lines = block
-          .split('\n')
-          .map((l) => l.trim())
-          .filter(Boolean)
-        const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
-        const header = headMatch ? headMatch[1] : null
-        const rest = header ? lines.slice(1) : lines
-        const bullets = rest.filter(isBullet).map(stripBullet)
-        const paras = rest.filter((l) => !isBullet(l))
+        const { header, nodes } = parseSummaryBlock(block)
         return (
           <div key={i}>
             {header && <p className="mb-1 font-semibold text-on-surface">{header}</p>}
-            {paras.map((p, j) => (
-              <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
-                <AnswerLine text={p} terms={terms} onCite={onCite} />
-              </p>
-            ))}
-            {bullets.length > 0 && (
-              <ul className="mt-1 space-y-1">
-                {bullets.map((b, j) => (
-                  <li key={`b${j}`} className="flex gap-2">
-                    <span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
-                    <span className="min-w-0">
-                      <AnswerLine text={b} terms={terms} onCite={onCite} />
-                    </span>
-                  </li>
-                ))}
-              </ul>
+            {groupSummaryNodes(nodes).map((group, j) =>
+              group.kind === 'heading' ? (
+                <p key={j} className={`font-semibold text-on-surface ${j ? 'mb-1 mt-2.5' : 'mb-1'}`}>
+                  {group.text}
+                </p>
+              ) : group.kind === 'para' ? (
+                <p key={j} className={j ? 'mt-1.5' : ''}>
+                  <AnswerLine text={group.text} terms={terms} onCite={onCite} />
+                </p>
+              ) : (
+                <List key={j} ordered={group.ordered} className="mt-1 space-y-1">
+                  {group.items.map((b, n) => (
+                    <li key={n} className="flex gap-2">
+                      <Marker ordered={group.ordered} index={n} className="mt-[9px] h-1 w-1 bg-primary/60" />
+                      <span className="min-w-0">
+                        <AnswerLine text={b} terms={terms} onCite={onCite} />
+                      </span>
+                    </li>
+                  ))}
+                </List>
+              ),
             )}
           </div>
         )
