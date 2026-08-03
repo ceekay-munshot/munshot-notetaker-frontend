@@ -62,7 +62,34 @@ export interface Me {
   authenticated: boolean
   email?: string
   isAdmin?: boolean
+  /** Organisation id carried on the session (host-token logins only). Reported
+   *  for visibility — nothing is scoped by it. */
+  orgId?: string | null
   codeRequired?: boolean
+}
+
+/** What the Worker says about why this session can or can't see meetings.
+ *  See the Worker's handleWhoami. */
+export interface Whoami {
+  email: string
+  orgId: string | null
+  isAdmin: boolean
+  orgScopingEnabled: boolean
+  meetings: {
+    viaMeetingOwners: number | null
+    viaLegacyOwnerEmail: number | null
+    visible: number | null
+  }
+  /** Masked near-miss owner addresses (e.g. "n***l@munshot.com"). */
+  similarOwners: string[]
+  verdict: string
+}
+
+/** Diagnoses an empty dashboard: the address this session is actually keyed on,
+ *  how many meetings each branch of the visibility rule matches, and any
+ *  near-miss owner addresses. */
+export function whoami(): Promise<Whoami> {
+  return request<Whoami>('/api/debug/whoami')
 }
 
 /** Probe the session. Returns the signed-in user or an unauthenticated marker
@@ -90,7 +117,7 @@ export function logout(): Promise<{ ok: boolean }> {
  *  calls made from inside the host iframe are authenticated. See the security
  *  caveat on the Worker's handleHostLogin — the token's signature isn't
  *  verified server-side. */
-export function hostLogin(token: string): Promise<{ ok: boolean; email?: string }> {
+export function hostLogin(token: string): Promise<{ ok: boolean; email?: string; orgId?: string | null }> {
   return request('/api/host-login', { method: 'POST', body: JSON.stringify({ token }) })
 }
 

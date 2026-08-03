@@ -4,6 +4,7 @@ import { useAppData } from '../store/AppData'
 import { useDashboardCapture } from '../hooks/useDashboardCapture'
 import { MobileSidebar, Sidebar } from './Sidebar'
 import { TopBar } from './TopBar'
+import { SessionNotice } from './SessionNotice'
 import { Icon } from './Icon'
 
 export function Layout() {
@@ -37,7 +38,19 @@ export function Layout() {
       <div className="flex min-h-screen flex-col md:ml-64">
         <TopBar menuOpen={menuOpen} onMenu={() => setMenuOpen(true)} />
         <main id="dashboard-main" data-dashboard-capture-root="true" className="flex-1 px-lg pb-lg pt-lg">
-          <div className="mx-auto max-w-container">{loading ? <LoadingState /> : <Outlet />}</div>
+          <div className="mx-auto max-w-container">
+            {loading ? (
+              <LoadingState />
+            ) : (
+              <>
+                {/* Above the routed page, not inside it: a broken session empties
+                    every view (meetings, search, weekly), so the explanation has
+                    to be visible from whichever one the user landed on. */}
+                <SessionNotice />
+                <Outlet />
+              </>
+            )}
+          </div>
         </main>
       </div>
     </div>

@@ -23,6 +23,10 @@ interface AppData {
   isAdmin: boolean
   /** True once an AI summary request came back "no key configured" (503). */
   needsApiKey: boolean
+  /** Why the last meetings load failed, or null when it succeeded (including
+   *  when it succeeded and returned nothing). The literal 'not_authed' means the
+   *  session cookie is missing/invalid — see <SessionNotice>. */
+  loadError: string | null
   // selectors
   podcastById: (id: string) => Podcast | undefined
   episodeById: (id: string) => Episode | undefined
@@ -107,6 +111,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
   const [episodes, setEpisodes] = useState<Episode[]>([])
   const [weekly] = useState<WeeklySummary | null>(null)
   const [needsApiKey, setNeedsApiKey] = useState(false)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [schedules, setSchedules] = useState<api.Schedule[]>([])
   const [calendarEvents, setCalendarEvents] = useState<api.CalendarEvent[]>([])
   const [cancelledEvents, setCancelledEvents] = useState<api.CalendarEvent[]>([])
@@ -134,9 +139,20 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
         })
       })
       setPodcasts(pods)
-    } catch {
-      // Transient/empty backend (e.g. no transcripts yet) — show an empty
-      // dashboard rather than crashing; the notetaker controls still work.
+      setLoadError(null)
+    } catch (err) {
+      // Still show an empty dashboard rather than crashing — the notetaker
+      // controls keep working. But RECORD why: a 401 (no valid session cookie)
+      // used to be indistinguishable from "no transcripts yet", which is what
+      // let a signed-in user with a broken session stare at an empty dashboard
+      // with no way to tell the two apart. <SessionNotice> reads this.
+      setLoadError(
+        err instanceof api.NotAuthedError
+          ? 'not_authed'
+          : err instanceof api.ApiError
+            ? err.message
+            : 'Couldn’t reach the meetings service.',
+      )
       setEpisodes([])
       setPodcasts([])
     } finally {
@@ -476,6 +492,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       identity,
       isAdmin,
       needsApiKey,
+      loadError,
       podcastById,
       episodeById,
       episodesByPodcast,
@@ -513,6 +530,7 @@ export function AppDataProvider({ children }: { children: ReactNode }) {
       identity,
       isAdmin,
       needsApiKey,
+      loadError,
       podcastById,
       episodeById,
       episodesByPodcast,

@@ -6,6 +6,12 @@
 // signing secret, which must never be bundled into this frontend. The token
 // is trusted because it arrives from the parent host window, not because we
 // verify it ourselves.
+//
+// The claim reading itself lives in src/lib/hostClaims.js, shared verbatim with
+// the Worker's handleHostLogin — see the header there for why the two must not
+// have their own copies.
+
+import { claimNames, decodeJwtPayload, readEmailClaim, readOrgIdClaim } from './hostClaims.js'
 
 export interface HostTokenClaims {
   email: string | null
@@ -13,33 +19,24 @@ export interface HostTokenClaims {
   orgId: string | null
   authority: string | null
   exp: number | null // seconds since epoch
-}
-
-function base64UrlDecode(segment: string): string {
-  const base64 = segment.replace(/-/g, '+').replace(/_/g, '/')
-  const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4)
-  const binary = atob(padded)
-  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0))
-  return new TextDecoder('utf-8').decode(bytes)
+  /** Claim names the token actually carried, sorted. Names only, never values.
+   *  Surfaced in the session diagnostics so a token whose email sits under an
+   *  unexpected key is visible instead of just reading as "no email". */
+  claimNames: string[]
 }
 
 /** Decodes the payload of a JWT. Returns null on any malformed input — never throws. */
 export function decodeHostToken(token: string | null | undefined): HostTokenClaims | null {
-  if (!token) return null
-  const parts = token.split('.')
-  if (parts.length !== 3) return null
+  const payload = decodeJwtPayload(token)
+  if (!payload) return null
 
-  try {
-    const payload = JSON.parse(base64UrlDecode(parts[1]))
-    return {
-      email: typeof payload.email === 'string' ? payload.email : null,
-      sub: typeof payload.sub === 'string' ? payload.sub : null,
-      orgId: typeof payload.orgId === 'string' ? payload.orgId : null,
-      authority: typeof payload.authority === 'string' ? payload.authority : null,
-      exp: typeof payload.exp === 'number' ? payload.exp : null,
-    }
-  } catch {
-    return null
+  return {
+    email: readEmailClaim(payload),
+    sub: typeof payload.sub === 'string' ? payload.sub : null,
+    orgId: readOrgIdClaim(payload),
+    authority: typeof payload.authority === 'string' ? payload.authority : null,
+    exp: typeof payload.exp === 'number' ? payload.exp : null,
+    claimNames: claimNames(payload),
   }
 }
 
