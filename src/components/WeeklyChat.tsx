@@ -3,6 +3,7 @@ import type { ChangeEvent } from 'react'
 import { ApiError, chatWeekly, type WeeklyMeetingRef } from '../lib/api'
 import { Icon } from './Icon'
 import { RichText } from './RichText'
+import { CopyButton } from './CopyButton'
 
 // ── Weekly chat — free-form Q&A over the week's meetings ─────────────────────────
 // A slide-over panel that queries POST /api/weekly/chat. The Worker loads the
@@ -225,7 +226,9 @@ export function WeeklyChat({
 }
 
 // Renders a chat answer with the same light markdown the summaries use (bold
-// **headers**, "- " bullets, paragraphs) at a compact, uniform chat size.
+// **headers**, "- " bullets, paragraphs) at a compact, uniform chat size. Each
+// headed block gets its own copy button; "Copy" under the whole answer grabs it
+// all, as raw Markdown.
 function ChatAnswer({ text }: { text: string }) {
   const isBullet = (l: string) => /^([-*•]|\d+[.)])\s+/.test(l)
   const stripBullet = (l: string) => l.replace(/^([-*•]|\d+[.)])\s+/, '')
@@ -235,40 +238,50 @@ function ChatAnswer({ text }: { text: string }) {
     .filter(Boolean)
   if (!blocks.length) return <p className="text-[14px] leading-relaxed text-on-surface">{text}</p>
   return (
-    <div className="space-y-2.5 text-[14px] leading-relaxed text-on-surface">
-      {blocks.map((block, i) => {
-        const lines = block
-          .split('\n')
-          .map((l) => l.trim())
-          .filter(Boolean)
-        const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
-        const header = headMatch ? headMatch[1] : null
-        const rest = header ? lines.slice(1) : lines
-        const bullets = rest.filter(isBullet).map(stripBullet)
-        const paras = rest.filter((l) => !isBullet(l))
-        return (
-          <div key={i}>
-            {header && <p className="mb-1 font-semibold text-on-surface">{header}</p>}
-            {paras.map((p, j) => (
-              <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
-                <RichText text={p} terms={[]} />
-              </p>
-            ))}
-            {bullets.length > 0 && (
-              <ul className="mt-1 space-y-1">
-                {bullets.map((b, j) => (
-                  <li key={`b${j}`} className="flex gap-2">
-                    <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-primary" />
-                    <span>
-                      <RichText text={b} terms={[]} />
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )
-      })}
+    <div className="text-[14px] leading-relaxed text-on-surface">
+      <div className="space-y-2.5">
+        {blocks.map((block, i) => {
+          const lines = block
+            .split('\n')
+            .map((l) => l.trim())
+            .filter(Boolean)
+          const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
+          const header = headMatch ? headMatch[1] : null
+          const rest = header ? lines.slice(1) : lines
+          const bullets = rest.filter(isBullet).map(stripBullet)
+          const paras = rest.filter((l) => !isBullet(l))
+          return (
+            <div key={i}>
+              {header && (
+                <div className="mb-1 flex items-start justify-between gap-2">
+                  <p className="font-semibold text-on-surface">{header}</p>
+                  <CopyButton getText={() => block} title={`Copy "${header}" as Markdown`} size="sm" />
+                </div>
+              )}
+              {paras.map((p, j) => (
+                <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
+                  <RichText text={p} terms={[]} />
+                </p>
+              ))}
+              {bullets.length > 0 && (
+                <ul className="mt-1 space-y-1">
+                  {bullets.map((b, j) => (
+                    <li key={`b${j}`} className="flex gap-2">
+                      <span className="mt-2 h-1 w-1 shrink-0 rounded-full bg-primary" />
+                      <span>
+                        <RichText text={b} terms={[]} />
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      <div className="mt-2 flex justify-end">
+        <CopyButton getText={() => text} label="Copy" title="Copy this answer as Markdown" />
+      </div>
     </div>
   )
 }
