@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import { RichText } from './RichText'
 import { Icon } from './Icon'
+import { CopyButton } from './CopyButton'
 import { parseSummaryBlock } from '../lib/summaryFormat'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -13,21 +14,48 @@ import { parseSummaryBlock } from '../lib/summaryFormat'
 
 /** The one-page summary body. Top-level sections render a notch larger with a
  *  divider so per-person / per-topic sub-headers nest visually beneath them —
- *  instead of dumping raw dashes and asterisks. */
+ *  instead of dumping raw dashes and asterisks. Every section and sub-header
+ *  gets its own copy button (raw Markdown, exactly as the Worker wrote it), plus
+ *  one button up top for the whole summary — so a section, a sub-section, or the
+ *  entire brief can be pasted elsewhere without reformatting. */
 export function SummaryBody({ blocks, terms }: { blocks: string[]; terms: string[] }) {
+  const parsed = useMemo(() => blocks.map(parseSummaryBlock), [blocks])
+
+  // A top-level section's "copy" grabs its own block plus every sub-header block
+  // that follows it, up to the next top-level section (or the end).
+  function sectionMarkdown(i: number): string {
+    let end = i + 1
+    while (end < blocks.length && !parsed[end].isSection) end++
+    return blocks.slice(i, end).join('\n\n')
+  }
+
   return (
     <div className="space-y-4">
+      {blocks.length > 0 && (
+        <div className="flex justify-end">
+          <CopyButton getText={() => blocks.join('\n\n')} label="Copy summary" title="Copy the full summary as Markdown" />
+        </div>
+      )}
       {blocks.map((block, i) => {
-        const { header, isSection, paras, bullets } = parseSummaryBlock(block)
+        const { header, isSection, paras, bullets } = parsed[i]
         const lead = i === 0
         return (
           <div key={i} className={isSection && i > 0 ? 'border-t border-outline-variant pt-4' : undefined}>
-            {header &&
-              (isSection ? (
-                <h3 className="mb-2 text-[17px] font-semibold tracking-tight text-on-surface">{header}</h3>
-              ) : (
-                <h4 className="mb-1.5 mt-1 text-[15px] font-semibold text-on-surface">{header}</h4>
-              ))}
+            {header && (
+              <div className={`flex items-start justify-between gap-2 ${isSection ? 'mb-2' : 'mb-1.5 mt-1'}`}>
+                {isSection ? (
+                  <h3 className="text-[17px] font-semibold tracking-tight text-on-surface">{header}</h3>
+                ) : (
+                  <h4 className="text-[15px] font-semibold text-on-surface">{header}</h4>
+                )}
+                <CopyButton
+                  getText={() => (isSection ? sectionMarkdown(i) : block)}
+                  title={isSection ? `Copy "${header}" section as Markdown` : `Copy "${header}" as Markdown`}
+                  size="sm"
+                  className="mt-0.5"
+                />
+              </div>
+            )}
             {paras.map((p, j) => (
               <p
                 key={`p${j}`}
@@ -117,7 +145,9 @@ function AnswerLine({ text, terms, onCite }: { text: string; terms: string[]; on
 }
 
 /** A chat answer — the same light markdown (bold **headers**, "- " bullets,
- *  paragraphs) at a compact, uniform chat size. */
+ *  paragraphs) at a compact, uniform chat size. Each **headed** block gets its
+ *  own copy button (raw Markdown for that block alone); a "Copy" button under
+ *  the whole answer grabs it all. */
 export function ChatAnswer({
   text,
   terms,
@@ -135,40 +165,50 @@ export function ChatAnswer({
     .filter(Boolean)
   if (!blocks.length) return <p className="text-[14px] leading-relaxed text-on-surface">{text}</p>
   return (
-    <div className="space-y-2.5 text-[14px] leading-relaxed text-on-surface">
-      {blocks.map((block, i) => {
-        const lines = block
-          .split('\n')
-          .map((l) => l.trim())
-          .filter(Boolean)
-        const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
-        const header = headMatch ? headMatch[1] : null
-        const rest = header ? lines.slice(1) : lines
-        const bullets = rest.filter(isBullet).map(stripBullet)
-        const paras = rest.filter((l) => !isBullet(l))
-        return (
-          <div key={i}>
-            {header && <p className="mb-1 font-semibold text-on-surface">{header}</p>}
-            {paras.map((p, j) => (
-              <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
-                <AnswerLine text={p} terms={terms} onCite={onCite} />
-              </p>
-            ))}
-            {bullets.length > 0 && (
-              <ul className="mt-1 space-y-1">
-                {bullets.map((b, j) => (
-                  <li key={`b${j}`} className="flex gap-2">
-                    <span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
-                    <span className="min-w-0">
-                      <AnswerLine text={b} terms={terms} onCite={onCite} />
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        )
-      })}
+    <div className="text-[14px] leading-relaxed text-on-surface">
+      <div className="space-y-2.5">
+        {blocks.map((block, i) => {
+          const lines = block
+            .split('\n')
+            .map((l) => l.trim())
+            .filter(Boolean)
+          const headMatch = lines[0] ? /^\*\*(.+?)\*\*$/.exec(lines[0]) : null
+          const header = headMatch ? headMatch[1] : null
+          const rest = header ? lines.slice(1) : lines
+          const bullets = rest.filter(isBullet).map(stripBullet)
+          const paras = rest.filter((l) => !isBullet(l))
+          return (
+            <div key={i}>
+              {header && (
+                <div className="mb-1 flex items-start justify-between gap-2">
+                  <p className="font-semibold text-on-surface">{header}</p>
+                  <CopyButton getText={() => block} title={`Copy "${header}" as Markdown`} size="sm" />
+                </div>
+              )}
+              {paras.map((p, j) => (
+                <p key={`p${j}`} className={j ? 'mt-1.5' : ''}>
+                  <AnswerLine text={p} terms={terms} onCite={onCite} />
+                </p>
+              ))}
+              {bullets.length > 0 && (
+                <ul className="mt-1 space-y-1">
+                  {bullets.map((b, j) => (
+                    <li key={`b${j}`} className="flex gap-2">
+                      <span className="mt-[9px] h-1 w-1 shrink-0 rounded-full bg-primary/60" />
+                      <span className="min-w-0">
+                        <AnswerLine text={b} terms={terms} onCite={onCite} />
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )
+        })}
+      </div>
+      <div className="mt-2 flex justify-end">
+        <CopyButton getText={() => text} label="Copy" title="Copy this answer as Markdown" />
+      </div>
     </div>
   )
 }
