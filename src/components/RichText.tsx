@@ -10,14 +10,14 @@ import { findSentimentSpans, sentimentClass, sentimentTitle } from '../lib/senti
 // purposeful tiers, applied to plain (often machine-generated) strings:
 //
 //   1. **key clause**  → heaviest, near-black   (the gist, if you read nothing else)
-//   2. metrics/numbers → semibold BLUE          ($1.7T, 90%, 10x, 2,000-day, 2027)
+//   2. metrics/numbers → semibold GOLD          ($1.7T, 90%, 10x, 2,000-day, 2027)
 //   3. named entities  → gentle weight bump      (companies / people you pass in)
 //   4. sentiment       → soft GREEN / RED tint   (the "good" and the "bad" language)
 //
 // Numbers are detected conservatively (must carry a %, $, ×, comma, decimal, or
 // be a 19xx/20xx year) so bare counts like "3 questions" stay calm. Sentiment is
 // applied ONLY to the plain runs left between the structural tokens above, so a
-// number stays blue and an entity stays weighted — the tiers never nest. The
+// number stays gold and an entity stays weighted — the tiers never nest. The
 // green/red layer is gated on the global sentiment toggle.
 // ─────────────────────────────────────────────────────────────────────────────
 

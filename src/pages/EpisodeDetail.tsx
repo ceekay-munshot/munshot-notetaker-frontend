@@ -31,7 +31,7 @@ const LEGACY_TABS: Record<string, Tab> = { takeaways: 'highlights', moments: 'hi
 
 // Colored styling for highlight tiles, cycled by index.
 const TILES = [
-  { icon: 'hub', text: 'text-[#2563eb]', tile: 'bg-[#eff5ff]', pill: 'bg-[#eff5ff] text-[#2563eb]' },
+  { icon: 'hub', text: 'text-[#9c6209]', tile: 'bg-[#fff7e8]', pill: 'bg-[#fff7e8] text-[#9c6209]' },
   { icon: 'memory', text: 'text-[#16a34a]', tile: 'bg-[#ecfdf3]', pill: 'bg-[#ecfdf3] text-[#15803d]' },
   { icon: 'trending_up', text: 'text-[#7c3aed]', tile: 'bg-[#f5f3ff]', pill: 'bg-[#f5f3ff] text-[#7c3aed]' },
   { icon: 'account_balance', text: 'text-[#ea7317]', tile: 'bg-[#fff4ec]', pill: 'bg-[#fff4ec] text-[#c2410c]' },
@@ -1065,7 +1065,7 @@ function TranscriptTab({
                   onMouseEnter={() => setActiveRef(h.id)}
                   onClick={() => jump(h.segmentId, h.id)}
                   className={`press-soft w-full rounded-lg border p-3 text-left ${
-                    active ? 'border-l-4 border-primary bg-[#eff5ff]' : 'border-outline-variant bg-surface-container-lowest hover:bg-surface-container-low'
+                    active ? 'border-l-4 border-primary bg-[#fff7e8]' : 'border-outline-variant bg-surface-container-lowest hover:bg-surface-container-low'
                   }`}
                 >
                   <p className="flex items-center gap-1.5 text-metadata font-semibold text-primary">
@@ -1459,9 +1459,9 @@ function TranscriptRow({
       id={`seg-${seg.id}`}
       className={`scroll-mt-24 rounded-lg py-3 transition-colors ${
         focused
-          ? 'border-l-4 border-primary bg-[#eff5ff] pl-3 pr-2'
+          ? 'border-l-4 border-primary bg-[#fff7e8] pl-3 pr-2'
           : isActive
-            ? `${accent} bg-[#eff5ff] px-2`
+            ? `${accent} bg-[#fff7e8] px-2`
             : `${accent} px-2`
       }`}
     >
@@ -1476,7 +1476,7 @@ function TranscriptRow({
           <button
             onClick={() => onSeekAudio(seekSec)}
             title="Play the recording from here"
-            className="press group -ml-1 flex items-start gap-0.5 self-start rounded px-1 text-left text-metadata font-semibold text-primary hover:bg-[#eff5ff]"
+            className="press group -ml-1 flex items-start gap-0.5 self-start rounded px-1 text-left text-metadata font-semibold text-primary hover:bg-[#fff7e8]"
           >
             <Icon
               name="play_arrow"
@@ -1502,7 +1502,7 @@ function TranscriptRow({
 
 // The moment <mark> stays the authoritative outer span; sentiment is applied
 // independently inside before / quote / after, so the green/red layer can color
-// words even within a highlighted quote without ever breaking the blue mark.
+// words even within a highlighted quote without ever breaking the gold mark.
 function TranscriptText({
   seg,
   activeRef,
@@ -1759,7 +1759,7 @@ function PipelineBar({ progress, mode, idx }: { progress: number; mode: PipeMode
       ? 'from-error to-[#f06565]'
       : mode === 'ready'
         ? 'from-success to-[#34d27b]'
-        : 'from-primary to-[#4f86f7]'
+        : 'from-primary to-brand-gold'
   const pctTone = mode === 'failed' ? 'text-error' : mode === 'ready' ? 'text-success' : 'text-primary'
   return (
     <div className="mb-lg">
@@ -1813,14 +1813,14 @@ function StepNode({ state, icon, live }: { state: NodeState; icon: string; live:
   )
 }
 
-// The rail segment between two nodes. The blue fill grows from the top toward the
+// The rail segment between two nodes. The gold fill grows from the top toward the
 // next step; the active segment flows + glows at its leading edge so the eye is
 // drawn to exactly where the work is right now.
 function StepConnector({ fill, active }: { fill: number; active: boolean }) {
   return (
     <div className="relative my-1 h-7 w-[3px] overflow-hidden rounded-full bg-surface-container-high">
       <div
-        className={`absolute inset-x-0 top-0 rounded-full ${active ? 'pipe-wire' : 'bg-gradient-to-b from-primary to-[#4f86f7]'}`}
+        className={`absolute inset-x-0 top-0 rounded-full ${active ? 'pipe-wire' : 'bg-gradient-to-b from-primary to-brand-gold'}`}
         style={{ height: `${fill * 100}%`, transition: 'height 380ms var(--ease-out)' }}
       >
         {active && fill > 0.02 && fill < 0.99 && <span className="pipe-glow" aria-hidden />}

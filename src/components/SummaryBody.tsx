@@ -129,7 +129,7 @@ function AnswerLine({ text, terms, onCite }: { text: string; terms: string[]; on
             key={i}
             onClick={() => onCite(p.sec!)}
             title="Open this moment in the transcript"
-            className="press mx-0.5 inline-flex items-center gap-0.5 rounded-md border border-outline-variant bg-surface-container-low px-1.5 py-px align-baseline text-[12px] font-semibold tabular-nums text-primary hover:border-primary hover:bg-[#eff5ff]"
+            className="press mx-0.5 inline-flex items-center gap-0.5 rounded-md border border-outline-variant bg-surface-container-low px-1.5 py-px align-baseline text-[12px] font-semibold tabular-nums text-primary hover:border-primary hover:bg-[#fff7e8]"
           >
             <Icon name="play_arrow" size={11} className="shrink-0" fill />
             {p.text}

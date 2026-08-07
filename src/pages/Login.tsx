@@ -42,7 +42,13 @@ export default function Login({ codeRequired }: { codeRequired: boolean }) {
     <div className="grid min-h-screen place-items-center bg-background px-4 py-12">
       <div className="w-full max-w-md">
         <div className="mb-8 flex flex-col items-center text-center">
-          <img src="/munshot-logo.png" alt="Munshot" className="mb-4 h-10 w-auto" />
+          {/* The brand mark, sized like an app icon — the gold monogram on its own
+              near-black ground, which is what the whole palette is drawn from. */}
+          <img
+            src="/munshot-mark.jpeg"
+            alt="Munshot"
+            className="mb-4 h-14 w-14 rounded-2xl object-cover shadow-card ring-1 ring-primary/20"
+          />
           <h1 className="text-display-lg text-on-background">Munshot Notetaker</h1>
           <p className="mt-1 text-body-md text-secondary">Your meeting intelligence layer.</p>
         </div>

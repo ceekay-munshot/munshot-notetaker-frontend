@@ -23,7 +23,7 @@ import { WeeklyTracking } from '../components/WeeklyTracking'
 import { WeeklyChat } from '../components/WeeklyChat'
 
 const THEME_STYLES = [
-  { tile: 'bg-[#eff5ff] text-[#2563eb] border-[#dbeafe]', icon: 'cloud' },
+  { tile: 'bg-[#fff7e8] text-[#9c6209] border-[#f7e3bd]', icon: 'cloud' },
   { tile: 'bg-[#ecfdf3] text-[#15803d] border-[#d1fadf]', icon: 'pie_chart' },
   { tile: 'bg-[#f5f3ff] text-[#7c3aed] border-[#e9e2ff]', icon: 'shield' },
   { tile: 'bg-[#fff4ec] text-[#c2410c] border-[#ffe5d3]', icon: 'memory' },
@@ -278,8 +278,8 @@ export default function Weekly() {
 
       {/* Process this week's not-yet-summarised episodes so the Monday brief is complete. */}
       {(unprocessed.length > 0 || weekProcessing) && (
-        <div className="animate-fade-up mb-md flex items-center gap-3 rounded-xl border border-[#ecddb6] bg-[#fdf8ee] px-4 py-3">
-          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-[#b8902f] text-white">
+        <div className="animate-fade-up mb-md flex items-center gap-3 rounded-xl border border-primary-fixed-dim bg-primary-fixed/50 px-4 py-3">
+          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-primary text-on-primary">
             <Icon name={weekProcessing ? 'progress_activity' : 'bolt'} size={18} className={weekProcessing ? 'animate-spin' : ''} />
           </span>
           <div className="min-w-0 flex-1">
@@ -289,8 +289,8 @@ export default function Weekly() {
                   Processing {Math.min(weekProgress.done + 1, weekProgress.total)} of {weekProgress.total}…
                 </p>
                 <p className="truncate text-[12px] text-secondary">{weekProgress.title || 'Finishing up…'}</p>
-                <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-[#efe3c6]">
-                  <div className="h-full rounded-full bg-[#b8902f] transition-[width] duration-300 ease-out" style={{ width: `${weekProgress.total ? (weekProgress.done / weekProgress.total) * 100 : 0}%` }} />
+                <div className="mt-1.5 h-1 overflow-hidden rounded-full bg-primary-fixed-dim">
+                  <div className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out" style={{ width: `${weekProgress.total ? (weekProgress.done / weekProgress.total) * 100 : 0}%` }} />
                 </div>
               </>
             ) : (
@@ -313,7 +313,7 @@ export default function Weekly() {
             <button
               onClick={processAll}
               disabled={needsApiKey}
-              className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-[#b8902f] px-3.5 py-2 text-metadata font-semibold text-white hover:bg-[#a87f28] disabled:opacity-50"
+              className="press inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-primary px-3.5 py-2 text-metadata font-semibold text-on-primary hover:bg-primary-container disabled:opacity-50"
             >
               <Icon name="auto_awesome" size={15} /> Process all
             </button>
@@ -326,7 +326,7 @@ export default function Weekly() {
         <button
           onClick={refresh}
           disabled={refreshing}
-          className="press-soft animate-fade-up mb-md flex w-full items-center gap-3 rounded-xl border border-primary/30 bg-[#eff5ff] px-4 py-3 text-left hover:bg-[#e6efff] disabled:opacity-70"
+          className="press-soft animate-fade-up mb-md flex w-full items-center gap-3 rounded-xl border border-primary/30 bg-[#fff7e8] px-4 py-3 text-left hover:bg-[#fdeed4] disabled:opacity-70"
         >
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-full bg-primary text-on-primary">
             <Icon name="fiber_new" size={18} />

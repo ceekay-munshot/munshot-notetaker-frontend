@@ -95,12 +95,13 @@ function SidebarContent({ onNavigate, onClose }: { onNavigate?: () => void; onCl
           onClick={onNavigate}
           className="press flex items-center gap-2.5 rounded-lg px-2 py-1 hover:opacity-90"
         >
-          <span
-            className="grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-[10px] shadow-sm"
-            style={{ background: 'linear-gradient(150deg, #2a2e38 0%, #0c0e13 100%)' }}
-          >
-            <img src="/munshot-logo.png" alt="Munshot" className="h-7 w-7 object-contain" />
-          </span>
+          {/* The brand mark ships with its own dark ground, so it needs no
+              reconstructed tile behind it. */}
+          <img
+            src="/munshot-mark.jpeg"
+            alt="Munshot"
+            className="h-9 w-9 shrink-0 rounded-[10px] object-cover shadow-sm"
+          />
           <span className="text-[19px] font-bold tracking-tight text-on-surface">Munshot</span>
         </Link>
         {onClose && (

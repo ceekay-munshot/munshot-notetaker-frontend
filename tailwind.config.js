@@ -1,47 +1,56 @@
 /** @type {import('tailwindcss').Config} */
-// Munshot Podcasts design tokens — clean, minimal, editorial SaaS.
-// Near-white canvas, white cards with subtle borders + faint shadows, a single
-// bright blue accent, Inter type scale. Token NAMES are kept stable so the whole
+// Munshot Notetaker design tokens — clean, minimal, editorial SaaS, dressed in
+// the Munshot brand: the gold "M" monogram on near-black navy (public/munshot-mark.jpeg).
+// Near-white (subtly warm) canvas, white cards with faint borders + shadows, a
+// single gold accent, Inter type scale. Token NAMES are kept stable so the whole
 // app re-skins from this one file.
+//
+// On the gold: the logo's bright mark (#f5a623) only clears ~2:1 on white, so it
+// is reserved for fills, gradients and dark-surface accents. Anything that has to
+// be *read* — text, icons, solid buttons — uses the deep gold `primary` (#9c6209,
+// 5.0:1 on white, and the same 5.0:1 for white text sitting on it).
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
       colors: {
-        background: '#fafbfc',
-        'on-background': '#0f172a',
+        background: '#fafaf8',
+        'on-background': '#12121a',
         surface: '#ffffff',
-        'surface-dim': '#eef0f3',
+        'surface-dim': '#eeece7',
         'surface-bright': '#ffffff',
         'surface-container-lowest': '#ffffff',
-        'surface-container-low': '#f6f7f9',
-        'surface-container': '#f0f2f5',
-        'surface-container-high': '#e9ebef',
-        'surface-container-highest': '#e3e6ea',
-        'surface-variant': '#f0f2f5',
-        'on-surface': '#0f172a',
-        // Body / reading text — darkened from slate-600 to slate-700 for a
-        // stronger, lower-effort read while staying clearly below headings.
-        'on-surface-variant': '#374151',
-        'inverse-surface': '#111827',
-        'inverse-on-surface': '#f8fafc',
-        outline: '#94a3b8',
-        'outline-variant': '#e7e9ee',
-        'surface-tint': '#2563eb',
-        primary: '#2563eb',
+        'surface-container-low': '#f7f6f3',
+        'surface-container': '#f2f1ec',
+        'surface-container-high': '#ebe9e3',
+        'surface-container-highest': '#e5e2db',
+        'surface-variant': '#f2f1ec',
+        // Ink drawn from the logo's near-black navy ground.
+        'on-surface': '#12121a',
+        // Body / reading text — a warm dark grey: strong and low-effort to read,
+        // while staying clearly below headings.
+        'on-surface-variant': '#3f3b36',
+        'inverse-surface': '#0b0a12',
+        'inverse-on-surface': '#faf9f6',
+        outline: '#9a948a',
+        'outline-variant': '#e8e5de',
+        'surface-tint': '#9c6209',
+        // Deep gold — the readable end of the brand ramp (5.0:1 on white).
+        primary: '#9c6209',
         'on-primary': '#ffffff',
-        'primary-container': '#1d4ed8',
-        'on-primary-container': '#1e40af',
-        'primary-fixed': '#dbeafe',
-        'primary-fixed-dim': '#bfdbfe',
-        'inverse-primary': '#bfdbfe',
-        secondary: '#64748b',
+        'primary-container': '#7c4a06',
+        'on-primary-container': '#7c4a06',
+        'primary-fixed': '#fdf3de',
+        'primary-fixed-dim': '#f9e0aa',
+        // Light gold, for accents that sit on the dark inverse surfaces.
+        'inverse-primary': '#f2c25c',
+        secondary: '#6b655c',
         'on-secondary': '#ffffff',
-        'secondary-container': '#eef0f3',
-        'on-secondary-container': '#475569',
-        tertiary: '#7c8089',
+        'secondary-container': '#eeece7',
+        'on-secondary-container': '#514c44',
+        tertiary: '#847d72',
         'on-tertiary': '#ffffff',
-        'tertiary-container': '#94a3b8',
+        'tertiary-container': '#9a948a',
         error: '#dc2626',
         'on-error': '#ffffff',
         'error-container': '#fee2e2',
@@ -49,8 +58,11 @@ export default {
         success: '#16a34a',
         'success-container': '#e7f7ee',
         'on-success-container': '#15803d',
+        // The logo's bright mark gold — fills, gradients, dark-surface accents.
+        // Not for text on light backgrounds (see the note above).
+        'brand-gold': '#f5a623',
         // Accent palette for interesting-moment tiles & theme chips.
-        'accent-blue': '#2563eb',
+        'accent-gold': '#9c6209',
         'accent-green': '#16a34a',
         'accent-purple': '#7c3aed',
         'accent-orange': '#ea7317',
@@ -91,9 +103,11 @@ export default {
         full: '9999px',
       },
       boxShadow: {
-        card: '0 1px 2px 0 rgba(16,24,40,0.04), 0 1px 3px 0 rgba(16,24,40,0.04)',
-        'card-hover': '0 6px 16px -4px rgba(16,24,40,0.08), 0 2px 6px -2px rgba(16,24,40,0.05)',
-        player: '0 8px 30px rgba(16,24,40,0.12)',
+        // Warm-neutral shadow ink, so cards settle onto the warm canvas instead
+        // of casting the old cool-navy tint over it.
+        card: '0 1px 2px 0 rgba(38,30,16,0.05), 0 1px 3px 0 rgba(38,30,16,0.04)',
+        'card-hover': '0 6px 16px -4px rgba(38,30,16,0.09), 0 2px 6px -2px rgba(38,30,16,0.06)',
+        player: '0 8px 30px rgba(38,30,16,0.13)',
       },
       keyframes: {
         'fade-up': {

@@ -1,6 +1,6 @@
 import type { Takeaway } from '../lib/types'
 
-// "Intelligence module" — the 4px blue accent-bar list item from the design
+// "Intelligence module" — the 4px gold accent-bar list item from the design
 // system. Used on Home, the episode page, and the weekly summary.
 export function TakeawayList({ items, numbered = false }: { items: Takeaway[]; numbered?: boolean }) {
   return (

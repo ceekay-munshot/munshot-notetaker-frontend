@@ -58,29 +58,29 @@
     text-wrap: balance;
   }
   ::selection {
-    background: rgba(37, 99, 235, 0.16);
-    color: #1e3a8a;
+    background: rgba(245, 166, 35, 0.24);
+    color: #5c3803;
   }
 }
 
 @layer components {
-  /* Intelligence module — 4px blue accent bar instead of a full border. */
+  /* Intelligence module — 4px gold accent bar instead of a full border. */
   .intel-bar {
     @apply border-l-4 border-primary pl-md;
   }
-  /* Citation / status chip with a soft blue tint. */
+  /* Citation / status chip with a soft gold tint. */
   .chip-signal {
-    background: #eff5ff;
+    background: #fff7e8;
     @apply text-primary;
   }
   /* Highlighted transcript span linked to a summary module. */
   .transcript-mark {
     @apply rounded px-1 cursor-pointer transition-colors;
-    background: rgba(37, 99, 235, 0.12);
+    background: rgba(245, 166, 35, 0.2);
   }
   .transcript-mark:hover,
   .transcript-mark.is-active {
-    background: rgba(37, 99, 235, 0.22);
+    background: rgba(245, 166, 35, 0.36);
   }
 
   /* Sentiment — soft green / red highlight for "good" and "bad" language, in the
@@ -103,7 +103,7 @@
   .sentiment-strong {
     font-weight: 600;
   }
-  /* Inside the blue moment mark, drop the tint (it would muddy on blue) and keep
+  /* Inside the gold moment mark, drop the tint (it would muddy on gold) and keep
      just colored, slightly heavier text so both signals stay legible. */
   .transcript-mark .sentiment-pos,
   .transcript-mark .sentiment-neg {
@@ -134,10 +134,10 @@
    of overriding its background. The highlight itself is what stays put. */
 @keyframes seg-flash {
   0% {
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.4);
+    box-shadow: 0 0 0 3px rgba(245, 166, 35, 0.55);
   }
   100% {
-    box-shadow: 0 0 0 3px rgba(37, 99, 235, 0);
+    box-shadow: 0 0 0 3px rgba(245, 166, 35, 0);
   }
 }
 .seg-flash {
@@ -188,7 +188,7 @@
 .pipe-wire {
   background-image:
     linear-gradient(180deg, rgba(255, 255, 255, 0) 0%, rgba(255, 255, 255, 0.65) 50%, rgba(255, 255, 255, 0) 100%),
-    linear-gradient(to bottom, #2563eb, #4f86f7);
+    linear-gradient(to bottom, #9c6209, #f5a623);
   background-size:
     100% 220%,
     100% 100%;
@@ -214,7 +214,7 @@
   width: 14px;
   transform: translate(-50%, 50%);
   border-radius: 9999px;
-  background: radial-gradient(circle, rgba(37, 99, 235, 0.85), rgba(37, 99, 235, 0) 70%);
+  background: radial-gradient(circle, rgba(245, 166, 35, 0.9), rgba(245, 166, 35, 0) 70%);
   animation: pipe-pulse 1.3s var(--ease-in-out) infinite;
   pointer-events: none;
 }
@@ -222,13 +222,13 @@
 /* Pulsing halo on the node of the stage in progress. */
 @keyframes node-halo {
   0% {
-    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.3);
+    box-shadow: 0 0 0 0 rgba(245, 166, 35, 0.45);
   }
   70% {
-    box-shadow: 0 0 0 9px rgba(37, 99, 235, 0);
+    box-shadow: 0 0 0 9px rgba(245, 166, 35, 0);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0);
+    box-shadow: 0 0 0 0 rgba(245, 166, 35, 0);
   }
 }
 .node-halo {
@@ -262,11 +262,11 @@
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #e2e2e2;
+  background: #e0dcd3;
   border-radius: 8px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #c1c6d7;
+  background: #c4bdae;
 }
 
 /* ───────────────────────────────────────────────────────────────────────── */
@@ -303,7 +303,7 @@
   width: 12px;
   height: 12px;
   border-radius: 9999px;
-  background: #2563eb;
+  background: #9c6209;
   border: 2px solid #ffffff;
   box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
   cursor: inherit;
@@ -316,7 +316,7 @@
   width: 12px;
   height: 12px;
   border-radius: 9999px;
-  background: #2563eb;
+  background: #9c6209;
   border: 2px solid #ffffff;
   box-shadow: 0 1px 3px rgb(0 0 0 / 0.3);
   cursor: inherit;

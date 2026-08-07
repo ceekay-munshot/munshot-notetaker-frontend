@@ -70,7 +70,7 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
               {selected ? (
                 <CoverTile podcast={selected} className="h-4 w-4" rounded="rounded" />
               ) : (
-                <span className="grid h-4 w-4 place-items-center rounded bg-inverse-surface text-[8px] font-bold text-white">M</span>
+                <img src="/munshot-mark.jpeg" alt="" className="h-4 w-4 shrink-0 rounded object-cover" />
               )}
               <span className="max-w-[150px] truncate">{selected ? selected.title : 'All Meetings'}</span>
               <Icon name="expand_more" size={18} className={`text-outline transition-transform ${chanOpen ? 'rotate-180' : ''}`} />
@@ -90,7 +90,7 @@ export function TopBar({ menuOpen, onMenu }: { menuOpen: boolean; onMenu: () => 
                       channelId === null ? 'bg-primary-fixed/50 font-semibold text-primary' : 'text-on-surface hover:bg-surface-container-low'
                     }`}
                   >
-                    <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-inverse-surface text-[9px] font-bold text-white">M</span>
+                    <img src="/munshot-mark.jpeg" alt="" className="h-5 w-5 shrink-0 rounded object-cover" />
                     <span className="flex-1 text-left">All Meetings</span>
                     {channelId === null && <Icon name="check" size={16} className="shrink-0" />}
                   </button>

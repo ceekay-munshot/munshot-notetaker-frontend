@@ -278,7 +278,7 @@ function Highlight({ text, terms }: { text: string; terms: string[] }): ReactNod
     <>
       {parts.map((part, i) =>
         terms.some((t) => t.toLowerCase() === part.toLowerCase()) ? (
-          <mark key={i} className="rounded bg-[rgba(37,99,235,0.14)] px-0.5 font-semibold text-on-surface">
+          <mark key={i} className="rounded bg-[rgba(245,166,35,0.32)] px-0.5 font-semibold text-on-surface">
             {part}
           </mark>
         ) : (
